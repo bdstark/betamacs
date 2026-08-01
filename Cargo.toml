@@ -5,10 +5,16 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
 image = "0.25.10"
 ndarray = "0.17.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSColor", "NSView", "NSResponder", "NSGraphics"] }
+objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime", "CMFormatDescription"] }
+objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer"] }
+objc2-foundation = "0.3.2"
+objc2-screen-capture-kit = { version = "0.3.2", features = ["SCStream", "SCShareableContent", "SCError"] }
 ort = { version = "2.0.0-rc.13", features = ["coreml"] }
 softbuffer = "0.4.8"
 tracing = "0.1.44"

@@ -49,6 +49,10 @@ impl OverlayHandle {
 pub struct OverlayApp {
     windows: Vec<Window>,
     visible: usize,
+    /// Last applied region set; identical updates are dropped so a static
+    /// scene causes zero window-server traffic (window updates would
+    /// otherwise re-trigger SCK change frames in a feedback loop).
+    last_regions: Vec<CensorRegion>,
     /// Hide the boxes from screen capture (`NSWindow.sharingType = .none`).
     /// True for normal operation; false when the user wants captures and
     /// screen shares censored too (`Config::censor_in_captures`).
@@ -70,6 +74,7 @@ impl OverlayApp {
             Self {
                 windows: Vec::new(),
                 visible: 0,
+                last_regions: Vec::new(),
                 content_protected,
             },
         ))
@@ -101,6 +106,9 @@ impl OverlayApp {
     }
 
     fn apply_regions(&mut self, event_loop: &ActiveEventLoop, regions: Vec<CensorRegion>) {
+        if regions == self.last_regions {
+            return;
+        }
         for (i, region) in regions.iter().enumerate() {
             let window = match self.ensure_window(event_loop, i) {
                 Ok(w) => w,
@@ -125,6 +133,7 @@ impl OverlayApp {
             window.set_visible(false);
         }
         self.visible = regions.len();
+        self.last_regions = regions;
     }
 }
 
@@ -169,15 +178,13 @@ mod macos {
             tracing::error!("could not get NSWindow for overlay window");
             return;
         };
-        unsafe {
-            ns.setBackgroundColor(Some(&NSColor::blackColor()));
-            ns.setHasShadow(false);
-            ns.setCollectionBehavior(
-                NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | NSWindowCollectionBehavior::Stationary
-                    | NSWindowCollectionBehavior::IgnoresCycle,
-            );
-        }
+        ns.setBackgroundColor(Some(&NSColor::blackColor()));
+        ns.setHasShadow(false);
+        ns.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
     }
 }

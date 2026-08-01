@@ -8,14 +8,19 @@ on-device; no frame ever leaves the machine.
 ## Pipeline
 
 ```
-capture (xcap / ScreenCaptureKit, per monitor)
+capture (native ScreenCaptureKit stream per display, change-driven)
    → detect (NudeNet ONNX via ort, letterbox + YOLOv8 decode + NMS)
-   → censor (per-monitor overlay window: transparent, always-on-top,
-             click-through, excluded from capture)
+   → censor (pool of black always-on-top click-through windows)
 ```
 
-- **capture.rs** — polls a full screenshot of every monitor per tick.
-  Upgrade path: persistent ScreenCaptureKit streams for higher FPS.
+- **capture_sck.rs** — one persistent `SCStream` per display. Frames are
+  delivered only when the display's content changes, so fully static
+  screens cost zero CPU. In `--censor-captures` mode the stream filter
+  excludes this app's windows from *our* capture only (the detector sees
+  beneath the boxes; other apps' captures see them). Captures at logical
+  (point) resolution — the detector downscales anyway.
+- **capture.rs** — the original xcap polling capture, still used by the
+  `probe` and `demo` modes.
 - **detect.rs** — ONNX Runtime session per process; letterboxes the frame
   to the model's square input, decodes the `[1, 4+18, anchors]` output,
   maps boxes back to source-pixel coordinates.
@@ -25,9 +30,13 @@ capture (xcap / ScreenCaptureKit, per monitor)
   apps), and content-protected (`NSWindow.sharingType = .none`) so the
   detector keeps seeing the raw content underneath. No pixel drawing at
   all — the window background is the censor box.
-- **pipeline.rs** — the continuous loop: capture all monitors, detect,
-  convert flagged boxes to padded global-point regions, push to the
-  overlay. Regions linger `hold_ms` after last sighting (anti-flicker).
+- **pipeline.rs** — the continuous loop, event-driven off the frame
+  channel. Censor-box lifetime rules (shaped by change-driven capture): a
+  box is refreshed whenever a frame shows content; removed only when a
+  *new frame* shows it gone and `hold_ms` has passed; if no frames arrive
+  the screen hasn't changed, so boxes stay — a static image stays covered
+  indefinitely. Identical region sets are deduped before touching windows,
+  otherwise overlay updates would re-trigger SCK change frames forever.
 - **config.rs** — thresholds, FPS, censored class list.
 
 - **detect.rs (tiling)** — each screen is scanned as the full frame plus a
@@ -46,9 +55,10 @@ cargo run --release -- demo   # 8s black box + capture-exclusion self-check
 ```
 
 `--censor-captures` makes the boxes visible in screenshots / screen shares
-too. Caveat: the detector then can't see beneath its own boxes, so they
-blink roughly every `hold_ms`; a ScreenCaptureKit per-window exclusion
-filter (planned) will fix that properly. Debug: `BETAMACS_NO_PROTECT=1`
+too, flicker-free: once the first box appears, the app registers in
+shareable content and every stream's filter is updated to exclude this
+app's windows, so the detector keeps seeing beneath the boxes while
+everyone else's captures show them. Debug: `BETAMACS_NO_PROTECT=1`
 forces boxes into captures so the demo can verify they render.
 
 Requires macOS Screen Recording permission for the terminal/app running it.

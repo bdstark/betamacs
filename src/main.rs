@@ -1,4 +1,5 @@
 mod capture;
+mod capture_sck;
 mod config;
 mod detect;
 mod overlay;
