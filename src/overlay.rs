@@ -1,17 +1,20 @@
-//! Censor overlay: a pool of small, plain black borderless windows, one per
-//! censor region, positioned in global logical (point) coordinates.
+//! Censor overlay: a pool of borderless windows, one per censor region,
+//! positioned in global logical (point) coordinates. Fill color, border,
+//! and capture visibility come from the censor module settings and can be
+//! restyled live.
 //!
 //! Properties per window:
-//!   - black background, no decorations, no shadow, never focused
+//!   - styled background (default black), no decorations, no shadow,
+//!     never focused
 //!   - always-on-top, click-through (`set_cursor_hittest(false)`)
-//!   - content-protected (`NSWindow.sharingType = .none`) so the censor
-//!     boxes are invisible to screen capture — including our own detector
-//!     loop, which must keep seeing the raw content underneath
+//!   - content-protected (`NSWindow.sharingType = .none`) unless
+//!     `censor_in_captures` is on, so the boxes are invisible to screen
+//!     capture — including our own detector loop
 //!   - joins all Spaces, including fullscreen apps, and stays put during
 //!     Mission Control (collection behavior flags)
 //!
 //! winit requires the event loop to run on the main thread on macOS, so the
-//! pipeline runs on a worker thread and sends region updates through an
+//! pipeline runs on a worker thread and sends updates through an
 //! `EventLoopProxy` user event.
 
 use anyhow::Result;
@@ -21,8 +24,10 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId, WindowLevel};
 
+use crate::settings::CensorSettings;
+
 /// A rectangle to black out, in global logical screen points (the same
-/// coordinate space as `xcap` monitor origins).
+/// coordinate space as ScreenCaptureKit display origins).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CensorRegion {
     pub x: f32,
@@ -31,17 +36,30 @@ pub struct CensorRegion {
     pub height: f32,
 }
 
-/// Handle used by the pipeline thread to push region updates.
+#[derive(Debug)]
+pub enum OverlayMsg {
+    Regions(Vec<CensorRegion>),
+    Style(CensorSettings),
+}
+
+/// Handle used by the pipeline/server threads to push updates.
 #[derive(Clone)]
 pub struct OverlayHandle {
-    proxy: EventLoopProxy<Vec<CensorRegion>>,
+    proxy: EventLoopProxy<OverlayMsg>,
 }
 
 impl OverlayHandle {
     /// Replace the set of censor boxes shown on screen.
     pub fn set_regions(&self, regions: Vec<CensorRegion>) -> Result<()> {
         self.proxy
-            .send_event(regions)
+            .send_event(OverlayMsg::Regions(regions))
+            .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
+    }
+
+    /// Restyle the boxes (fill, border, capture visibility).
+    pub fn set_style(&self, style: CensorSettings) -> Result<()> {
+        self.proxy
+            .send_event(OverlayMsg::Style(style))
             .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
     }
 }
@@ -53,16 +71,13 @@ pub struct OverlayApp {
     /// scene causes zero window-server traffic (window updates would
     /// otherwise re-trigger SCK change frames in a feedback loop).
     last_regions: Vec<CensorRegion>,
-    /// Hide the boxes from screen capture (`NSWindow.sharingType = .none`).
-    /// True for normal operation; false when the user wants captures and
-    /// screen shares censored too (`Config::censor_in_captures`).
-    content_protected: bool,
+    style: CensorSettings,
 }
 
 impl OverlayApp {
-    /// Build the event loop and a handle for the pipeline thread.
-    pub fn new(content_protected: bool) -> Result<(EventLoop<Vec<CensorRegion>>, OverlayHandle, Self)> {
-        let event_loop = EventLoop::<Vec<CensorRegion>>::with_user_event()
+    /// Build the event loop and a handle for the worker threads.
+    pub fn new(style: CensorSettings) -> Result<(EventLoop<OverlayMsg>, OverlayHandle, Self)> {
+        let event_loop = EventLoop::<OverlayMsg>::with_user_event()
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build event loop: {e}"))?;
         let handle = OverlayHandle {
@@ -75,12 +90,18 @@ impl OverlayApp {
                 windows: Vec::new(),
                 visible: 0,
                 last_regions: Vec::new(),
-                content_protected,
+                style,
             },
         ))
     }
 
-    fn ensure_window(&mut self, event_loop: &ActiveEventLoop, i: usize) -> Result<&Window> {
+    fn content_protected(&self) -> bool {
+        // BETAMACS_NO_PROTECT=1 overrides for debugging, to verify via
+        // capture that the boxes actually render.
+        !self.style.censor_in_captures && std::env::var_os("BETAMACS_NO_PROTECT").is_none()
+    }
+
+    fn ensure_window(&mut self, event_loop: &ActiveEventLoop, i: usize) -> Result<()> {
         while self.windows.len() <= i {
             let attrs = Window::default_attributes()
                 .with_title("betamacs censor")
@@ -89,20 +110,17 @@ impl OverlayApp {
                 .with_active(false)
                 .with_visible(false)
                 .with_window_level(WindowLevel::AlwaysOnTop)
-                // BETAMACS_NO_PROTECT=1 overrides for debugging, to verify
-                // via capture that the boxes actually render.
-                .with_content_protected(
-                    self.content_protected && std::env::var_os("BETAMACS_NO_PROTECT").is_none(),
-                )
+                .with_content_protected(self.content_protected())
                 .with_inner_size(LogicalSize::new(1.0, 1.0));
             let window = event_loop
                 .create_window(attrs)
                 .map_err(|e| anyhow::anyhow!("failed to create overlay window: {e}"))?;
             let _ = window.set_cursor_hittest(false);
             macos::configure_censor_window(&window);
+            macos::apply_style(&window, &self.style);
             self.windows.push(window);
         }
-        Ok(&self.windows[i])
+        Ok(())
     }
 
     fn apply_regions(&mut self, event_loop: &ActiveEventLoop, regions: Vec<CensorRegion>) {
@@ -110,13 +128,11 @@ impl OverlayApp {
             return;
         }
         for (i, region) in regions.iter().enumerate() {
-            let window = match self.ensure_window(event_loop, i) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("{e}");
-                    return;
-                }
-            };
+            if let Err(e) = self.ensure_window(event_loop, i) {
+                tracing::error!("{e}");
+                return;
+            }
+            let window = &self.windows[i];
             let _ = window.request_inner_size(LogicalSize::new(region.width, region.height));
             window.set_outer_position(LogicalPosition::new(region.x, region.y));
             window.set_visible(true);
@@ -135,13 +151,28 @@ impl OverlayApp {
         self.visible = regions.len();
         self.last_regions = regions;
     }
+
+    fn apply_style(&mut self, style: CensorSettings) {
+        if style == self.style {
+            return;
+        }
+        self.style = style;
+        let protected = self.content_protected();
+        for window in &self.windows {
+            window.set_content_protected(protected);
+            macos::apply_style(window, &self.style);
+        }
+    }
 }
 
-impl ApplicationHandler<Vec<CensorRegion>> for OverlayApp {
+impl ApplicationHandler<OverlayMsg> for OverlayApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, regions: Vec<CensorRegion>) {
-        self.apply_regions(event_loop, regions);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, msg: OverlayMsg) {
+        match msg {
+            OverlayMsg::Regions(regions) => self.apply_regions(event_loop, regions),
+            OverlayMsg::Style(style) => self.apply_style(style),
+        }
     }
 
     fn window_event(
@@ -159,6 +190,8 @@ mod macos {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
+    use crate::settings::{parse_color, CensorSettings};
+
     fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
         let handle = window.window_handle().ok()?;
         let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
@@ -170,15 +203,14 @@ mod macos {
         view.window()
     }
 
-    /// Black background, no shadow, and visible on every Space including
-    /// fullscreen apps. (Click-through and capture exclusion are handled by
-    /// winit's `set_cursor_hittest` / `with_content_protected`.)
+    /// No shadow, and visible on every Space including fullscreen apps.
+    /// (Click-through and capture exclusion are handled by winit's
+    /// `set_cursor_hittest` / `set_content_protected`.)
     pub fn configure_censor_window(window: &Window) {
         let Some(ns) = ns_window(window) else {
             tracing::error!("could not get NSWindow for overlay window");
             return;
         };
-        ns.setBackgroundColor(Some(&NSColor::blackColor()));
         ns.setHasShadow(false);
         ns.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -186,5 +218,26 @@ mod macos {
                 | NSWindowCollectionBehavior::Stationary
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
+    }
+
+    /// Fill color on the window, border on the content view's layer.
+    pub fn apply_style(window: &Window, style: &CensorSettings) {
+        let Some(ns) = ns_window(window) else {
+            return;
+        };
+        let (r, g, b, a) = parse_color(&style.fill_color).unwrap_or((0.0, 0.0, 0.0, 1.0));
+        let fill = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a);
+        ns.setBackgroundColor(Some(&fill));
+        if let Some(view) = ns.contentView() {
+            view.setWantsLayer(true);
+            if let Some(layer) = view.layer() {
+                let (r, g, b, a) =
+                    parse_color(&style.border_color).unwrap_or((0.0, 0.0, 0.0, 1.0));
+                let border = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a);
+                layer.setBorderWidth(style.border_width as f64);
+                let cg = border.CGColor();
+                layer.setBorderColor(Some(cg.as_ref()));
+            }
+        }
     }
 }

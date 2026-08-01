@@ -1,5 +1,10 @@
 //! Continuous capture -> detect -> censor loop (runs on a worker thread).
 //!
+//! Settings are read from the shared `Effective` state every cycle, so
+//! threshold/trigger/scale changes pushed through the config API apply
+//! live; a model change hot-swaps the detector. Capture fps and tile
+//! layout of the SCK streams need a restart.
+//!
 //! Capture is change-driven (ScreenCaptureKit only delivers a frame when a
 //! display's content changes), which shapes the censor-box lifetime rules:
 //!
@@ -11,34 +16,43 @@
 //!     a static image must remain covered indefinitely
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::capture::Frame;
 use crate::capture_sck::SckCapturer;
-use crate::config::Config;
 use crate::detect::{Detection, Detector};
 use crate::overlay::{CensorRegion, OverlayHandle};
+use crate::settings::Effective;
 
 /// Convert a detection on a captured frame into a censor box in global
-/// logical screen points, padded by `box_padding` on each side.
-pub fn detection_to_region(frame: &Frame, det: &Detection, box_padding: f32) -> CensorRegion {
+/// logical screen points, scaled by the censor module's x/y percentages.
+pub fn detection_to_region(
+    frame: &Frame,
+    det: &Detection,
+    x_scale_pct: f32,
+    y_scale_pct: f32,
+) -> CensorRegion {
     let scale = frame.pixel_to_point_scale();
     let (x, y, w, h) = det.bbox;
-    let (pad_w, pad_h) = (w * box_padding, h * box_padding);
+    let new_w = w * (x_scale_pct / 100.0).max(0.0);
+    let new_h = h * (y_scale_pct / 100.0).max(0.0);
     CensorRegion {
-        x: frame.origin.0 as f32 + (x - pad_w) * scale,
-        y: frame.origin.1 as f32 + (y - pad_h) * scale,
-        width: (w + 2.0 * pad_w) * scale,
-        height: (h + 2.0 * pad_h) * scale,
+        x: frame.origin.0 as f32 + (x + w / 2.0 - new_w / 2.0) * scale,
+        y: frame.origin.1 as f32 + (y + h / 2.0 - new_h / 2.0) * scale,
+        width: new_w * scale,
+        height: new_h * scale,
     }
 }
 
-pub fn run(config: Config, overlay: OverlayHandle) -> Result<()> {
-    let mut detector = Detector::new(&config.model_path, config.input_size)?;
-    let mut capturer = SckCapturer::new(config.capture_fps)?;
-    let hold = Duration::from_millis(config.hold_ms);
+pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()> {
+    let initial = shared.read().unwrap().clone();
+    let (model_path, input_size) = initial.detection.model_path();
+    let mut detector = Detector::new(&model_path, input_size)?;
+    let mut loaded_model = initial.detection.model.clone();
+    let mut capturer = SckCapturer::new(initial.detection.capture_fps)?;
     // Per-monitor: when censorable content was last seen, and where.
     let mut held: HashMap<u32, (Instant, Vec<CensorRegion>)> = HashMap::new();
     let mut last_exclusion_attempt: Option<Instant> = None;
@@ -48,11 +62,26 @@ pub fn run(config: Config, overlay: OverlayHandle) -> Result<()> {
 
     tracing::info!(
         "pipeline running: model {}, change-driven capture at <= {:.1} fps",
-        config.model_path.display(),
-        config.capture_fps,
+        model_path.display(),
+        initial.detection.capture_fps,
     );
 
     loop {
+        let cfg = shared.read().unwrap().clone();
+
+        // Hot-swap the detector on model change.
+        if cfg.detection.model != loaded_model {
+            let (path, size) = cfg.detection.model_path();
+            match Detector::new(&path, size) {
+                Ok(d) => {
+                    tracing::info!("switched detector to {}", path.display());
+                    detector = d;
+                    loaded_model = cfg.detection.model.clone();
+                }
+                Err(e) => tracing::error!("model switch to {} failed: {e}", path.display()),
+            }
+        }
+
         // Block for the next changed frame, then drain the queue keeping
         // only the newest frame per monitor (coalescing under load).
         let mut latest: HashMap<u32, Frame> = HashMap::new();
@@ -74,15 +103,16 @@ pub fn run(config: Config, overlay: OverlayHandle) -> Result<()> {
             last_stats = Instant::now();
         }
 
+        let hold = Duration::from_millis(cfg.detection.hold_ms);
         let mut changed = false;
         for (monitor_id, frame) in &latest {
             let tick = Instant::now();
             let detections = match detector.detect_tiled(
                 &frame.image,
-                config.tile_grid,
-                config.tile_overlap,
-                config.confidence_threshold,
-                config.iou_threshold,
+                cfg.detection.tile_grid,
+                0.2,
+                cfg.detection.confidence_threshold,
+                cfg.detection.iou_threshold,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -92,12 +122,23 @@ pub fn run(config: Config, overlay: OverlayHandle) -> Result<()> {
             };
             let flagged: Vec<&Detection> = detections
                 .iter()
-                .filter(|d| config.censored_classes.contains(&d.class))
+                .filter(|d| {
+                    cfg.detection.triggers.get(d.class).copied().unwrap_or(false)
+                        && d.bbox.2 >= cfg.detection.min_region_px
+                        && d.bbox.3 >= cfg.detection.min_region_px
+                })
                 .collect();
             if !flagged.is_empty() {
                 let regions = flagged
                     .iter()
-                    .map(|d| detection_to_region(frame, d, config.box_padding))
+                    .map(|d| {
+                        detection_to_region(
+                            frame,
+                            d,
+                            cfg.censor.x_scale_pct,
+                            cfg.censor.y_scale_pct,
+                        )
+                    })
                     .collect::<Vec<_>>();
                 let is_new = held
                     .get(monitor_id)
@@ -133,11 +174,11 @@ pub fn run(config: Config, overlay: OverlayHandle) -> Result<()> {
             overlay.set_regions(all)?;
         }
 
-        // In --censor-captures mode the boxes are visible to capture, so our
-        // own streams must exclude this app or the detector goes blind under
-        // its boxes. The app only becomes excludable once it has an
+        // In censor-in-captures mode the boxes are visible to capture, so
+        // our own streams must exclude this app or the detector goes blind
+        // under its boxes. The app only becomes excludable once it has an
         // on-screen window, so retry after boxes first appear.
-        if config.censor_in_captures
+        if cfg.censor.censor_in_captures
             && !capturer.self_excluded()
             && !held.is_empty()
             && last_exclusion_attempt.is_none_or(|t| t.elapsed() > Duration::from_secs(2))

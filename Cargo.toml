@@ -5,18 +5,25 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+axum = "0.8.9"
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 image = "0.25.10"
 ndarray = "0.17.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSColor", "NSView", "NSResponder", "NSGraphics"] }
+objc2-core-graphics = "0.3.2"
 objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime", "CMFormatDescription"] }
 objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer"] }
 objc2-foundation = "0.3.2"
+objc2-quartz-core = { version = "0.3.2", features = ["CALayer"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCStream", "SCShareableContent", "SCError"] }
 ort = { version = "2.0.0-rc.13", features = ["coreml"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 softbuffer = "0.4.8"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "macros"] }
+tower-http = { version = "0.7.0", features = ["fs", "cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 winit = "0.30.13"

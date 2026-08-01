@@ -44,6 +44,40 @@ capture (native ScreenCaptureKit stream per display, change-driven)
   and quarter-screen windows survive the downscale to model input size.
   Global NMS merges duplicate boxes across tiles.
 
+## Settings (modules / layers / packages)
+
+Configuration is a JSON **package**: a set of **named configurations**
+(each a *partial*, per-module settings object), an ordered **layer** stack
+of them, and explicit overrides. Effective settings = module defaults <-
+layers in order <- overrides, merged field by field (`triggers` merges per
+class). `src/settings.rs` and `webapp/src/schema.ts` implement the same
+contract and resolution.
+
+Modules: **detection** (model, confidence/IoU/minimum sliders, capture
+rate, tiling, hold time, grouped trigger switches) and **censor** (fill /
+border colors, x/y size percentages, trigger-label + random-text overlay
+config; label/text rendering in the app is pending).
+
+The settings site is TypeScript + Lit web components (`webapp/`), built
+with Vite, and works identically self-hosted by the app (`/`) or hosted
+externally and pushed to the local app.
+
+```bash
+cd webapp && npm install && npm run build   # app serves webapp/dist
+```
+
+API (localhost only, bearer token in `config/api-token`, printed at
+startup; CORS open for the externally-hosted UI):
+
+```
+GET  /api/package    # stored package
+PUT  /api/package    # validate, persist to config/package.json, apply live
+GET  /api/status     # app + resolved effective settings
+```
+
+Thresholds, triggers, scales, colors, and hold time apply live; a model
+change hot-swaps the detector; capture fps / tile layout need a restart.
+
 ## Setup
 
 ```bash

@@ -1,2 +1,5 @@
 /target
 /models
+/config
+webapp/node_modules
+webapp/dist

@@ -1,15 +1,18 @@
 mod capture;
 mod capture_sck;
-mod config;
 mod detect;
 mod overlay;
 mod pipeline;
+mod server;
+mod settings;
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use config::Config;
 use overlay::{CensorRegion, OverlayApp};
+use settings::{CensorSettings, Effective, Package};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -24,42 +27,72 @@ fn main() -> Result<()> {
     let censor_in_captures = args.iter().any(|a| a == "--censor-captures");
     args.retain(|a| a != "--censor-captures");
     let (mode, model) = match args.first().map(String::as_str) {
-        Some(m @ ("run" | "probe" | "demo")) => (m, args.get(1)),
-        Some(_) => ("run", args.first()),
+        Some(m @ ("run" | "probe" | "demo")) => (m, args.get(1).cloned()),
+        Some(_) => ("run", args.first().cloned()),
         None => ("run", None),
     };
-    let mut config = match model {
-        Some(model) => Config::default().with_model(model),
-        None => Config::default(),
-    };
-    config.censor_in_captures = censor_in_captures;
 
     match mode {
-        "probe" => probe(config),
+        "probe" => probe(model),
         "demo" => demo(),
-        _ => run(config),
+        _ => run(model, censor_in_captures),
     }
 }
 
 /// Continuous censoring: overlay event loop on the main thread (macOS
-/// requirement), capture/detect pipeline on a worker thread.
-fn run(config: Config) -> Result<()> {
-    anyhow::ensure!(
-        config.model_path.exists(),
-        "model not found at {} — run scripts/fetch-model.sh",
-        config.model_path.display()
-    );
-    if config.censor_in_captures {
-        tracing::warn!(
-            "--censor-captures: boxes will appear in screenshots/shares, but \
-             will blink roughly every {}ms as the detector re-checks beneath \
-             them (proper SCK exclusion filter is on the roadmap)",
-            config.hold_ms
-        );
+/// requirement), capture/detect pipeline and settings server on worker
+/// threads.
+fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
+    let package_path = PathBuf::from("config/package.json");
+    let package = if package_path.exists() {
+        Package::load(&package_path)?
+    } else {
+        let starter = Package::starter();
+        starter.save(&package_path)?;
+        tracing::info!("wrote starter package to {}", package_path.display());
+        starter
+    };
+
+    let mut effective = package.resolve();
+    // CLI flags act as runtime-only overrides on top of the package.
+    if let Some(model) = model_override {
+        effective.detection.model = model;
     }
-    let (event_loop, handle, mut app) = OverlayApp::new(!config.censor_in_captures)?;
+    if censor_in_captures {
+        effective.censor.censor_in_captures = true;
+    }
+    let (model_path, _) = effective.detection.model_path();
+    anyhow::ensure!(
+        model_path.exists(),
+        "model not found at {} — run scripts/fetch-model.sh",
+        model_path.display()
+    );
+
+    let (event_loop, handle, mut app) = OverlayApp::new(effective.censor.clone())?;
+    let shared = Arc::new(RwLock::new(effective));
+
+    let token = server::load_or_create_token(&PathBuf::from("config/api-token"))?;
+    let port: u16 = std::env::var("BETAMACS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8787);
+    tracing::info!("settings UI: http://127.0.0.1:{port}/  (token: {token})");
+    server::spawn(
+        Arc::new(server::ServerState {
+            package: Mutex::new(package),
+            effective: shared.clone(),
+            overlay: handle.clone(),
+            package_path,
+            token,
+        }),
+        port,
+        PathBuf::from(
+            std::env::var("BETAMACS_WEBAPP_DIR").unwrap_or_else(|_| "webapp/dist".into()),
+        ),
+    );
+
     std::thread::spawn(move || {
-        if let Err(e) = pipeline::run(config, handle) {
+        if let Err(e) = pipeline::run(shared, handle) {
             tracing::error!("pipeline exited: {e}");
             std::process::exit(1);
         }
@@ -73,7 +106,7 @@ fn run(config: Config) -> Result<()> {
 /// verify it is (a) visible to the user but (b) invisible to screen
 /// capture, by comparing captures taken before and while it is shown.
 fn demo() -> Result<()> {
-    let (event_loop, handle, mut app) = OverlayApp::new(true)?;
+    let (event_loop, handle, mut app) = OverlayApp::new(CensorSettings::default())?;
     std::thread::spawn(move || -> () {
         let check = || -> Result<f32> {
             let frames = capture::capture_all()?;
@@ -120,7 +153,7 @@ fn demo() -> Result<()> {
                 if during < 8.0 && before > 16.0 {
                     tracing::error!(
                         "overlay LEAKED into capture (region went dark) — \
-                         content_protected is not excluding it"
+                         content protection is not excluding it"
                     );
                 } else if (before - during).abs() < 16.0 {
                     tracing::info!("overlay correctly excluded from capture");
@@ -143,7 +176,13 @@ fn demo() -> Result<()> {
 }
 
 /// One-shot capture + detection pass with timings, no overlay.
-fn probe(config: Config) -> Result<()> {
+fn probe(model_override: Option<String>) -> Result<()> {
+    let mut effective = Effective::default();
+    if let Some(model) = model_override {
+        effective.detection.model = model;
+    }
+    let d = &effective.detection;
+
     let start = Instant::now();
     let frames = capture::capture_all()?;
     tracing::info!(
@@ -163,23 +202,24 @@ fn probe(config: Config) -> Result<()> {
         );
     }
 
-    if !config.model_path.exists() {
+    let (model_path, input_size) = d.model_path();
+    if !model_path.exists() {
         tracing::warn!(
             "model not found at {} — run scripts/fetch-model.sh; skipping detection",
-            config.model_path.display()
+            model_path.display()
         );
         return Ok(());
     }
 
-    let mut detector = detect::Detector::new(&config.model_path, config.input_size)?;
+    let mut detector = detect::Detector::new(&model_path, input_size)?;
     for frame in &frames {
         let start = Instant::now();
         let detections = detector.detect_tiled(
             &frame.image,
-            config.tile_grid,
-            config.tile_overlap,
-            config.confidence_threshold,
-            config.iou_threshold,
+            d.tile_grid,
+            0.2,
+            d.confidence_threshold,
+            d.iou_threshold,
         )?;
         tracing::info!(
             "{}: {} detection(s) in {:?}",
@@ -188,7 +228,7 @@ fn probe(config: Config) -> Result<()> {
             start.elapsed()
         );
         for det in &detections {
-            let censored = config.censored_classes.contains(&det.class);
+            let censored = d.triggers.get(det.class).copied().unwrap_or(false);
             tracing::info!(
                 "  {} {:.0}% at {:?}{}",
                 det.class,
