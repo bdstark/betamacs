@@ -132,6 +132,7 @@ export class BmLayers extends LitElement {
           p.namedConfigs = pkg.namedConfigs ?? [];
           p.layers = pkg.layers ?? [];
           p.overrides = pkg.overrides ?? {};
+          p.textSets = pkg.textSets ?? [];
           p.version = pkg.version ?? 1;
         });
         store.setStatus("package imported");
@@ -214,6 +215,63 @@ export class BmLayers extends LitElement {
             </div>
           `;
         })}
+      </bm-section>
+
+      <bm-section heading="Text sets">
+        <p class="muted">
+          Named collections of lines for the censor box text display. Assign
+          one or more to the text overlay in the Black box censor tab.
+        </p>
+        ${pkg.textSets.map(
+          (set, i) => html`
+            <div class="config">
+              <span class="name">${set.name}</span>
+              <span></span>
+              <span class="order">
+                <button
+                  @click=${() =>
+                    confirm(`Delete text set '${set.name}'?`) &&
+                    store.update((p) => {
+                      p.textSets.splice(i, 1);
+                    })}
+                >
+                  delete
+                </button>
+              </span>
+              ${set.description
+                ? html`<span class="desc">${set.description}</span>`
+                : ""}
+              <span class="sets" style="grid-column: 1 / -1">
+                <textarea
+                  style="width:100%;box-sizing:border-box;min-height:70px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font:inherit"
+                  .value=${set.lines.join("\n")}
+                  @change=${(e: Event) =>
+                    store.update((p) => {
+                      p.textSets[i]!.lines = (e.target as HTMLTextAreaElement).value
+                        .split("\n")
+                        .map((s) => s.trim())
+                        .filter(Boolean);
+                    })}
+                ></textarea>
+              </span>
+            </div>
+          `,
+        )}
+        <div class="actions">
+          <button
+            @click=${() => {
+              const name = prompt("Name for the new text set:");
+              if (!name) return;
+              store.update((p) => {
+                if (!p.textSets.some((s) => s.name === name)) {
+                  p.textSets.push({ name, lines: [] });
+                }
+              });
+            }}
+          >
+            New text set
+          </button>
+        </div>
       </bm-section>
 
       <bm-section heading="Package">

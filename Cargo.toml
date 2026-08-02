@@ -11,7 +11,8 @@ dispatch2 = "0.3.1"
 image = "0.25.10"
 ndarray = "0.17.2"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSColor", "NSView", "NSResponder", "NSGraphics"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSColor", "NSView", "NSResponder", "NSGraphics", "NSTextField", "NSControl", "NSFont", "NSText", "NSCell"] }
+objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime", "CMFormatDescription"] }
 objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer"] }

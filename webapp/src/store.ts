@@ -21,6 +21,8 @@ class Store {
 
   constructor() {
     this.pkg = readJson<Package>(PKG_KEY) ?? emptyPackage();
+    // Migrate drafts saved before textSets existed.
+    this.pkg.textSets ??= [];
     this.connection =
       readJson<Connection>(CONN_KEY) ?? { url: defaultAppUrl(), token: "" };
   }

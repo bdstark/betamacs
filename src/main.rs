@@ -22,6 +22,13 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // A silent thread panic would leave the app half-dead with no trace in
+    // the log; record it and exit loudly so a supervisor can restart us.
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic: {info}");
+        std::process::exit(101);
+    }));
+
     // Usage: betamacs [run|probe|demo] [320n|640m|path/to/model.onnx] [--censor-captures]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let censor_in_captures = args.iter().any(|a| a == "--censor-captures");
@@ -105,8 +112,13 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
 /// Show a fixed censor box on the primary monitor for a few seconds and
 /// verify it is (a) visible to the user but (b) invisible to screen
 /// capture, by comparing captures taken before and while it is shown.
+/// Styled from config/package.json when present, so the demo doubles as a
+/// style preview.
 fn demo() -> Result<()> {
-    let (event_loop, handle, mut app) = OverlayApp::new(CensorSettings::default())?;
+    let style = Package::load(&PathBuf::from("config/package.json"))
+        .map(|p| p.resolve().censor)
+        .unwrap_or_else(|_| CensorSettings::default());
+    let (event_loop, handle, mut app) = OverlayApp::new(style)?;
     std::thread::spawn(move || -> () {
         let check = || -> Result<f32> {
             let frames = capture::capture_all()?;
@@ -141,6 +153,8 @@ fn demo() -> Result<()> {
             y: 300.0,
             width: 400.0,
             height: 300.0,
+            trigger: "DEMO_TRIGGER",
+            text_seed: 0,
         };
         if let Err(e) = handle.set_regions(vec![region]) {
             tracing::error!("{e}");

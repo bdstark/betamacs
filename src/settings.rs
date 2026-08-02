@@ -27,6 +27,21 @@ pub struct Package {
     pub layers: Vec<String>,
     #[serde(default)]
     pub overrides: ModulePatches,
+    /// Named collections of overlay text lines. The censor module's text
+    /// display references one or more sets by name; their lines pool
+    /// together for the per-box random pick.
+    #[serde(default)]
+    pub text_sets: Vec<TextSet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextSet {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,12 +234,18 @@ impl CensorSettings {
     }
 }
 
+/// The text display drawn on a censor box: which named text sets supply
+/// the lines, and how they render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextOverlay {
     pub enabled: bool,
-    /// One is picked at random per box.
-    pub texts: Vec<String>,
+    /// Names of `Package::text_sets` to draw lines from.
+    pub sets: Vec<String>,
+    /// Resolved lines from the referenced sets (filled by
+    /// `Package::resolve`; ignored on input). One is picked per box.
+    #[serde(default)]
+    pub lines: Vec<String>,
     pub font_family: String,
     pub font_size_pt: f32,
     pub font_color: String,
@@ -234,7 +255,8 @@ impl Default for TextOverlay {
     fn default() -> Self {
         Self {
             enabled: false,
-            texts: Vec::new(),
+            sets: Vec::new(),
+            lines: Vec::new(),
             font_family: "Helvetica".into(),
             font_size_pt: 18.0,
             font_color: "#ffffff".into(),
@@ -269,6 +291,15 @@ impl Package {
                 effective.censor.apply(p);
             }
         }
+        // Pool the lines of the referenced text sets, in reference order.
+        effective.censor.text_overlay.lines = effective
+            .censor
+            .text_overlay
+            .sets
+            .iter()
+            .filter_map(|name| self.text_sets.iter().find(|s| &s.name == name))
+            .flat_map(|s| s.lines.iter().cloned())
+            .collect();
         effective
     }
 
@@ -363,6 +394,15 @@ impl Package {
             ],
             layers: vec![],
             overrides: ModulePatches::default(),
+            text_sets: vec![TextSet {
+                name: "classic".into(),
+                description: Some("Stock censor-bar phrases".into()),
+                lines: vec![
+                    "CENSORED".into(),
+                    "NOTHING TO SEE HERE".into(),
+                    "MOVE ALONG".into(),
+                ],
+            }],
         }
     }
 }

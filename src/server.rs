@@ -88,6 +88,23 @@ async fn put_package(
                 .into_response();
         }
     }
+    // Same for text-set references in any censor patch.
+    let patches = package
+        .named_configs
+        .iter()
+        .map(|c| &c.settings)
+        .chain(std::iter::once(&package.overrides));
+    for censor in patches.filter_map(|p| p.censor.as_ref()) {
+        for set in censor.text_overlay.iter().flat_map(|t| t.sets.iter()) {
+            if !package.text_sets.iter().any(|s| &s.name == set) {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("text set '{set}' is not defined in the package"),
+                )
+                    .into_response();
+            }
+        }
+    }
     let effective = package.resolve();
     if let Err(e) = package.save(&state.package_path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("save failed: {e}"))

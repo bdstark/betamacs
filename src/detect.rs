@@ -208,18 +208,36 @@ impl Detector {
 }
 
 /// Greedy per-class non-maximum suppression.
+///
+/// Suppresses by IoU, and also by containment (intersection over the
+/// smaller box's area): the full-frame pass and a tile pass often find the
+/// same region at different box sizes, whose IoU stays under the threshold
+/// even though one essentially contains the other.
 fn nms(mut detections: Vec<Detection>, iou_threshold: f32) -> Vec<Detection> {
     detections.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
     let mut kept: Vec<Detection> = Vec::new();
     for det in detections {
-        let overlaps = kept
-            .iter()
-            .any(|k| k.class == det.class && iou(k.bbox, det.bbox) > iou_threshold);
+        let overlaps = kept.iter().any(|k| {
+            k.class == det.class
+                && (iou(k.bbox, det.bbox) > iou_threshold
+                    || containment(k.bbox, det.bbox) > 0.6)
+        });
         if !overlaps {
             kept.push(det);
         }
     }
     kept
+}
+
+/// Intersection area over the smaller box's area (1.0 = fully contained).
+fn containment(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
+    let x1 = a.0.max(b.0);
+    let y1 = a.1.max(b.1);
+    let x2 = (a.0 + a.2).min(b.0 + b.2);
+    let y2 = (a.1 + a.3).min(b.1 + b.3);
+    let inter = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+    let min_area = (a.2 * a.3).min(b.2 * b.3);
+    if min_area <= 0.0 { 0.0 } else { inter / min_area }
 }
 
 fn iou(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {

@@ -55,8 +55,10 @@ contract and resolution.
 
 Modules: **detection** (model, confidence/IoU/minimum sliders, capture
 rate, tiling, hold time, grouped trigger switches) and **censor** (fill /
-border colors, x/y size percentages, trigger-label + random-text overlay
-config; label/text rendering in the app is pending).
+border colors, x/y size percentages, trigger-label + random-text overlay).
+Boxes render the trigger class and a randomly picked text via NSTextField
+subviews; the text pick is a stable hash of the box geometry so static
+boxes don't reshuffle their text.
 
 The settings site is TypeScript + Lit web components (`webapp/`), built
 with Vite, and works identically self-hosted by the app (`/`) or hosted

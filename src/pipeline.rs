@@ -34,17 +34,40 @@ pub fn detection_to_region(
     det: &Detection,
     x_scale_pct: f32,
     y_scale_pct: f32,
+    text_seed: u64,
 ) -> CensorRegion {
     let scale = frame.pixel_to_point_scale();
     let (x, y, w, h) = det.bbox;
     let new_w = w * (x_scale_pct / 100.0).max(0.0);
     let new_h = h * (y_scale_pct / 100.0).max(0.0);
+    // Clamp to the monitor so scaled-up boxes never hang off-screen (or
+    // onto a neighboring display).
+    let (ox, oy) = (frame.origin.0 as f32, frame.origin.1 as f32);
+    let (mw, mh) = (frame.logical_size.0 as f32, frame.logical_size.1 as f32);
+    let x1 = (ox + (x + w / 2.0 - new_w / 2.0) * scale).max(ox);
+    let y1 = (oy + (y + h / 2.0 - new_h / 2.0) * scale).max(oy);
+    let x2 = (x1 + new_w * scale).min(ox + mw);
+    let y2 = (y1 + new_h * scale).min(oy + mh);
     CensorRegion {
-        x: frame.origin.0 as f32 + (x + w / 2.0 - new_w / 2.0) * scale,
-        y: frame.origin.1 as f32 + (y + h / 2.0 - new_h / 2.0) * scale,
-        width: new_w * scale,
-        height: new_h * scale,
+        x: x1,
+        y: y1,
+        width: (x2 - x1).max(1.0),
+        height: (y2 - y1).max(1.0),
+        trigger: det.class,
+        text_seed,
     }
+}
+
+/// IoU between two censor regions, for matching a fresh detection to a
+/// held box.
+fn region_iou(a: &CensorRegion, b: &CensorRegion) -> f32 {
+    let x1 = a.x.max(b.x);
+    let y1 = a.y.max(b.y);
+    let x2 = (a.x + a.width).min(b.x + b.width);
+    let y2 = (a.y + a.height).min(b.y + b.height);
+    let inter = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+    let union = a.width * a.height + b.width * b.height - inter;
+    if union <= 0.0 { 0.0 } else { inter / union }
 }
 
 pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()> {
@@ -52,9 +75,16 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
     let (model_path, input_size) = initial.detection.model_path();
     let mut detector = Detector::new(&model_path, input_size)?;
     let mut loaded_model = initial.detection.model.clone();
+    let mut consecutive_failures = 0u32;
     let mut capturer = SckCapturer::new(initial.detection.capture_fps)?;
-    // Per-monitor: when censorable content was last seen, and where.
-    let mut held: HashMap<u32, (Instant, Vec<CensorRegion>)> = HashMap::new();
+    // Per-monitor held boxes, each with its own last-seen time so one
+    // region dropping out (confidence wobble) doesn't take others with it.
+    let mut held: HashMap<u32, Vec<(Instant, CensorRegion)>> = HashMap::new();
+    // Monotonic seed source for per-box text picks.
+    let mut next_text_seed: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let mut last_exclusion_attempt: Option<Instant> = None;
     // Frame-rate accounting, logged every 10s to spot busy displays.
     let mut frame_counts: HashMap<u32, u32> = HashMap::new();
@@ -114,9 +144,26 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                 cfg.detection.confidence_threshold,
                 cfg.detection.iou_threshold,
             ) {
-                Ok(d) => d,
+                Ok(d) => {
+                    consecutive_failures = 0;
+                    d
+                }
                 Err(e) => {
                     tracing::error!("detection failed on {}: {e}", frame.monitor_name);
+                    consecutive_failures += 1;
+                    // The ONNX session can wedge (e.g. "GetElementType is
+                    // not implemented"); rebuild it after repeat failures.
+                    if consecutive_failures >= 3 {
+                        let (path, size) = cfg.detection.model_path();
+                        match Detector::new(&path, size) {
+                            Ok(d) => {
+                                tracing::warn!("rebuilt detector session after repeated failures");
+                                detector = d;
+                                consecutive_failures = 0;
+                            }
+                            Err(e) => tracing::error!("detector rebuild failed: {e}"),
+                        }
+                    }
                     continue;
                 }
             };
@@ -128,26 +175,81 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                         && d.bbox.3 >= cfg.detection.min_region_px
                 })
                 .collect();
-            if !flagged.is_empty() {
-                let regions = flagged
+            let regions: Vec<CensorRegion> = flagged
+                .iter()
+                .map(|d| {
+                    next_text_seed = next_text_seed.wrapping_add(0x9e3779b97f4a7c15);
+                    detection_to_region(
+                        frame,
+                        d,
+                        cfg.censor.x_scale_pct,
+                        cfg.censor.y_scale_pct,
+                        next_text_seed,
+                    )
+                })
+                .collect();
+
+            // Per-region hold with movement tracking: each fresh detection
+            // claims the best-matching held box — overlapping first, else
+            // the nearest with the same trigger (content being dragged) —
+            // and updates it in place, so the box jumps with its content
+            // instead of leaving a trail. Unclaimed boxes linger `hold_ms`
+            // (confidence-wobble grace, per box).
+            let now = Instant::now();
+            let entry = held.entry(*monitor_id).or_default();
+            let before: Vec<CensorRegion> = entry.iter().map(|(_, r)| r.clone()).collect();
+            let mut claimed = vec![false; entry.len()];
+            for region in regions {
+                let best = entry
                     .iter()
-                    .map(|d| {
-                        detection_to_region(
-                            frame,
-                            d,
-                            cfg.censor.x_scale_pct,
-                            cfg.censor.y_scale_pct,
-                        )
+                    .enumerate()
+                    .filter(|(j, (_, h))| !claimed[*j] && h.trigger == region.trigger)
+                    .map(|(j, (_, h))| {
+                        let iou = region_iou(h, &region);
+                        let dx = (h.x + h.width / 2.0) - (region.x + region.width / 2.0);
+                        let dy = (h.y + h.height / 2.0) - (region.y + region.height / 2.0);
+                        // Overlapping boxes always beat distant ones.
+                        (j, if iou > 0.0 { 1e6 + iou } else { -dx.hypot(dy) })
                     })
-                    .collect::<Vec<_>>();
-                let is_new = held
-                    .get(monitor_id)
-                    .is_none_or(|(_, prev)| *prev != regions);
-                if is_new {
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(j, _)| j);
+                match best {
+                    Some(j) => {
+                        claimed[j] = true;
+                        // The box keeps its text for its whole lifetime.
+                        let mut region = region;
+                        region.text_seed = entry[j].1.text_seed;
+                        // Dead-band: detection coordinates jitter slightly
+                        // frame to frame; keep the existing geometry unless
+                        // the box genuinely moved or resized.
+                        let existing = entry[j].1.clone();
+                        let stable = (existing.x - region.x).abs() < 4.0
+                            && (existing.y - region.y).abs() < 4.0
+                            && (existing.width - region.width).abs() < 4.0
+                            && (existing.height - region.height).abs() < 4.0;
+                        entry[j] = (now, if stable { existing } else { region });
+                    }
+                    None => {
+                        entry.push((now, region));
+                        claimed.push(true);
+                    }
+                }
+            }
+            entry.retain(|(last_seen, _)| last_seen.elapsed() < hold);
+            let after: Vec<CensorRegion> = entry.iter().map(|(_, r)| r.clone()).collect();
+            if entry.is_empty() {
+                held.remove(monitor_id);
+            }
+
+            if after != before {
+                changed = true;
+                if after.is_empty() {
+                    tracing::info!("{}: clear, releasing censor boxes", frame.monitor_name);
+                } else {
                     tracing::info!(
                         "{}: censoring {} region(s) in {:?}: {:?}",
                         frame.monitor_name,
-                        regions.len(),
+                        after.len(),
                         tick.elapsed(),
                         flagged
                             .iter()
@@ -155,22 +257,14 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                             .collect::<Vec<_>>(),
                     );
                 }
-                held.insert(*monitor_id, (Instant::now(), regions));
-                changed = true;
-            } else if let Some((last_seen, _)) = held.get(monitor_id) {
-                // Content gone from this fresh frame; release after the
-                // wobble grace period.
-                if last_seen.elapsed() >= hold {
-                    tracing::info!("{}: clear, releasing censor boxes", frame.monitor_name);
-                    held.remove(monitor_id);
-                    changed = true;
-                }
             }
         }
 
         if changed {
-            let all: Vec<CensorRegion> =
-                held.values().flat_map(|(_, r)| r.iter().cloned()).collect();
+            let all: Vec<CensorRegion> = held
+                .values()
+                .flat_map(|regions| regions.iter().map(|(_, r)| r.clone()))
+                .collect();
             overlay.set_regions(all)?;
         }
 

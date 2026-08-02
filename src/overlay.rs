@@ -34,6 +34,12 @@ pub struct CensorRegion {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// NudeNet class that caused this box (for the trigger-label overlay).
+    pub trigger: &'static str,
+    /// Picks this box's overlay text; assigned when the box first appears
+    /// and preserved while it moves, so the text stays stable for the
+    /// box's whole lifetime.
+    pub text_seed: u64,
 }
 
 #[derive(Debug)]
@@ -66,6 +72,8 @@ impl OverlayHandle {
 
 pub struct OverlayApp {
     windows: Vec<Window>,
+    /// Text fields (random text + trigger label) per window, same index.
+    chromes: Vec<macos::Chrome>,
     visible: usize,
     /// Last applied region set; identical updates are dropped so a static
     /// scene causes zero window-server traffic (window updates would
@@ -88,6 +96,7 @@ impl OverlayApp {
             handle,
             Self {
                 windows: Vec::new(),
+                chromes: Vec::new(),
                 visible: 0,
                 last_regions: Vec::new(),
                 style,
@@ -118,6 +127,7 @@ impl OverlayApp {
             let _ = window.set_cursor_hittest(false);
             macos::configure_censor_window(&window);
             macos::apply_style(&window, &self.style);
+            self.chromes.push(macos::Chrome::attach(&window));
             self.windows.push(window);
         }
         Ok(())
@@ -135,7 +145,12 @@ impl OverlayApp {
             let window = &self.windows[i];
             let _ = window.request_inner_size(LogicalSize::new(region.width, region.height));
             window.set_outer_position(LogicalPosition::new(region.x, region.y));
+            self.chromes[i].update(region, &self.style);
             window.set_visible(true);
+            // winit's set_visible uses orderFront, which the window server
+            // can ignore for a background (never-activated) app; this
+            // orders the window in regardless of activation state.
+            macos::order_front_regardless(window);
             tracing::debug!(
                 "window {i}: requested {:?}, actual pos {:?} size {:?} visible {:?}",
                 region,
@@ -143,6 +158,7 @@ impl OverlayApp {
                 window.inner_size(),
                 window.is_visible(),
             );
+            macos::debug_window_state(window, i);
         }
         // Hide the pooled surplus.
         for window in &self.windows[regions.len()..] {
@@ -158,9 +174,12 @@ impl OverlayApp {
         }
         self.style = style;
         let protected = self.content_protected();
-        for window in &self.windows {
+        for (i, window) in self.windows.iter().enumerate() {
             window.set_content_protected(protected);
             macos::apply_style(window, &self.style);
+            if let Some(region) = self.last_regions.get(i) {
+                self.chromes[i].update(region, &self.style);
+            }
         }
     }
 }
@@ -186,11 +205,102 @@ impl ApplicationHandler<OverlayMsg> for OverlayApp {
 
 mod macos {
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSColor, NSView, NSWindow, NSWindowCollectionBehavior};
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSColor, NSFont, NSTextAlignment, NSTextField, NSView, NSWindow,
+        NSWindowCollectionBehavior,
+    };
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_foundation::NSString;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
+    use super::CensorRegion;
     use crate::settings::{parse_color, CensorSettings};
+
+    /// The text fields drawn on a censor window: a centered random text
+    /// and a small trigger-class label near the bottom edge.
+    pub struct Chrome {
+        text: Option<Retained<NSTextField>>,
+        label: Option<Retained<NSTextField>>,
+    }
+
+    impl Chrome {
+        pub fn attach(window: &Window) -> Self {
+            let empty = Self { text: None, label: None };
+            let Some(mtm) = MainThreadMarker::new() else {
+                return empty;
+            };
+            let Some(content) = ns_window(window).and_then(|ns| ns.contentView()) else {
+                tracing::error!("no content view for overlay window");
+                return empty;
+            };
+            let make = || {
+                let field = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+                field.setAlignment(NSTextAlignment::Center);
+                field.setHidden(true);
+                content.addSubview(&field);
+                field
+            };
+            Self {
+                text: Some(make()),
+                label: Some(make()),
+            }
+        }
+
+        /// Set contents/fonts/frames for this box. Called whenever the
+        /// window is (re)assigned a region or the style changes.
+        pub fn update(&self, region: &CensorRegion, style: &CensorSettings) {
+            let (w, h) = (region.width as f64, region.height as f64);
+            let overlay = &style.text_overlay;
+            let (r, g, b, a) = parse_color(&overlay.font_color).unwrap_or((1.0, 1.0, 1.0, 1.0));
+            let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a);
+
+            if let Some(text) = &self.text {
+                let show = overlay.enabled && !overlay.lines.is_empty();
+                text.setHidden(!show);
+                if show {
+                    let pick = pick_text(region, &overlay.lines);
+                    text.setStringValue(&NSString::from_str(pick));
+                    text.setTextColor(Some(&color));
+                    text.setFont(Some(&font(&overlay.font_family, overlay.font_size_pt as f64)));
+                    text.sizeToFit();
+                    let size = text.frame().size;
+                    text.setFrame(centered(size, w, (h - size.height) / 2.0));
+                }
+            }
+
+            if let Some(label) = &self.label {
+                label.setHidden(!style.show_trigger_label);
+                if style.show_trigger_label {
+                    label.setStringValue(&NSString::from_str(region.trigger));
+                    label.setTextColor(Some(&color));
+                    let size_pt = (overlay.font_size_pt as f64 * 0.6).clamp(9.0, 14.0);
+                    label.setFont(Some(&font(&overlay.font_family, size_pt)));
+                    label.sizeToFit();
+                    let size = label.frame().size;
+                    label.setFrame(centered(size, w, 4.0));
+                }
+            }
+        }
+    }
+
+    fn centered(size: CGSize, container_width: f64, y: f64) -> CGRect {
+        CGRect::new(
+            CGPoint::new(((container_width - size.width) / 2.0).max(0.0), y.max(0.0)),
+            size,
+        )
+    }
+
+    fn font(family: &str, size: f64) -> Retained<NSFont> {
+        NSFont::fontWithName_size(&NSString::from_str(family), size)
+            .unwrap_or_else(|| NSFont::boldSystemFontOfSize(size))
+    }
+
+    /// The box's seed picks its text once, for its whole lifetime.
+    fn pick_text<'a>(region: &CensorRegion, texts: &'a [String]) -> &'a str {
+        &texts[(region.text_seed % texts.len() as u64) as usize]
+    }
 
     fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
         let handle = window.window_handle().ok()?;
@@ -217,6 +327,35 @@ mod macos {
                 | NSWindowCollectionBehavior::FullScreenAuxiliary
                 | NSWindowCollectionBehavior::Stationary
                 | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+    }
+
+    pub fn order_front_regardless(window: &Window) {
+        if let Some(ns) = ns_window(window) {
+            ns.orderFrontRegardless();
+        }
+    }
+
+    /// Log ground truth from the NSWindow itself (winit's bookkeeping can
+    /// disagree with the window server).
+    pub fn debug_window_state(window: &Window, i: usize) {
+        let Some(ns) = ns_window(window) else {
+            tracing::debug!("window {i}: no NSWindow");
+            return;
+        };
+        let frame = ns.frame();
+        tracing::debug!(
+            "window {i} NSWindow: number={:?} visible={} sharing={:?} level={:?} alpha={} frame=({}, {}) {}x{} screenCount={}",
+            ns.windowNumber(),
+            ns.isVisible(),
+            ns.sharingType(),
+            ns.level(),
+            ns.alphaValue(),
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+            objc2_app_kit::NSScreen::screens(objc2::MainThreadMarker::new().unwrap()).len(),
         );
     }
 

@@ -71,10 +71,19 @@ export interface DetectionSettings {
 
 export interface TextOverlay {
   enabled: boolean;
-  texts: string[];
+  /** Names of Package.textSets to draw lines from. */
+  sets: string[];
+  /** Resolved lines (filled by resolve(); ignored on input). */
+  lines?: string[];
   fontFamily: string;
   fontSizePt: number;
   fontColor: string;
+}
+
+export interface TextSet {
+  name: string;
+  description?: string;
+  lines: string[];
 }
 
 export interface CensorSettings {
@@ -107,6 +116,7 @@ export interface Package {
   namedConfigs: NamedConfig[];
   layers: string[];
   overrides: ModulePatches;
+  textSets: TextSet[];
 }
 
 export interface Effective {
@@ -145,7 +155,7 @@ export function defaultCensor(): CensorSettings {
     censorInCaptures: false,
     textOverlay: {
       enabled: false,
-      texts: [],
+      sets: [],
       fontFamily: "Helvetica",
       fontSizePt: 18,
       fontColor: "#ffffff",
@@ -154,7 +164,15 @@ export function defaultCensor(): CensorSettings {
 }
 
 export function emptyPackage(): Package {
-  return { version: 1, namedConfigs: [], layers: [], overrides: {} };
+  return { version: 1, namedConfigs: [], layers: [], overrides: {}, textSets: [] };
+}
+
+/** Pool the lines of the referenced text sets, in reference order. */
+export function resolveTextLines(pkg: Package, overlay: TextOverlay): string[] {
+  return overlay.sets
+    .map((name) => pkg.textSets.find((s) => s.name === name))
+    .filter((s): s is TextSet => !!s)
+    .flatMap((s) => s.lines);
 }
 
 function applyDetection(base: DetectionSettings, patch: DetectionPatch): void {
@@ -183,6 +201,7 @@ export function resolve(pkg: Package): Effective {
     if (patches.detection) applyDetection(effective.detection, patches.detection);
     if (patches.censor) applyCensor(effective.censor, patches.censor);
   }
+  effective.censor.textOverlay.lines = resolveTextLines(pkg, effective.censor.textOverlay);
   return effective;
 }
 

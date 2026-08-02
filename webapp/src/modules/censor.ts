@@ -71,7 +71,8 @@ export class BmCensorModule extends LitElement {
   }
 
   private setText(patch: Partial<TextOverlay>) {
-    const current = store.effective.censor.textOverlay;
+    // Strip resolved lines; they're derived from the sets on resolve.
+    const { lines, ...current } = store.effective.censor.textOverlay;
     setOverride("textOverlay", { ...current, ...patch });
   }
 
@@ -90,11 +91,11 @@ export class BmCensorModule extends LitElement {
               .borderColor};transform:scale(${c.xScalePct / 130}, ${c.yScalePct / 130})"
           >
             <div>
-              ${t.enabled && t.texts.length
+              ${t.enabled && t.lines?.length
                 ? html`<div
                     style="color:${t.fontColor};font-family:${t.fontFamily};font-size:${t.fontSizePt}px"
                   >
-                    ${t.texts[0]}
+                    ${t.lines[0]}
                   </div>`
                 : ""}
               ${c.showTriggerLabel
@@ -169,7 +170,7 @@ export class BmCensorModule extends LitElement {
         ></bm-switch>
         <bm-switch
           label="Show trigger label"
-          hint="Overlays the NudeNet class that caused the box (app support pending)"
+          hint="Overlays the NudeNet class that caused the box"
           .value=${c.showTriggerLabel}
           source=${src("showTriggerLabel")}
           @field-change=${(e: CustomEvent) => setOverride("showTriggerLabel", e.detail)}
@@ -180,7 +181,7 @@ export class BmCensorModule extends LitElement {
       <bm-section heading="Text overlay">
         <bm-switch
           label="Enabled"
-          hint="Draw a randomly chosen text on each box (app support pending)"
+          hint="Draw a randomly chosen text on each box"
           .value=${t.enabled}
           source=${src("textOverlay")}
           @field-change=${(e: CustomEvent) => this.setText({ enabled: e.detail })}
@@ -213,18 +214,32 @@ export class BmCensorModule extends LitElement {
         ></bm-color>
         <div style="padding:10px 0">
           <p class="muted" style="margin:0 0 6px">
-            Texts, one per line — one is picked at random per box:
+            Text sets assigned to this display — lines pool together, one is
+            picked per box. Manage the sets in Layers &amp; package.
           </p>
-          <textarea
-            .value=${t.texts.join("\n")}
-            @change=${(e: Event) =>
-              this.setText({
-                texts: (e.target as HTMLTextAreaElement).value
-                  .split("\n")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-              })}
-          ></textarea>
+          ${pkg.textSets.length === 0
+            ? html`<p class="muted">No text sets defined yet.</p>`
+            : pkg.textSets.map(
+                (set) => html`
+                  <label style="display:flex;gap:8px;align-items:center;padding:3px 0">
+                    <input
+                      type="checkbox"
+                      .checked=${t.sets.includes(set.name)}
+                      @change=${(e: Event) => {
+                        const on = (e.target as HTMLInputElement).checked;
+                        const sets = t.sets.filter((s) => s !== set.name);
+                        if (on) sets.push(set.name);
+                        this.setText({ sets });
+                      }}
+                    />
+                    <span>${set.name}</span>
+                    <span class="muted">${set.lines.length} line(s)</span>
+                  </label>
+                `,
+              )}
+          <p class="muted" style="margin:6px 0 0">
+            Pooled lines: ${(t.lines ?? []).length ? (t.lines ?? []).join(" · ") : "none"}
+          </p>
         </div>
       </bm-section>
     `;
