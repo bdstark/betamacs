@@ -86,6 +86,7 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let mut last_exclusion_attempt: Option<Instant> = None;
+    let mut displays_were_asleep = capturer.any_display_asleep();
     // Frame-rate accounting, logged every 10s to spot busy displays.
     let mut frame_counts: HashMap<u32, u32> = HashMap::new();
     let mut last_stats = Instant::now();
@@ -111,6 +112,19 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                 Err(e) => tracing::error!("model switch to {} failed: {e}", path.display()),
             }
         }
+
+        // SCK streams go stale across display sleep: they keep delivering
+        // frames, but of pre-sleep content, so detection silently sees an
+        // outdated screen. Rebuild the streams when displays wake.
+        let displays_asleep = capturer.any_display_asleep();
+        if displays_were_asleep && !displays_asleep {
+            tracing::info!("display(s) woke; rebuilding capture streams");
+            match SckCapturer::new(cfg.detection.capture_fps) {
+                Ok(new_capturer) => capturer = new_capturer,
+                Err(e) => tracing::error!("stream rebuild failed: {e}"),
+            }
+        }
+        displays_were_asleep = displays_asleep;
 
         // Block for the next changed frame, then drain the queue keeping
         // only the newest frame per monitor (coalescing under load).

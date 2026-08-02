@@ -254,6 +254,24 @@ impl SckCapturer {
     pub fn sender(&self) -> mpsc::Sender<Frame> {
         self.tx.clone()
     }
+
+    /// True if any captured display is currently asleep. Streams go stale
+    /// across display sleep (they keep delivering frames of pre-sleep
+    /// content), so the pipeline rebuilds the capturer on the wake
+    /// transition.
+    pub fn any_display_asleep(&self) -> bool {
+        self.streams
+            .iter()
+            .any(|(id, _)| objc2_core_graphics::CGDisplayIsAsleep(*id))
+    }
+}
+
+impl Drop for SckCapturer {
+    fn drop(&mut self) {
+        for (_, stream) in &self.streams {
+            unsafe { stream.stopCaptureWithCompletionHandler(None) };
+        }
+    }
 }
 
 fn start_stream(
