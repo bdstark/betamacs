@@ -12,10 +12,16 @@
 #                                            # -> <package.json>.authored
 #                                            #    (the wrapper publish.sh uploads)
 #
-# Custody: after generating, store author-key.pem's contents in
-# typeserver as a pasted secret. To lock config changes until T, use
-# typeserver's LOCK_SECRET on it and delete/shred the local file; the
-# drand timelock makes early recovery impossible for everyone.
+# Preferred custody: create the key INSIDE typeserver (Secrets UI →
+# "Signing Key" type — the private half never exists outside the
+# server), save the shown public key as author-pubkey.pem, and sign
+# remotely by setting:
+#   TYPESERVER_URL       e.g. https://typeserver.docker.newton.haus
+#   TYPESERVER_SESSION   the ts_session cookie value of a signed-in browser
+#   BETAMACS_AUTHOR_SECRET  the secret's name in typeserver
+# Locking config changes is then just typeserver's LOCK_SECRET on that
+# secret — the drand timelock refuses the signing operation until T.
+# The local author-key.pem path below remains for offline/dev use.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KEY="${BETAMACS_AUTHOR_KEY:-$ROOT/author-key.pem}"
@@ -33,11 +39,16 @@ case "${1:-}" in
   sign)
     FILE="${2:-}"
     [ -f "$FILE" ] || { echo "usage: author-key.sh sign <package.json> [ttl-seconds]" >&2; exit 1; }
-    [ -f "$KEY" ] || { echo "author key not found at $KEY (BETAMACS_AUTHOR_KEY overrides)" >&2; exit 1; }
     TTL="${3:-3600}"
-    python3 - "$FILE" "$KEY" "$TTL" <<'EOF'
-import base64, json, subprocess, sys, tempfile, time
-path, key, ttl = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    if [ -n "${BETAMACS_AUTHOR_SECRET:-}" ]; then
+      : "${TYPESERVER_URL:?TYPESERVER_URL required for remote signing}"
+      : "${TYPESERVER_SESSION:?TYPESERVER_SESSION (ts_session cookie) required for remote signing}"
+    elif [ ! -f "$KEY" ]; then
+      echo "no author key at $KEY and no BETAMACS_AUTHOR_SECRET set" >&2; exit 1
+    fi
+    python3 - "$FILE" "$TTL" "$KEY" <<'EOF'
+import base64, json, os, subprocess, sys, tempfile, time, urllib.request
+path, ttl, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 package = open(path, "rb").read()
 json.loads(package)  # must be valid JSON before it gets signed
 fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -45,11 +56,34 @@ authored_at = time.strftime(fmt, time.gmtime())
 not_after = time.strftime(fmt, time.gmtime(time.time() + ttl))
 package_b64 = base64.b64encode(package).decode()
 signing_input = f"betamacs-config-author-v1\n{authored_at}\n{not_after}\n{package_b64}"
-with tempfile.NamedTemporaryFile() as msg, tempfile.NamedTemporaryFile() as sig:
-    msg.write(signing_input.encode()); msg.flush()
-    subprocess.run(["openssl", "dgst", "-sha256", "-sign", key,
-                    "-out", sig.name, msg.name], check=True)
-    signature = base64.b64encode(open(sig.name, "rb").read()).decode()
+
+secret = os.environ.get("BETAMACS_AUTHOR_SECRET")
+if secret:
+    # Remote: typeserver's signing oracle. The key never leaves the
+    # server; a LOCK_SECRET on it refuses this call until the lock ends.
+    req = urllib.request.Request(
+        os.environ["TYPESERVER_URL"].rstrip("/") + "/api/secrets/sign",
+        data=json.dumps({
+            "name": secret,
+            "payload_b64": base64.b64encode(signing_input.encode()).decode(),
+            "passphrase": os.environ.get("BETAMACS_AUTHOR_PASSPHRASE", ""),
+        }).encode(),
+        headers={"Content-Type": "application/json",
+                 "Cookie": "ts_session=" + os.environ["TYPESERVER_SESSION"]},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            signature = json.load(resp)["signature_b64"]
+    except urllib.error.HTTPError as e:
+        sys.exit(f"typeserver refused to sign: {e.read().decode().strip()}")
+    print(f"signed remotely with typeserver secret {secret!r}")
+else:
+    with tempfile.NamedTemporaryFile() as msg, tempfile.NamedTemporaryFile() as sig:
+        msg.write(signing_input.encode()); msg.flush()
+        subprocess.run(["openssl", "dgst", "-sha256", "-sign", key,
+                        "-out", sig.name, msg.name], check=True)
+        signature = base64.b64encode(open(sig.name, "rb").read()).decode()
+
 out = path + ".authored"
 json.dump({"packageB64": package_b64, "authoredAt": authored_at,
            "notAfter": not_after, "authorSignature": signature},

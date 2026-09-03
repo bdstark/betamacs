@@ -160,9 +160,16 @@ Screen Time is neither an obstacle nor a defense here:
   `BETAMACS_AUTHOR_TTL`), so pre-signed stashes expire; epoch
   anti-rollback blocks replaying old configs.
 
-  **The lock ceremony:** store `author-key.pem`'s contents in
-  typeserver as a pasted secret; to lock, `LOCK_SECRET` it with
-  `decrypt_at = T` and shred the local file. typeserver's timed secrets
+  **The lock ceremony (signing oracle):** typeserver holds the author
+  key and signs on demand — create a "Signing Key" secret in its
+  Secrets UI (the private half is generated server-side and never
+  leaves; the shown public key becomes `author-pubkey.pem`), and
+  publish with `BETAMACS_AUTHOR_SECRET=<name>`, `TYPESERVER_URL`, and
+  `TYPESERVER_SESSION` set — publish.sh calls `POST /api/secrets/sign`.
+  To lock, `LOCK_SECRET` the secret with `decrypt_at = T`: the signing
+  *operation* then refuses until the round arrives; there is no local
+  key to manage or shred. (A local `author-key.pem` remains supported
+  for offline/dev signing.) typeserver's timed secrets
   are real timelock cryptography — the data key is wrapped to a future
   drand (League of Entropy) round via tlock/IBE — so before T no one,
   parent and server root included, can produce a valid config
