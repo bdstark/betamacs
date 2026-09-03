@@ -103,16 +103,30 @@ Requires macOS Screen Recording permission for the terminal/app running it.
 
 ```bash
 scripts/make-app.sh              # -> dist/betamacs.app (signed)
-ditto dist/betamacs.app /Applications/betamacs.app
-launchctl kickstart -k gui/$UID/com.bdstark.betamacs   # restart after reinstall
 ```
 
-`~/Library/LaunchAgents/com.bdstark.betamacs.plist` runs the bundle's
-binary with `RunAtLoad` + `KeepAlive`, so it starts at login and launchd
-relaunches it on any exit (the panic hook's loud `exit(101)` counts on
-this). First-time load: `launchctl bootstrap gui/$UID <plist>`; stop for
-good with `launchctl bootout gui/$UID/com.bdstark.betamacs`. Early
-launch failures (before the logger starts) land in the data dir's
+Copy `dist/betamacs.app` anywhere (e.g. `/Applications`) and open it
+once: a bundled hand launch self-installs. It writes
+`~/Library/LaunchAgents/com.bdstark.betamacs.plist` pointing at its own
+bundle (`RunAtLoad` + `KeepAlive`), replaces any loaded agent with it,
+and exits, leaving the launchd-managed instance running — so it starts
+at every login and launchd relaunches it on any exit (the panic hook's
+loud `exit(101)` counts on this). The plist's `BETAMACS_LAUNCHD` env
+marker is what tells the launchd child not to self-install again.
+Grant Screen Recording (System Settings → Privacy & Security) on first
+install; the Developer ID signature keeps the grant across updates. To
+update in place, overwrite the .app and run
+`launchctl kickstart -k gui/$UID/com.bdstark.betamacs` — or just open
+the app again. Note `open -a` is a no-op while an instance is running;
+run `Contents/MacOS/betamacs` directly to force a reinstall. Uninstall:
+
+```bash
+launchctl bootout gui/$UID/com.bdstark.betamacs
+rm ~/Library/LaunchAgents/com.bdstark.betamacs.plist
+rm -rf /Applications/betamacs.app ~/Library/Application\ Support/betamacs
+```
+
+Early launch failures (before the logger starts) land in the data dir's
 `launchd.log`.
 
 When the executable finds itself inside a bundle it pins the working

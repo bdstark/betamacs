@@ -23,6 +23,7 @@ fn main() -> Result<()> {
         .map(|res| enter_data_dir(&res))
         .transpose()?;
 
+    let log_file_bundled = log_file.is_some();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "betamacs=info,ort=error".into());
     match log_file {
@@ -51,11 +52,100 @@ fn main() -> Result<()> {
         None => ("run", None),
     };
 
+    // Bundled but launched by hand (Finder, `open`) rather than by launchd:
+    // install/refresh the LaunchAgent and hand off to the instance it
+    // starts, so copying the .app and opening it once is a full install.
+    if mode == "run" && log_file_bundled && std::env::var_os("BETAMACS_LAUNCHD").is_none() {
+        return self_install().inspect_err(|e| tracing::error!("self-install failed: {e}"));
+    }
+
     match mode {
         "probe" => probe(model),
         "demo" => demo(),
         _ => run(model, censor_in_captures),
     }
+}
+
+/// Write ~/Library/LaunchAgents/com.bdstark.betamacs.plist pointing at the
+/// running bundle, replace any loaded agent with it, and return so this
+/// hand-launched process exits. The plist sets BETAMACS_LAUNCHD, which is
+/// what stops the launchd-started child from landing back here.
+fn self_install() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let exe = std::env::current_exe()?;
+    let home = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let uid = std::fs::metadata(&home)?.uid();
+    let log = home.join("Library/Application Support/betamacs/launchd.log");
+    let agents = home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents)?;
+    let plist_path = agents.join("com.bdstark.betamacs.plist");
+    std::fs::write(
+        &plist_path,
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.bdstark.betamacs</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{exe}</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BETAMACS_LAUNCHD</key>
+		<string>1</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>StandardOutPath</key>
+	<string>{log}</string>
+	<key>StandardErrorPath</key>
+	<string>{log}</string>
+</dict>
+</plist>
+"#,
+            exe = exe.display(),
+            log = log.display(),
+        ),
+    )?;
+
+    // Replace whatever is loaded; bootout fails harmlessly when nothing is.
+    let service = format!("gui/{uid}/com.bdstark.betamacs");
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &service])
+        .status();
+    // launchd tears the booted-out service down asynchronously, and
+    // bootstrapping the same label too soon fails with EIO — retry briefly.
+    let mut status = None;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let s = std::process::Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(format!("gui/{uid}"))
+            .arg(&plist_path)
+            .status()?;
+        status = Some(s);
+        if s.success() {
+            break;
+        }
+    }
+    let status = status.expect("at least one bootstrap attempt");
+    anyhow::ensure!(status.success(), "launchctl bootstrap failed: {status}");
+    tracing::info!(
+        "installed LaunchAgent {} for {} and handed off",
+        plist_path.display(),
+        exe.display()
+    );
+    Ok(())
 }
 
 /// Contents/Resources of the .app we are running from, or None when the
