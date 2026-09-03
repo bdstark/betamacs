@@ -209,11 +209,46 @@ export interface ExposureSettings {
 }
 export type ExposurePatch = Partial<ExposureSettings>;
 
+// ------------------------------------------------------------- earned time
+// A gate: during a scheduled window the internet is locked until the user
+// has earned credit by active time on an allowlisted site/app. Bankable.
+// Policy only (see docs/earned-time.md); disabled by default.
+
+export interface Schedule {
+  days: string[]; // lowercase "mon".."sun"
+  from: string; // "HH:MM" local
+  to: string;
+}
+
+export interface SourceMatch {
+  bundleId?: string;
+  browserHostSuffix?: string;
+}
+
+export interface EarnSource {
+  name: string;
+  match: SourceMatch;
+  earnRatio: number;
+}
+
+export interface EarnedTimeSettings {
+  enabled: boolean;
+  schedule: Schedule[];
+  sources: EarnSource[];
+  spendRatio: number;
+  dailyEarnCapMin: number;
+  maxBankMin: number;
+  minSessionMin: number;
+  idleTimeoutSec: number;
+}
+export type EarnedTimePatch = Partial<EarnedTimeSettings>;
+
 export interface ModulePatches {
   detection?: DetectionPatch;
   censor?: CensorPatch;
   challenge?: ChallengePatch;
   exposure?: ExposurePatch;
+  earnedTime?: EarnedTimePatch;
 }
 
 export interface NamedConfig {
@@ -235,6 +270,7 @@ export interface Effective {
   censor: CensorSettings;
   challenge: ChallengeSettings;
   exposure: ExposureSettings;
+  earnedTime: EarnedTimeSettings;
 }
 
 export function defaultDetection(): DetectionSettings {
@@ -355,12 +391,26 @@ export function defaultExposure(): ExposureSettings {
   };
 }
 
+export function defaultEarnedTime(): EarnedTimeSettings {
+  return {
+    enabled: false,
+    schedule: [],
+    sources: [],
+    spendRatio: 1,
+    dailyEarnCapMin: 120,
+    maxBankMin: 240,
+    minSessionMin: 5,
+    idleTimeoutSec: 60,
+  };
+}
+
 export function resolve(pkg: Package): Effective {
   const effective: Effective = {
     detection: defaultDetection(),
     censor: defaultCensor(),
     challenge: defaultChallenge(),
     exposure: defaultExposure(),
+    earnedTime: defaultEarnedTime(),
   };
   const layerPatches = pkg.layers
     .map((name) => pkg.namedConfigs.find((c) => c.name === name)?.settings)
@@ -370,6 +420,7 @@ export function resolve(pkg: Package): Effective {
     if (patches.censor) applyCensor(effective.censor, patches.censor);
     if (patches.challenge) Object.assign(effective.challenge, patches.challenge);
     if (patches.exposure) Object.assign(effective.exposure, patches.exposure);
+    if (patches.earnedTime) Object.assign(effective.earnedTime, patches.earnedTime);
   }
   effective.censor.textOverlay.lines = resolveTextLines(pkg, effective.censor.textOverlay);
   return effective;

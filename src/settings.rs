@@ -67,6 +67,8 @@ pub struct ModulePatches {
     pub challenge: Option<ChallengePatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<ExposurePatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earned_time: Option<EarnedTimePatch>,
 }
 
 // ---------------------------------------------------------------- detection
@@ -750,6 +752,126 @@ fn default_weight() -> f32 {
     1.0
 }
 
+// -------------------------------------------------------------- earned time
+//
+// A gate (not a punishment or liveness check): during a scheduled window the
+// internet is locked until the user has earned credit by active time on an
+// allowlisted educational site/app. Bankable. See docs/earned-time.md; the
+// daemon owns the balance ledger (part B) and the agent only observes
+// activity (part C, src/earned.rs). Policy only; disabled by default.
+
+/// A window during which the earned-time gate is active. `days` are lowercase
+/// three-letter names (`mon`..`sun`); `from`/`to` are `HH:MM` local times.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct Schedule {
+    pub days: Vec<String>,
+    pub from: String,
+    pub to: String,
+}
+
+/// What identifies an activity that earns credit. A source matches when the
+/// frontmost app's bundle id equals `bundle_id`, or (for web sources) the
+/// frontmost browser's current-tab host matches `browser_host_suffix`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct SourceMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_host_suffix: Option<String>,
+}
+
+/// An allowlisted activity and how fast it earns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct EarnSource {
+    pub name: String,
+    /// `match` on the wire (it is a keyword in Rust).
+    #[serde(rename = "match")]
+    pub matcher: SourceMatch,
+    /// Active minutes -> earned minutes multiplier.
+    pub earn_ratio: f32,
+}
+
+/// Earned-time gate settings. **Disabled by default.**
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct EarnedTimeSettings {
+    /// Master switch; false means the gate and the activity monitor idle.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When the gate is active (empty = never).
+    #[serde(default)]
+    pub schedule: Vec<Schedule>,
+    /// What earns credit, and how fast.
+    #[serde(default)]
+    pub sources: Vec<EarnSource>,
+    /// Earned minutes -> minutes of gated internet.
+    pub spend_ratio: f32,
+    /// Most that can be earned in a day.
+    pub daily_earn_cap_min: u32,
+    /// Ceiling on the carried-over balance.
+    pub max_bank_min: u32,
+    /// Ignore sub-threshold blips of activity.
+    pub min_session_min: u32,
+    /// Pause crediting after this much idle (no input).
+    pub idle_timeout_sec: u32,
+}
+
+impl Default for EarnedTimeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: Vec::new(),
+            sources: Vec::new(),
+            spend_ratio: 1.0,
+            daily_earn_cap_min: 120,
+            max_bank_min: 240,
+            min_session_min: 5,
+            idle_timeout_sec: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct EarnedTimePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Vec<Schedule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<EarnSource>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_ratio: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_earn_cap_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bank_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_session_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_sec: Option<u32>,
+}
+
+impl EarnedTimeSettings {
+    pub fn apply(&mut self, p: &EarnedTimePatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, schedule, sources, spend_ratio, daily_earn_cap_min,
+            max_bank_min, min_session_min, idle_timeout_sec
+        );
+    }
+}
+
 // ---------------------------------------------------------------- resolution
 
 /// Fully resolved settings for all modules.
@@ -762,6 +884,8 @@ pub struct Effective {
     pub challenge: ChallengeSettings,
     #[serde(default)]
     pub exposure: ExposureSettings,
+    #[serde(default)]
+    pub earned_time: EarnedTimeSettings,
 }
 
 impl Package {
@@ -785,6 +909,9 @@ impl Package {
             }
             if let Some(p) = &patches.exposure {
                 effective.exposure.apply(p);
+            }
+            if let Some(p) = &patches.earned_time {
+                effective.earned_time.apply(p);
             }
         }
         // Pool the lines of the referenced text sets, in reference order.

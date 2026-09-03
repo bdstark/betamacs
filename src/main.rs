@@ -3,6 +3,7 @@ mod capture_sck;
 mod censor_fx;
 mod challenge;
 mod detect;
+mod earned;
 mod envelope;
 mod heartbeat;
 mod menubar;
@@ -413,6 +414,10 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     // Activity-challenge scheduler (osascript prompts; enforced via the
     // heartbeat's challengeOverdue signal). No-op until policy enables it.
     challenge::spawn(shared.clone(), health.clone());
+    // Earned-time activity monitor (observation only for now; ledger and
+    // enforcement are the daemon's, per docs/earned-time.md). No-op until
+    // policy enables it.
+    earned::spawn(shared.clone(), health.clone());
 
     std::thread::spawn(move || {
         if let Err(e) = pipeline::run(shared, handle, health) {
