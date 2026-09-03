@@ -145,22 +145,33 @@ Screen Time is neither an obstacle nor a defense here:
   policy-controlled off switch. If genuinely dynamic per-device config
   is ever needed, otactl's `device_app_configs`-style endpoint is the
   growth path — not a reason to move now.
-- **Timed change-locks** (typeserver integration, planned): typeserver's
-  timed secrets are real timelock cryptography — data keys wrapped to a
-  future drand (League of Entropy) round via tlock/IBE, extend-only,
-  with optional k-of-n quorum early-unlock. The fit for betamacs is
-  locking the *ability to publish config*: encrypt the
-  `betamacs-config` publisher key under a generated passphrase, store
-  the passphrase as a `decrypt_at` secret, shred the plaintext key —
-  until the round arrives, no one (parent included) can sign a config
-  change, and the lock can only ever be extended. Known bypass to close
-  server-side later: an otactl admin can enroll a fresh publisher; a
-  per-app "publish freeze until T" in otactl (refusing uploads and new
-  publisher enrollment for the app) turns that from a two-minute
-  workaround into a deliberate server-policy change. Full cryptographic
-  enforcement (a second, tlock-held authoring key required by
-  betamacsd) is possible but heavier than the pestering threat model
-  warrants.
+- **Integral timed change-locks — IMPLEMENTED (author signatures) +
+  typeserver custody (manual ceremony).** The otactl manifest signature
+  is made server-side, so anything that can reach otactl's signer (any
+  publisher, server root) could mint config — locking a publisher key
+  is friction, not closure. The integral mechanism is a second
+  signature verified at the endpoint: with `author-pubkey.pem` baked
+  into the bundle beside the otactl root, betamacsd and betamacs accept
+  a config artifact ONLY as an author wrapper — the raw package bytes
+  plus an ECDSA P-256 signature by the **policy-author key**, which
+  otactl never holds. `scripts/author-key.sh generate` mints the pair;
+  `scripts/publish.sh config` signs automatically when the private key
+  is present. The wrapper carries a signed validity window (default 1 h,
+  `BETAMACS_AUTHOR_TTL`), so pre-signed stashes expire; epoch
+  anti-rollback blocks replaying old configs.
+
+  **The lock ceremony:** store `author-key.pem`'s contents in
+  typeserver as a pasted secret; to lock, `LOCK_SECRET` it with
+  `decrypt_at = T` and shred the local file. typeserver's timed secrets
+  are real timelock cryptography — the data key is wrapped to a future
+  drand (League of Entropy) round via tlock/IBE — so before T no one,
+  parent and server root included, can produce a valid config
+  signature. Locks are extend-only by construction; k-of-n quorum is
+  the sole early-unlock (co-parent consent). Residuals: enforcement
+  lives in betamacsd on the endpoint, so admin-on-the-Mac tampering
+  (replace the pin/daemon) remains the accepted layer-1 boundary; and
+  unlocking needs a reachable drand relay (`TLOCK_NETWORK` can pin an
+  alternate).
 
 ## Residual risks (accepted)
 

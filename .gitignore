@@ -5,3 +5,5 @@ webapp/node_modules
 webapp/dist
 /dist
 /otactl-root.pem
+/author-key.pem
+*.authored

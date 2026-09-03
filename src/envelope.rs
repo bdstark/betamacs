@@ -143,9 +143,68 @@ pub struct Verified {
     pub version: String,
 }
 
+/// The author wrapper a config artifact must be when an author key is
+/// pinned (docs/managed-mode.md, "integral timed locks"): the raw
+/// package bytes plus a signature by the policy-author key — a key
+/// otactl does not hold, so no server-side path can mint policy. The
+/// validity window stops pre-signed stashes from outliving their
+/// authoring session.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorWrapper {
+    /// base64 (std) of the exact package.json bytes that were signed.
+    pub package_b64: String,
+    /// RFC3339 UTC; informational, covered by the signature.
+    pub authored_at: String,
+    /// RFC3339 UTC; the wrapper is refused after this instant.
+    pub not_after: String,
+    /// base64 DER ECDSA P-256/SHA-256 over `signing_input()`.
+    pub author_signature: String,
+}
+
+impl AuthorWrapper {
+    /// The signed bytes: three fields joined by newlines — exact strings,
+    /// no canonicalization to agree on.
+    pub fn signing_input(&self) -> Vec<u8> {
+        format!(
+            "betamacs-config-author-v1\n{}\n{}\n{}",
+            self.authored_at, self.not_after, self.package_b64
+        )
+        .into_bytes()
+    }
+}
+
+fn parse_rfc3339_utc(s: &str) -> Result<SystemTime> {
+    // "YYYY-MM-DDTHH:MM:SSZ" only — what our own tooling writes.
+    let s = s.trim();
+    let fail = || anyhow::anyhow!("timestamp {s:?} is not YYYY-MM-DDTHH:MM:SSZ");
+    let b = s.as_bytes();
+    if b.len() != 20 || b[19] != b'Z' || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return Err(fail());
+    }
+    let num = |r: std::ops::Range<usize>| -> Result<i64> {
+        s[r].parse::<i64>().map_err(|_| fail())
+    };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    anyhow::ensure!((1..=12).contains(&mo) && (1..=31).contains(&d), fail());
+    // Days since Unix epoch (civil-from-days inverse, Hinnant's algorithm).
+    let (y2, mo2) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * mo2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + h * 3600 + mi * 60 + sec;
+    anyhow::ensure!(secs >= 0, fail());
+    Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
 #[derive(Clone)]
 pub struct Verifier {
     roots: Vec<Certificate>,
+    /// When pinned, config artifacts MUST be valid author wrappers.
+    author_key: Option<p256::ecdsa::VerifyingKey>,
 }
 
 impl Verifier {
@@ -153,16 +212,35 @@ impl Verifier {
     pub fn from_pem(pem: &[u8]) -> Result<Self> {
         let roots = Certificate::load_pem_chain(pem).context("parse pinned root PEM")?;
         anyhow::ensure!(!roots.is_empty(), "pinned root PEM contains no certificates");
-        Ok(Self { roots })
+        Ok(Self {
+            roots,
+            author_key: None,
+        })
     }
 
-    /// Load the pin from an app bundle's Resources (betamacsd's entry
-    /// point). Its absence is what makes an install unmanaged.
+    /// Additionally pin the policy-author public key (SPKI PEM): config
+    /// artifacts are then accepted only as valid author wrappers.
+    pub fn with_author_key_pem(mut self, pem: &str) -> Result<Self> {
+        use p256::pkcs8::DecodePublicKey;
+        let key = p256::PublicKey::from_public_key_pem(pem)
+            .map_err(|e| anyhow::anyhow!("parse author public key: {e}"))?;
+        self.author_key = Some(p256::ecdsa::VerifyingKey::from(key));
+        Ok(self)
+    }
+
+    /// Load the pins from an app bundle's Resources (betamacsd's entry
+    /// point). No otactl root = unmanaged; an author-pubkey.pem beside
+    /// it additionally requires author-signed config.
     #[allow(dead_code)] // used by betamacsd, dead in the betamacs bin
     pub fn from_bundled_root(app: &Path) -> Result<Self> {
-        let path = app.join("Contents/Resources/otactl-root.pem");
-        let pem = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        Self::from_pem(&pem)
+        let resources = app.join("Contents/Resources");
+        let pem = std::fs::read(resources.join("otactl-root.pem"))
+            .with_context(|| format!("read {}", resources.join("otactl-root.pem").display()))?;
+        let verifier = Self::from_pem(&pem)?;
+        match std::fs::read_to_string(resources.join("author-pubkey.pem")) {
+            Ok(author) => verifier.with_author_key_pem(&author),
+            Err(_) => Ok(verifier),
+        }
     }
 
     /// Full envelope verification; `last_epoch` is the persisted
@@ -233,12 +311,44 @@ impl Verifier {
         {
             bail!("rollback refused: epoch {epoch} is below the accepted {last_epoch}");
         }
+
+        // Integral policy authorship: with an author key pinned, a config
+        // artifact must be a wrapper signed by the policy author — a key
+        // otactl never holds, so no server-side path can mint policy.
+        let artifact = if expected_app == CONFIG_APP && self.author_key.is_some() {
+            self.unwrap_authored(&artifact)?
+        } else {
+            artifact
+        };
         Ok(Verified {
             // Never lower the persisted high-water (absent epoch = 0).
             epoch: env.manifest.epoch.unwrap_or(0).max(last_epoch),
             artifact,
             version: env.manifest.version.clone(),
         })
+    }
+
+    /// Verify the author wrapper and return the inner package bytes.
+    fn unwrap_authored(&self, artifact: &[u8]) -> Result<Vec<u8>> {
+        let key = self.author_key.as_ref().expect("caller checked");
+        let wrapper: AuthorWrapper = serde_json::from_slice(artifact)
+            .context("config is not an author-signed wrapper (author key is pinned)")?;
+        let not_after = parse_rfc3339_utc(&wrapper.not_after)?;
+        anyhow::ensure!(
+            SystemTime::now() <= not_after,
+            "author signature expired at {} (stashed pre-signed config?)",
+            wrapper.not_after,
+        );
+        let sig_der = base64::engine::general_purpose::STANDARD
+            .decode(wrapper.author_signature.trim())
+            .context("author signature is not base64")?;
+        let sig = p256::ecdsa::Signature::from_der(&sig_der)
+            .map_err(|e| anyhow::anyhow!("author signature is not DER ECDSA: {e}"))?;
+        key.verify(&wrapper.signing_input(), &sig)
+            .map_err(|_| anyhow::anyhow!("author signature verification failed"))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(wrapper.package_b64.trim())
+            .context("wrapper packageB64 is not base64")
     }
 
     /// Anchors-only path validation: leaf -> (chain certs) -> a pinned
@@ -387,6 +497,79 @@ mod tests {
         );
         assert_eq!(escape("tab\there"), "tab\\there");
         assert_eq!(escape("\u{1}"), "\\u0001");
+    }
+
+    #[test]
+    fn rfc3339_parser_matches_known_epochs() {
+        let t = |s: &str| {
+            parse_rfc3339_utc(s)
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(t("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(t("2026-09-03T12:00:00Z"), 1788436800);
+        assert_eq!(t("2000-03-01T00:00:00Z"), 951868800);
+        assert!(parse_rfc3339_utc("2026-09-03 12:00:00").is_err());
+        assert!(parse_rfc3339_utc("garbage").is_err());
+    }
+
+    fn wrapper_for(package: &[u8], not_after: &str) -> (AuthorWrapper, Verifier) {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        use p256::pkcs8::EncodePublicKey;
+        let signing = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let mut wrapper = AuthorWrapper {
+            package_b64: base64::engine::general_purpose::STANDARD.encode(package),
+            authored_at: "2026-09-03T00:00:00Z".into(),
+            not_after: not_after.into(),
+            author_signature: String::new(),
+        };
+        let sig: p256::ecdsa::Signature = signing.sign(&wrapper.signing_input());
+        wrapper.author_signature =
+            base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes());
+        let pem = signing
+            .verifying_key()
+            .to_public_key_pem(Default::default())
+            .unwrap();
+        let verifier = Verifier {
+            roots: Vec::new(),
+            author_key: None,
+        }
+        .with_author_key_pem(&pem)
+        .unwrap();
+        (wrapper, verifier)
+    }
+
+    #[test]
+    fn author_wrapper_round_trip() {
+        let package = br#"{"layers":[]}"#;
+        let (wrapper, verifier) = wrapper_for(package, "2099-01-01T00:00:00Z");
+        let artifact = serde_json::to_vec(&wrapper).unwrap();
+        assert_eq!(verifier.unwrap_authored(&artifact).unwrap(), package);
+    }
+
+    #[test]
+    fn author_wrapper_rejects_expiry_and_tamper() {
+        let package = br#"{"layers":[]}"#;
+        let (expired, verifier) = wrapper_for(package, "2020-01-01T00:00:00Z");
+        let err = verifier
+            .unwrap_authored(&serde_json::to_vec(&expired).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+
+        let (mut tampered, verifier) = wrapper_for(package, "2099-01-01T00:00:00Z");
+        use base64::Engine;
+        tampered.package_b64 =
+            base64::engine::general_purpose::STANDARD.encode(br#"{"layers":["evil"]}"#);
+        let err = verifier
+            .unwrap_authored(&serde_json::to_vec(&tampered).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("verification failed"), "{err}");
+
+        // A plain (unwrapped) config must be refused when a key is pinned.
+        assert!(verifier.unwrap_authored(package).is_err());
     }
 
     #[test]

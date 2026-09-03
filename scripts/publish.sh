@@ -43,6 +43,16 @@ case "${1:-}" in
     [ -f "$FILE" ] || { echo "no package file at $FILE" >&2; exit 1; }
     # Validate before signing anything: the file must parse as JSON.
     python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$FILE"
+    # With an author key present, upload the author-signed wrapper — a
+    # pinned fleet refuses anything else (docs/managed-mode.md).
+    if [ -f "${BETAMACS_AUTHOR_KEY:-$ROOT/author-key.pem}" ]; then
+      "$ROOT/scripts/author-key.sh" sign "$FILE" "${BETAMACS_AUTHOR_TTL:-3600}"
+      FILE="$FILE.authored"
+    elif [ -f "$ROOT/author-pubkey.pem" ]; then
+      echo "WARNING: author-pubkey.pem exists but no author key found —" >&2
+      echo "  pinned installs will REFUSE this unsigned config." >&2
+      echo "  (BETAMACS_AUTHOR_KEY points at the key; typeserver may hold it.)" >&2
+    fi
     echo "publishing app=betamacs-config $VERSION ($CHANNEL) from $FILE"
     "$OTACTL" boot-usb upload \
       --artifact "$FILE" --app betamacs-config --arch "$ARCH" --channel "$CHANNEL" \

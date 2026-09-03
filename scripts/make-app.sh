@@ -59,6 +59,13 @@ if [ -f "$PIN" ]; then
   cp "$PIN" "$APP/Contents/Resources/otactl-root.pem"
   echo "managed build: pinned otactl root from $PIN"
 fi
+# An author public key beside it makes config author-signature-required:
+# only the policy author's key (which otactl never holds, and which
+# typeserver can time-lock) can change policy on such installs.
+if [ -f "$ROOT/author-pubkey.pem" ]; then
+  cp "$ROOT/author-pubkey.pem" "$APP/Contents/Resources/author-pubkey.pem"
+  echo "managed build: author-signed config REQUIRED (author-pubkey.pem)"
+fi
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

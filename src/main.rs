@@ -303,12 +303,16 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     // bundle switches the settings source to signed envelopes and makes
     // the local API read-only.
     let verifier = bundle_resources()
-        .map(|r| r.join("otactl-root.pem"))
-        .filter(|p| p.exists())
-        .map(|p| {
-            std::fs::read(&p)
-                .map_err(anyhow::Error::from)
-                .and_then(|pem| envelope::Verifier::from_pem(&pem))
+        .filter(|r| r.join("otactl-root.pem").exists())
+        .map(|r| {
+            let pem = std::fs::read(r.join("otactl-root.pem"))?;
+            let v = envelope::Verifier::from_pem(&pem)?;
+            // An author pin beside the root additionally requires
+            // author-signed config (docs/managed-mode.md).
+            match std::fs::read_to_string(r.join("author-pubkey.pem")) {
+                Ok(author) => v.with_author_key_pem(&author),
+                Err(_) => Ok(v),
+            }
         })
         .transpose()?;
     let managed = verifier.is_some();
