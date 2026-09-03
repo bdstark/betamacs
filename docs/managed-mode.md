@@ -130,6 +130,34 @@ wiping/reinstalling macOS (device drops off the fleet — visible), or
 obtaining the admin password. All remaining attacks are loud, none are
 silent.
 
+## Bootstrap (crossing the privilege boundary once)
+
+hausmeister runs as the logged-in user by design, so it cannot create
+root-owned state; something must cross the privilege boundary exactly
+once, and afterwards betamacsd is the standing root foothold that every
+update flows through with no further prompts. Two equivalent paths:
+
+- **GUI (default)** — the app bundle carries its daemon plist
+  (`Contents/Library/LaunchDaemons/`); `betamacs install-daemon`
+  registers it via `SMAppService`, and the human approves once in
+  System Settings → General → Login Items & Extensions (the OS asks for
+  admin credentials there). On its first root run, betamacsd finishes
+  the layout itself: chowns the bundle to `root:wheel`, installs the
+  global LaunchAgent, and migrates the console session off any
+  per-user agent. The hausmeister plugin drives this end to end when it
+  finds no daemon: it installs the app from the signed pipeline (first
+  install needs an admin session, which onboarding is anyway), runs
+  `install-daemon`, and surfaces "approve in System Settings" in its
+  menu/notification. A hand launch of a managed build does the same.
+- **Headless** — `sudo scripts/install-managed.sh` produces the
+  identical end state over SSH; it writes a /Library/LaunchDaemons
+  plist instead of the SMAppService registration (betamacsd repairs
+  whichever registration exists, never both).
+
+So machine onboarding is: enroll hausmeister (existing flow) → grant
+the betamacs entitlements → approve the daemon in System Settings →
+grant Screen Recording. No terminal required.
+
 ## Delivery flow (steady state)
 
 1. Operator edits the package (webapp against a staging betamacs, or

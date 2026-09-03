@@ -22,7 +22,31 @@ DAEMON="$ROOT/target/release/betamacsd"
 [ -f "$ROOT/webapp/dist/index.html" ] || { echo "webapp not built — run: cd webapp && npm install && npm run build" >&2; exit 1; }
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/models" "$APP/Contents/Resources/webapp"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/models" "$APP/Contents/Resources/webapp" \
+  "$APP/Contents/Library/LaunchDaemons"
+
+# SMAppService daemon: `betamacs install-daemon` registers this plist so
+# the privileged bootstrap is one System Settings approval, no sudo.
+cat > "$APP/Contents/Library/LaunchDaemons/com.bdstark.betamacsd.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.bdstark.betamacsd</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/betamacsd</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.bdstark.betamacs</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+</dict>
+</plist>
+EOF
 cp "$BIN" "$APP/Contents/MacOS/betamacs"
 cp "$DAEMON" "$APP/Contents/MacOS/betamacsd"
 cp "$ROOT"/models/*.onnx "$APP/Contents/Resources/models/"

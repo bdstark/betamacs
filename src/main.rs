@@ -6,6 +6,7 @@ mod envelope;
 mod heartbeat;
 mod menubar;
 mod overlay;
+mod smappservice;
 mod pipeline;
 mod server;
 mod settings;
@@ -45,25 +46,41 @@ fn main() -> Result<()> {
         std::process::exit(101);
     }));
 
-    // Usage: betamacs [run|probe|demo] [320n|640m|path/to/model.onnx] [--censor-captures]
+    // Usage: betamacs [run|probe|demo|install-daemon] [320n|640m|model.onnx] [--censor-captures]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let censor_in_captures = args.iter().any(|a| a == "--censor-captures");
     args.retain(|a| a != "--censor-captures");
     let (mode, model) = match args.first().map(String::as_str) {
-        Some(m @ ("run" | "probe" | "demo")) => (m, args.get(1).cloned()),
+        Some(m @ ("run" | "probe" | "demo" | "install-daemon")) => (m, args.get(1).cloned()),
         Some(_) => ("run", args.first().cloned()),
         None => ("run", None),
     };
+
+    if mode == "install-daemon" {
+        anyhow::ensure!(
+            log_file_bundled,
+            "install-daemon only works from the .app bundle (the daemon plist lives inside it)",
+        );
+        return install_daemon(true);
+    }
 
     // Bundled but launched by hand (Finder, `open`) rather than by launchd:
     // install/refresh the LaunchAgent and hand off to the instance it
     // starts, so copying the .app and opening it once is a full install.
     // On a managed install (docs/managed-mode.md) the root-owned global
-    // agent already runs betamacs; a hand launch does nothing.
+    // agent already runs betamacs; a hand launch does nothing. A managed
+    // BUILD not yet bootstrapped additionally registers betamacsd via
+    // SMAppService — once approved, the daemon roots the whole layout and
+    // retires the per-user agent installed as the bridge here.
     if mode == "run" && log_file_bundled && std::env::var_os("BETAMACS_LAUNCHD").is_none() {
         if PathBuf::from("/Library/LaunchAgents/com.bdstark.betamacs.plist").exists() {
             tracing::info!("managed install detected; the global LaunchAgent owns this app");
             return Ok(());
+        }
+        if bundle_resources().is_some_and(|r| r.join("otactl-root.pem").exists()) {
+            if let Err(e) = install_daemon(false) {
+                tracing::warn!("daemon registration failed (continuing per-user): {e:#}");
+            }
         }
         return self_install().inspect_err(|e| tracing::error!("self-install failed: {e}"));
     }
@@ -154,6 +171,32 @@ fn self_install() -> Result<()> {
         plist_path.display(),
         exe.display()
     );
+    Ok(())
+}
+
+/// Register betamacsd (the root watchdog) from the bundle's own plist
+/// via SMAppService: the privileged bootstrap is then one admin approval
+/// in System Settings → Login Items, no sudo. Once running as root, the
+/// daemon lays down the rest of the managed layout itself.
+fn install_daemon(interactive: bool) -> Result<()> {
+    use smappservice::ServiceStatus;
+    let status = smappservice::register("com.bdstark.betamacsd.plist")?;
+    tracing::info!("betamacsd registration status: {status:?}");
+    match status {
+        ServiceStatus::Enabled => {
+            println!("betamacsd is registered and enabled; the managed layout follows.");
+        }
+        ServiceStatus::RequiresApproval => {
+            println!(
+                "betamacsd needs one-time approval: System Settings → General → \
+                 Login Items & Extensions → allow \"betamacs\" (admin credentials required)."
+            );
+            if interactive {
+                smappservice::open_login_items_settings();
+            }
+        }
+        other => println!("betamacsd registration state: {other:?}"),
+    }
     Ok(())
 }
 

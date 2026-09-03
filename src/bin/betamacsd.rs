@@ -87,6 +87,8 @@ fn main() -> Result<()> {
         std::env::var_os("BETAMACSD_PREFIX"),
     );
 
+    ensure_managed_layout(&paths);
+
     let verifier = match envelope::Verifier::from_bundled_root(&paths.app) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -447,15 +449,78 @@ unsafe extern "C" {
     fn libc_geteuid() -> u32;
 }
 
+/// Running as root with an incomplete managed layout (the SMAppService
+/// bootstrap path, docs/managed-mode.md): finish what the sudo installer
+/// would have done — take root ownership of the bundle, install the
+/// global LaunchAgent, and migrate the console session off any per-user
+/// agent that served as the bridge.
+fn ensure_managed_layout(paths: &Paths) {
+    if unsafe { libc_geteuid() } != 0 {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = std::fs::metadata(&paths.app)
+        && meta.uid() != 0
+    {
+        tracing::info!("taking root ownership of {}", paths.app.display());
+        let _ = run("/usr/sbin/chown", &["-R", "root:wheel"], &[&paths.app]);
+        let _ = run("/bin/chmod", &["-R", "go-w"], &[&paths.app]);
+    }
+    if paths.agent_plist.exists() {
+        return;
+    }
+    tracing::info!("installing global LaunchAgent {}", paths.agent_plist.display());
+    if let Some(parent) = paths.agent_plist.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&paths.agent_plist, agent_plist(&paths.app)) {
+        tracing::error!("could not write {}: {e}", paths.agent_plist.display());
+        return;
+    }
+    let Ok(console) = std::fs::metadata("/dev/console") else {
+        return;
+    };
+    let uid = console.uid();
+    // Same label, new plist: drop the per-user registration and its file,
+    // then load the global agent into the live session.
+    let _ = std::process::Command::new("/bin/launchctl")
+        .args(["bootout", &format!("gui/{uid}/{AGENT_LABEL}")])
+        .status();
+    if let Ok(out) = std::process::Command::new("/usr/bin/stat")
+        .args(["-f", "%Su", "/dev/console"])
+        .output()
+    {
+        let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !user.is_empty() && user != "root" {
+            let _ = std::fs::remove_file(format!(
+                "/Users/{user}/Library/LaunchAgents/{AGENT_LABEL}.plist"
+            ));
+        }
+    }
+    let _ = std::process::Command::new("/bin/launchctl")
+        .arg("bootstrap")
+        .arg(format!("gui/{uid}"))
+        .arg(&paths.agent_plist)
+        .status();
+}
+
 /// Verify managed files exist with sane ownership; rewrite plists we
-/// own, report what we cannot fix.
+/// own, report what we cannot fix. The agent plist is always maintained;
+/// the /Library/LaunchDaemons plist only when a script install created
+/// it — the SMAppService path runs the daemon from the bundle's own
+/// plist and must not gain a second registration under the same label.
 fn check_integrity(paths: &Paths) {
-    for (path, content) in [
-        (&paths.agent_plist, agent_plist(&paths.app)),
-        (&paths.daemon_plist, daemon_plist(&paths.app, &paths.managed_dir)),
+    let daemon_exists = paths.daemon_plist.exists();
+    for (path, content, create) in [
+        (&paths.agent_plist, agent_plist(&paths.app), true),
+        (
+            &paths.daemon_plist,
+            daemon_plist(&paths.app, &paths.managed_dir),
+            daemon_exists,
+        ),
     ] {
         let current = std::fs::read_to_string(path).unwrap_or_default();
-        if current != content {
+        if current != content && (create || !current.is_empty()) {
             tracing::warn!("{} missing or altered; rewriting", path.display());
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);

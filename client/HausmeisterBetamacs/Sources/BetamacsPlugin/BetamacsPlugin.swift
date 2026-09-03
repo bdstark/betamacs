@@ -24,6 +24,9 @@ public final class BetamacsPlugin: HausmeisterPlugin {
 
   private let host: HostServices
   private var checking = false
+  /// The Login Items approval prompt should not nag hourly; the
+  /// bootstrap is attempted once per hausmeister run.
+  private var bootstrapAttempted = false
   /// Last daemon status, refreshed each tick for the menu.
   private var statusLine = "status unknown"
 
@@ -50,7 +53,12 @@ public final class BetamacsPlugin: HausmeisterPlugin {
 
   public func tick() {
     refreshStatus()
-    guard entitled, DaemonSocket.available, !checking else { return }
+    guard entitled else { return }
+    guard DaemonSocket.available else {
+      bootstrapIfNeeded()
+      return
+    }
+    guard !checking else { return }
     checking = true
     Task { [weak self] in
       guard let self else { return }
@@ -175,6 +183,91 @@ public final class BetamacsPlugin: HausmeisterPlugin {
                   body: "betamacs \(m.version) is installed and running.")
     }
     return "installed \(m.version)"
+  }
+
+  // MARK: bootstrap
+
+  /// No daemon on this Mac: it is being onboarded. Install the app when
+  /// missing (fetched and verified through the same signed pipeline),
+  /// then have it register betamacsd via SMAppService — the one
+  /// privileged approval, made in System Settings → Login Items. Once
+  /// approved, the daemon roots the whole layout itself and the next
+  /// tick finds its socket.
+  private func bootstrapIfNeeded() {
+    guard !bootstrapAttempted, !checking else { return }
+    bootstrapAttempted = true
+    checking = true
+    Task { [weak self] in
+      guard let self else { return }
+      do {
+        if !FileManager.default.fileExists(atPath: "/Applications/betamacs.app") {
+          let (response, client) = try await self.fetchManifest(app: BetamacsPlugin.appName)
+          let artifact = try await self.fetchArtifact(
+            app: BetamacsPlugin.appName, manifest: response.manifest, client: client)
+          try self.installAppDirect(artifact: artifact, manifest: response.manifest)
+          self.host.settings.set(Int(response.manifest.epoch ?? 0), for: "appEpoch")
+        }
+        try BetamacsPlugin.run(
+          "/Applications/betamacs.app/Contents/MacOS/betamacs", ["install-daemon"])
+        self.host.log.notice("betamacs: bootstrap: daemon registration requested")
+        await MainActor.run {
+          self.statusLine = "approve betamacsd: System Settings → Login Items"
+          self.host.notify(
+            title: "Betamacs needs one approval",
+            body: "Allow \"betamacs\" under System Settings → Login Items to finish setup.")
+        }
+      } catch {
+        self.host.log.error("betamacs: bootstrap: \(error)")
+        await MainActor.run { self.statusLine = "bootstrap failed — \(error)" }
+      }
+      await MainActor.run { self.checking = false }
+    }
+  }
+
+  /// First install only: place the verified bundle into /Applications
+  /// directly. Needs an admin session (the onboarding sitting); after
+  /// bootstrap, updates flow through the root daemon instead.
+  private func installAppDirect(artifact: Data, manifest m: ReleaseManifest) throws {
+    if let format = m.format, !format.isEmpty, format != BetamacsPlugin.appFormat {
+      throw ReleaseError.badArchive("unexpected artifact format \(format)")
+    }
+    let fm = FileManager.default
+    let staging = fm.temporaryDirectory
+      .appendingPathComponent("betamacs-\(UUID().uuidString)", isDirectory: true)
+    try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: staging) }
+    let archive = staging.appendingPathComponent("app.zip")
+    try artifact.write(to: archive)
+    let unpacked = staging.appendingPathComponent("unpacked", isDirectory: true)
+    try fm.createDirectory(at: unpacked, withIntermediateDirectories: true)
+    try BetamacsPlugin.run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
+    let entries = (try? fm.contentsOfDirectory(at: unpacked, includingPropertiesForKeys: nil))?
+      .filter { !$0.lastPathComponent.hasPrefix(".") } ?? []
+    guard let bundle = entries.first(where: { $0.pathExtension == "app" }) else {
+      throw ReleaseError.badArchive("no .app at the archive root")
+    }
+    try BetamacsPlugin.run("/usr/bin/codesign", ["--verify", "--strict", bundle.path])
+    do {
+      try fm.moveItem(at: bundle, to: URL(fileURLWithPath: "/Applications/betamacs.app"))
+    } catch {
+      throw ReleaseError.install(
+        "could not place /Applications/betamacs.app (admin session required): \(error.localizedDescription)")
+    }
+    host.log.notice("betamacs: bootstrap installed \(m.version) at /Applications/betamacs.app")
+  }
+
+  static func run(_ tool: String, _ args: [String]) throws {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: tool)
+    p.arguments = args
+    let err = Pipe()
+    p.standardError = err
+    try p.run()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else {
+      let text = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+      throw ReleaseError.install("\(tool) failed: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
   }
 
   // MARK: shared plumbing
