@@ -752,6 +752,14 @@ pub fn run(
             let keep =
                 Duration::from_secs(ex.warn_window_sec.max(ex.block_window_sec) as u64 + 5);
             exposure.prune(keep);
+            // Publish the current block-window gauge for the status HUD.
+            let block_sum = exposure.sum_within(Duration::from_secs(ex.block_window_sec as u64));
+            health
+                .exposure_recent
+                .store(block_sum.round().max(0.0) as u32, Ordering::Relaxed);
+            health
+                .exposure_block
+                .store(ex.block_threshold.round().max(0.0) as u32, Ordering::Relaxed);
 
             let over_block = ex.block_threshold > 0.0
                 && exposure.sum_within(Duration::from_secs(ex.block_window_sec as u64))
@@ -784,6 +792,10 @@ pub fn run(
                     "Are you looking at appropriate content?\n\nA lot of flagged content has been detected. Please make a better choice.",
                 );
             }
+        } else {
+            // Exposure disabled: clear the HUD gauge.
+            health.exposure_block.store(0, Ordering::Relaxed);
+            health.exposure_recent.store(0, Ordering::Relaxed);
         }
 
         // In censor-in-captures mode the boxes are visible to capture, so

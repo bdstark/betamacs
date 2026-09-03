@@ -682,9 +682,12 @@ fn handle_client(
                     .exposure_penalty_until
                     .map(|u| u.saturating_duration_since(Instant::now()).as_secs() as i64)
                     .unwrap_or(0);
-                let earned_balance_min = earned.lock().unwrap().ledger.balance_min;
+                let (earned_balance_min, earned_gate_active, earned_today_min) = {
+                    let e = earned.lock().unwrap();
+                    (e.ledger.balance_min, e.gate_active, e.ledger.earned_today_min)
+                };
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
@@ -694,6 +697,8 @@ fn handle_client(
                     a.challenge_overdue,
                     quarantine_secs,
                     earned_balance_min,
+                    earned_gate_active,
+                    earned_today_min,
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());

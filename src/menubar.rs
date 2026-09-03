@@ -14,10 +14,14 @@ use objc2::{
 };
 use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
+use winit::event_loop::EventLoopProxy;
+
+use crate::overlay::OverlayMsg;
 
 struct TargetIvars {
     settings_url: String,
     log_path: PathBuf,
+    stats_proxy: EventLoopProxy<OverlayMsg>,
 }
 
 define_class!(
@@ -44,14 +48,24 @@ define_class!(
                 let _ = std::process::Command::new("open").arg(path).spawn();
             }
         }
+
+        #[unsafe(method(toggleStatus:))]
+        fn toggle_status(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().stats_proxy.send_event(OverlayMsg::ToggleStats);
+        }
     }
 );
 
 impl MenuTarget {
-    fn new(settings_url: String, log_path: PathBuf) -> Retained<Self> {
+    fn new(
+        settings_url: String,
+        log_path: PathBuf,
+        stats_proxy: EventLoopProxy<OverlayMsg>,
+    ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(TargetIvars {
             settings_url,
             log_path,
+            stats_proxy,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -67,9 +81,13 @@ pub struct MenuBar {
 
 impl MenuBar {
     /// Install the status item. Returns None off the main thread.
-    pub fn new(settings_url: String, log_path: PathBuf) -> Option<Self> {
+    pub fn new(
+        settings_url: String,
+        log_path: PathBuf,
+        stats_proxy: EventLoopProxy<OverlayMsg>,
+    ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
-        let target = MenuTarget::new(settings_url, log_path);
+        let target = MenuTarget::new(settings_url, log_path, stats_proxy);
 
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
@@ -80,6 +98,12 @@ impl MenuBar {
         menu.addItem(&status_line);
         menu.addItem(&boxes_line);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&action_item(
+            mtm,
+            "Show/Hide Status",
+            sel!(toggleStatus:),
+            &target,
+        ));
         menu.addItem(&action_item(
             mtm,
             "Open Settings…",

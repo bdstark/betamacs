@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use objc2::MainThreadMarker;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::WindowEvent;
@@ -28,7 +29,31 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::censor_fx::RegionContent;
-use crate::settings::{CensorMode, CensorSettings};
+use crate::settings::{CensorMode, CensorSettings, ImageSettings};
+
+/// Decode the configured cover image (embedded base64, else a filesystem
+/// path) into RGBA pixels ready for a window layer.
+fn decode_cover_image(img: &ImageSettings) -> Result<RegionContent> {
+    use base64::Engine;
+    let bytes = if !img.data.is_empty() {
+        base64::engine::general_purpose::STANDARD
+            .decode(img.data.trim())
+            .map_err(|e| anyhow::anyhow!("cover image is not valid base64: {e}"))?
+    } else {
+        std::fs::read(&img.path)
+            .map_err(|e| anyhow::anyhow!("reading cover image {}: {e}", img.path))?
+    };
+    let decoded = image::load_from_memory(&bytes)
+        .map_err(|e| anyhow::anyhow!("decoding cover image: {e}"))?
+        .to_rgba8();
+    let (width, height) = (decoded.width(), decoded.height());
+    Ok(RegionContent {
+        width,
+        height,
+        rgba: Arc::new(decoded.into_raw()),
+        pixelated: false,
+    })
+}
 
 /// A censor rectangle in global logical screen points (the same coordinate
 /// space as ScreenCaptureKit display origins), plus optional processed
@@ -82,6 +107,10 @@ pub enum OverlayMsg {
     Style(CensorSettings),
     /// Status text for the menu bar's "monitoring" line.
     Status(String),
+    /// Refresh the live status HUD's text (composed by `statusframe`).
+    Stats(String),
+    /// Show/hide the status HUD (from the menu bar).
+    ToggleStats,
 }
 
 /// Handle used by the pipeline/server threads to push updates.
@@ -111,6 +140,13 @@ impl OverlayHandle {
             .send_event(OverlayMsg::Status(text))
             .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
     }
+
+    /// Refresh the live status HUD text.
+    pub fn set_stats(&self, text: String) -> Result<()> {
+        self.proxy
+            .send_event(OverlayMsg::Stats(text))
+            .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
+    }
 }
 
 pub struct OverlayApp {
@@ -123,12 +159,21 @@ pub struct OverlayApp {
     /// otherwise re-trigger SCK change frames in a feedback loop).
     last_regions: Vec<CensorRegion>,
     style: CensorSettings,
+    /// Decoded cover image for `CensorMode::Image`, cached by source key so
+    /// it is decoded only when the configured image changes. `None` when no
+    /// image is configured or the last decode failed.
+    image_cache: Option<(String, RegionContent)>,
     /// Next TV-static animation frame, when mode = static and animated.
     next_noise_tick: Option<Instant>,
     /// xorshift state for noise generation.
     rng: u64,
     /// Menu bar status item, when installed (run mode only).
     menubar: Option<crate::menubar::MenuBar>,
+    /// Live status HUD window, created on first use (main thread).
+    hud: Option<macos::StatusHud>,
+    /// Latest composed HUD text, retained so the window shows current data
+    /// the moment it is (re)opened.
+    hud_text: String,
 }
 
 impl OverlayApp {
@@ -149,6 +194,7 @@ impl OverlayApp {
                 visible: 0,
                 last_regions: Vec::new(),
                 style,
+                image_cache: None,
                 next_noise_tick: None,
                 rng: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -156,6 +202,8 @@ impl OverlayApp {
                     .unwrap_or(0x9e3779b97f4a7c15)
                     | 1,
                 menubar: None,
+                hud: None,
+                hud_text: String::new(),
             },
         ))
     }
@@ -249,27 +297,65 @@ impl OverlayApp {
 
     /// Draw one region's interior according to the censor mode.
     fn render_interior(&mut self, i: usize, region: &CensorRegion) {
-        let window = &self.windows[i];
         if region.highlight.is_some() {
-            macos::clear_layer_contents(window);
+            macos::clear_layer_contents(&self.windows[i]);
             return;
         }
         match self.style.mode {
-            CensorMode::Box => macos::clear_layer_contents(window),
+            CensorMode::Box => macos::clear_layer_contents(&self.windows[i]),
             CensorMode::Blur | CensorMode::Mosaic => {
                 if let Some(content) = &region.content {
-                    macos::set_layer_contents(window, content);
+                    macos::set_layer_contents(&self.windows[i], content);
                 }
             }
             CensorMode::Static => {
                 let content = macos::make_noise(
-                    window,
+                    &self.windows[i],
                     region.width,
                     region.height,
                     &self.style.static_noise,
                     &mut self.rng,
                 );
-                macos::set_layer_contents(window, &content);
+                macos::set_layer_contents(&self.windows[i], &content);
+            }
+            CensorMode::Image => {
+                self.ensure_image();
+                let window = &self.windows[i];
+                match &self.image_cache {
+                    // The one decoded image fills every box; CALayer scales
+                    // it to each box per the fit's contents gravity.
+                    Some((_, content)) => {
+                        macos::set_image_contents(window, content, self.style.image.fit)
+                    }
+                    // No image / decode failed: fall back to a solid fill so
+                    // the detection is still covered.
+                    None => macos::clear_layer_contents(window),
+                }
+            }
+        }
+    }
+
+    /// Decode the configured cover image into `image_cache`, keyed by its
+    /// source so a repeat call with an unchanged image is a no-op.
+    fn ensure_image(&mut self) {
+        let img = &self.style.image;
+        // Prefer embedded data; fall back to a filesystem path.
+        let key = if !img.data.is_empty() {
+            format!("data:{}", img.data)
+        } else if !img.path.is_empty() {
+            format!("path:{}", img.path)
+        } else {
+            self.image_cache = None;
+            return;
+        };
+        if self.image_cache.as_ref().is_some_and(|(k, _)| k == &key) {
+            return;
+        }
+        match decode_cover_image(img) {
+            Ok(content) => self.image_cache = Some((key, content)),
+            Err(e) => {
+                tracing::warn!("cover image unavailable, falling back to solid box: {e:#}");
+                self.image_cache = None;
             }
         }
     }
@@ -334,6 +420,22 @@ impl ApplicationHandler<OverlayMsg> for OverlayApp {
                     mb.set_status(&text);
                 }
             }
+            OverlayMsg::Stats(text) => {
+                // Keep the latest snapshot; update the window if it exists
+                // (created only once the user opens it).
+                self.hud_text = text;
+                if let Some(hud) = &self.hud {
+                    hud.set_text(&self.hud_text);
+                }
+            }
+            OverlayMsg::ToggleStats => {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    let text = self.hud_text.clone();
+                    let hud = self.hud.get_or_insert_with(|| macos::StatusHud::new(mtm));
+                    hud.set_text(&text);
+                    hud.toggle();
+                }
+            }
         }
     }
 
@@ -362,10 +464,10 @@ impl ApplicationHandler<OverlayMsg> for OverlayApp {
 
 mod macos {
     use objc2::rc::Retained;
-    use objc2::MainThreadMarker;
+    use objc2::{MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSColor, NSFont, NSTextAlignment, NSTextField, NSView, NSWindow,
-        NSWindowCollectionBehavior,
+        NSBackingStoreType, NSColor, NSFont, NSScreen, NSTextAlignment, NSTextField, NSView,
+        NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
     };
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::NSString;
@@ -376,7 +478,7 @@ mod macos {
 
     use super::CensorRegion;
     use crate::censor_fx::RegionContent;
-    use crate::settings::{parse_color, CensorSettings};
+    use crate::settings::{parse_color, CensorSettings, ImageFit};
 
     /// The text fields drawn on a censor window: a centered random text
     /// and a small trigger-class label near the bottom edge.
@@ -602,12 +704,41 @@ mod macos {
             return;
         };
         unsafe {
+            // These regions are box-sized already; stretch to fill (reset in
+            // case an image render left an aspect-fill gravity behind).
+            layer.setContentsGravity(objc2_quartz_core::kCAGravityResize);
             layer.setMagnificationFilter(if content.pixelated {
                 objc2_quartz_core::kCAFilterNearest
             } else {
                 objc2_quartz_core::kCAFilterLinear
             });
             // CALayer.contents takes a CGImage through the id-typed API.
+            let obj: &objc2::runtime::AnyObject =
+                &*(CFRetained::as_ptr(&image).as_ptr() as *const objc2::runtime::AnyObject);
+            layer.setContents(Some(obj));
+        }
+    }
+
+    /// Display a cover image as the window's interior, scaled to the box
+    /// per `fit` via the layer's contents gravity (the fill color shows
+    /// behind any area the image doesn't cover).
+    pub fn set_image_contents(window: &Window, content: &RegionContent, fit: ImageFit) {
+        let Some(layer) = content_layer(window) else {
+            return;
+        };
+        let Some(image) = cg_image_from_rgba(content.width, content.height, &content.rgba) else {
+            tracing::warn!("could not build CGImage for cover image");
+            return;
+        };
+        unsafe {
+            let gravity = match fit {
+                ImageFit::Stretch => objc2_quartz_core::kCAGravityResize,
+                ImageFit::Contain => objc2_quartz_core::kCAGravityResizeAspect,
+                ImageFit::Cover => objc2_quartz_core::kCAGravityResizeAspectFill,
+            };
+            layer.setContentsGravity(gravity);
+            layer.setMasksToBounds(true);
+            layer.setMagnificationFilter(objc2_quartz_core::kCAFilterLinear);
             let obj: &objc2::runtime::AnyObject =
                 &*(CFRetained::as_ptr(&image).as_ptr() as *const objc2::runtime::AnyObject);
             layer.setContents(Some(obj));
@@ -719,6 +850,74 @@ mod macos {
                 false,
                 CGColorRenderingIntent::RenderingIntentDefault,
             )
+        }
+    }
+
+    /// A small always-on-top, display-only status window. Created on the
+    /// main thread; the close button hides it (released-when-closed off) and
+    /// the menu bar reopens it.
+    pub struct StatusHud {
+        window: Retained<NSWindow>,
+        label: Retained<NSTextField>,
+    }
+
+    impl StatusHud {
+        pub fn new(mtm: MainThreadMarker) -> Self {
+            let size = CGSize::new(380.0, 210.0);
+            let rect = CGRect::new(CGPoint::new(0.0, 0.0), size);
+            let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    rect,
+                    style,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            window.setTitle(&NSString::from_str("betamacs status"));
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.setHidesOnDeactivate(false);
+            // Floating level: above normal windows, non-activating.
+            window.setLevel(3);
+
+            let inset = 14.0;
+            let label_rect = CGRect::new(
+                CGPoint::new(inset, inset),
+                CGSize::new(size.width - 2.0 * inset, size.height - 2.0 * inset),
+            );
+            let label = NSTextField::initWithFrame(NSTextField::alloc(mtm), label_rect);
+            label.setEditable(false);
+            label.setSelectable(false);
+            label.setBezeled(false);
+            label.setDrawsBackground(false);
+            label.setAlignment(NSTextAlignment::Left);
+            label.setUsesSingleLineMode(false);
+            label.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0)));
+            if let Some(content) = window.contentView() {
+                content.addSubview(&label);
+            }
+
+            // Park it near the top-right of the main screen.
+            if let Some(screen) = NSScreen::mainScreen(mtm) {
+                let vf = screen.visibleFrame();
+                let x = vf.origin.x + vf.size.width - size.width - 20.0;
+                let y = vf.origin.y + vf.size.height - size.height - 20.0;
+                window.setFrameOrigin(CGPoint::new(x, y));
+            }
+            Self { window, label }
+        }
+
+        pub fn set_text(&self, text: &str) {
+            self.label.setStringValue(&NSString::from_str(text));
+        }
+
+        pub fn toggle(&self) {
+            if self.window.isVisible() {
+                self.window.orderOut(None);
+            } else {
+                self.window.orderFrontRegardless();
+            }
         }
     }
 }

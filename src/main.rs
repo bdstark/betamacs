@@ -13,6 +13,7 @@ mod smappservice;
 mod pipeline;
 mod server;
 mod settings;
+mod statusframe;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -375,6 +376,7 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     match menubar::MenuBar::new(
         format!("http://127.0.0.1:{port}/#token={token}"),
         std::env::current_dir()?.join("betamacs.log"),
+        event_loop.create_proxy(),
     ) {
         Some(mb) => app.set_menubar(mb),
         None => tracing::warn!("menu bar item unavailable (not on main thread?)"),
@@ -418,6 +420,9 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     // enforcement are the daemon's, per docs/earned-time.md). No-op until
     // policy enables it.
     earned::spawn(shared.clone(), health.clone());
+    // Live status HUD feed (composes stats each second; the window is shown
+    // on demand from the menu bar). Display-only.
+    statusframe::spawn(health.clone(), handle.clone());
 
     std::thread::spawn(move || {
         if let Err(e) = pipeline::run(shared, handle, health) {

@@ -41,6 +41,10 @@ pub struct Health {
     pub exposure_over_budget: AtomicBool,
     /// Duration the daemon should hold the lockout when the edge fires.
     pub exposure_penalty_secs: AtomicU32,
+    /// Latest exposure metric sum over the block window, and the block
+    /// threshold, for the status HUD (rounded; 0 when exposure disabled).
+    pub exposure_recent: AtomicU32,
+    pub exposure_block: AtomicU32,
 }
 
 impl Health {
