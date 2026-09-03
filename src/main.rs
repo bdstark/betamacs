@@ -212,7 +212,7 @@ const MANAGED_DIR: &str = "/Library/Application Support/betamacs";
 fn load_managed(verifier: &envelope::Verifier) -> Result<(Package, u64)> {
     let raw = std::fs::read_to_string(PathBuf::from(MANAGED_DIR).join("envelope.json"))?;
     let env: envelope::Envelope = serde_json::from_str(&raw)?;
-    let verified = verifier.verify(&env, 0)?;
+    let verified = verifier.verify(&env, 0, envelope::CONFIG_APP)?;
     let package: Package = serde_json::from_slice(&verified.artifact)?;
     Ok((package, verified.epoch))
 }

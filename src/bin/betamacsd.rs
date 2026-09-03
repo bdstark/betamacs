@@ -186,6 +186,26 @@ fn handle_client(
                 let _ = stream.write_all(reply.as_bytes());
                 return;
             }
+            Some("app") => {
+                let reply = match apply_app_envelope(&line, managed_dir, verifier) {
+                    Ok(version) => {
+                        tracing::info!("installed betamacs {version}; restarting daemon to match");
+                        // KeepAlive respawns us from the new bundle.
+                        std::thread::spawn(|| {
+                            std::thread::sleep(Duration::from_secs(2));
+                            std::process::exit(0);
+                        });
+                        "{\"ok\":true}\n".to_string()
+                    }
+                    Err(e) => {
+                        tracing::warn!("app envelope refused: {e:#}");
+                        format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::json!(e.to_string()))
+                    }
+                };
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
             Some("status") => {
                 let a = agent.lock().unwrap().clone();
                 let reply = format!(
@@ -213,11 +233,8 @@ fn apply_envelope(
     let verifier = verifier.context("no pinned otactl root installed")?;
     let env: envelope::Envelope = serde_json::from_str(raw).context("malformed envelope")?;
     let epoch_path = managed_dir.join("epoch");
-    let last_epoch: u64 = std::fs::read_to_string(&epoch_path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let verified = verifier.verify(&env, last_epoch)?;
+    let last_epoch: u64 = read_epoch(&epoch_path);
+    let verified = verifier.verify(&env, last_epoch, envelope::CONFIG_APP)?;
 
     // Persist artifact + envelope atomically-ish, then bump the epoch
     // high-water last so a crash never leaves epoch ahead of config.
@@ -227,6 +244,164 @@ fn apply_envelope(
     std::fs::write(managed_dir.join("envelope.json"), raw)?;
     std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
     Ok(verified.epoch)
+}
+
+fn read_epoch(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Verify and install a betamacs.app update: unzip, code-signature and
+/// version checks, root-owned swap of /Applications/betamacs.app, agent
+/// kickstart. Returns the installed version; the caller restarts the
+/// daemon so the new bundle's betamacsd takes over.
+fn apply_app_envelope(
+    raw: &str,
+    managed_dir: &Path,
+    verifier: Option<&envelope::Verifier>,
+) -> Result<String> {
+    let verifier = verifier.context("no pinned otactl root installed")?;
+    let env: envelope::Envelope = serde_json::from_str(raw).context("malformed envelope")?;
+    if let Some(format) = env.manifest.format.as_deref()
+        && !format.is_empty()
+        && format != "macos-app-zip"
+    {
+        anyhow::bail!("unexpected artifact format {format:?}");
+    }
+    let epoch_path = managed_dir.join("epoch-app");
+    let verified = verifier.verify(&env, read_epoch(&epoch_path), envelope::APP_APP)?;
+    let version = verified.version.clone();
+
+    // Unpack into a staging dir inside the managed (root-owned) tree.
+    let staging = managed_dir.join("staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    let zip = staging.join("betamacs.zip");
+    std::fs::write(&zip, &verified.artifact)?;
+    run("/usr/bin/ditto", &["-x", "-k"], &[&zip, &staging.join("unpacked")])?;
+
+    // The bundle root is wherever the .app is: directly, or one dir deep.
+    let unpacked = staging.join("unpacked");
+    let bundle = find_app_bundle(&unpacked)
+        .context("no betamacs.app in the archive")?;
+
+    // Gate on the code signature like the Hausmeister updater: the new
+    // bundle must verify, and — when an install exists — carry the same
+    // team as the running one.
+    run("/usr/bin/codesign", &["--verify", "--strict"], &[&bundle])?;
+    let app = Paths::new().app;
+    if app.exists() {
+        let (old_team, new_team) = (codesign_team(&app)?, codesign_team(&bundle)?);
+        anyhow::ensure!(
+            old_team == new_team,
+            "new bundle team {new_team:?} does not match installed {old_team:?}",
+        );
+    }
+    let plist_version = run_capture(
+        "/usr/libexec/PlistBuddy",
+        &["-c", "Print :CFBundleShortVersionString"],
+        &[&bundle.join("Contents/Info.plist")],
+    )?;
+    anyhow::ensure!(
+        plist_version.trim() == version,
+        "bundle says version {:?}, manifest {version:?}",
+        plist_version.trim(),
+    );
+
+    // Root-owned swap with rollback, then the agent restarts into it.
+    // (chown only when actually root, so prefix test runs still work.)
+    if unsafe { libc_geteuid() } == 0 {
+        run("/usr/sbin/chown", &["-R", "root:wheel"], &[&bundle])?;
+    }
+    run("/bin/chmod", &["-R", "go-w"], &[&bundle])?;
+    let old = app.with_extension("app.old");
+    let _ = std::fs::remove_dir_all(&old);
+    let had_existing = app.exists();
+    if had_existing {
+        std::fs::rename(&app, &old).context("move current app aside")?;
+    }
+    if let Err(e) = std::fs::rename(&bundle, &app) {
+        if had_existing {
+            let _ = std::fs::rename(&old, &app);
+        }
+        return Err(anyhow::Error::from(e).context("move new app into place"));
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
+
+    // Restart the console user's agent into the new bundle.
+    if let Ok(meta) = std::fs::metadata("/dev/console") {
+        use std::os::unix::fs::MetadataExt;
+        let uid = meta.uid();
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["kickstart", "-k", &format!("gui/{uid}/{AGENT_LABEL}")])
+            .status();
+    }
+    Ok(version)
+}
+
+fn find_app_bundle(dir: &Path) -> Option<PathBuf> {
+    let is_app = |p: &PathBuf| p.extension().is_some_and(|e| e == "app");
+    let entries = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .map(|r| r.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let top = entries(dir);
+    if let Some(app) = top.iter().find(|p| is_app(p)) {
+        return Some(app.clone());
+    }
+    let dirs: Vec<&PathBuf> = top.iter().filter(|p| p.is_dir()).collect();
+    if let [only] = dirs.as_slice() {
+        return entries(only).into_iter().find(|p| is_app(p));
+    }
+    None
+}
+
+fn codesign_team(app: &Path) -> Result<String> {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dv"])
+        .arg(app)
+        .output()?;
+    // codesign writes details to stderr.
+    let text = String::from_utf8_lossy(&out.stderr);
+    text.lines()
+        .find_map(|l| l.strip_prefix("TeamIdentifier="))
+        .map(str::to_string)
+        .context("no TeamIdentifier in codesign output")
+}
+
+fn run(tool: &str, args: &[&str], paths: &[&Path]) -> Result<()> {
+    let mut cmd = std::process::Command::new(tool);
+    cmd.args(args);
+    for p in paths {
+        cmd.arg(p);
+    }
+    let out = cmd.output().with_context(|| format!("spawn {tool}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "{tool} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim(),
+    );
+    Ok(())
+}
+
+fn run_capture(tool: &str, args: &[&str], paths: &[&Path]) -> Result<String> {
+    let mut cmd = std::process::Command::new(tool);
+    cmd.args(args);
+    for p in paths {
+        cmd.arg(p);
+    }
+    let out = cmd.output().with_context(|| format!("spawn {tool}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "{tool} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim(),
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// React to heartbeat state: resume a stopped agent, log a missing one.
@@ -268,6 +443,8 @@ fn watch_agent(agent: &Mutex<AgentState>) {
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
 }
 
 /// Verify managed files exist with sane ownership; rewrite plists we

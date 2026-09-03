@@ -21,8 +21,10 @@ use x509_cert::der::asn1::ObjectIdentifier;
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
-/// The otactl app name config envelopes must carry.
+/// The otactl app names envelopes may carry: settings and the .app zip.
 pub const CONFIG_APP: &str = "betamacs-config";
+#[allow(dead_code)] // used by betamacsd, dead in the betamacs bin
+pub const APP_APP: &str = "betamacs";
 
 const ALG_ECDSA_P256_SHA256: &str = "ecdsa-p256-sha256";
 /// ecdsa-with-SHA256 (certificate signature algorithm).
@@ -164,8 +166,9 @@ impl Verifier {
     }
 
     /// Full envelope verification; `last_epoch` is the persisted
-    /// high-water for rollback refusal.
-    pub fn verify(&self, env: &Envelope, last_epoch: u64) -> Result<Verified> {
+    /// high-water for rollback refusal, `expected_app` the otactl app
+    /// name this envelope must be for.
+    pub fn verify(&self, env: &Envelope, last_epoch: u64, expected_app: &str) -> Result<Verified> {
         if let Some(alg) = env.signature_algorithm.as_deref()
             && !alg.is_empty()
             && alg != ALG_ECDSA_P256_SHA256
@@ -212,8 +215,8 @@ impl Verifier {
 
         // Identity, artifact binding, rollback.
         anyhow::ensure!(
-            env.manifest.app == CONFIG_APP,
-            "manifest is for app {:?}, expected {CONFIG_APP:?}",
+            env.manifest.app == expected_app,
+            "manifest is for app {:?}, expected {expected_app:?}",
             env.manifest.app,
         );
         let artifact = base64::engine::general_purpose::STANDARD
