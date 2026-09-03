@@ -29,12 +29,16 @@ pub struct Health {
     pub capture_ok: AtomicBool,
     /// Epoch of the applied managed config (0 = unmanaged/defaults).
     pub config_epoch: AtomicU64,
+    /// False when the applied policy disables censoring — the daemon must
+    /// treat that as healthy-by-policy, not as a tampered censor.
+    pub enabled: AtomicBool,
 }
 
 impl Health {
     pub fn new() -> Arc<Self> {
         let h = Self::default();
         h.capture_ok.store(true, Ordering::Relaxed);
+        h.enabled.store(true, Ordering::Relaxed);
         Arc::new(h)
     }
 }
@@ -44,12 +48,13 @@ impl Health {
 pub fn spawn(health: Arc<Health>) {
     std::thread::spawn(move || loop {
         let line = format!(
-            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{}}}\n",
+            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{}}}\n",
             std::process::id(),
             health.streams.load(Ordering::Relaxed),
             health.boxes.load(Ordering::Relaxed),
             health.capture_ok.load(Ordering::Relaxed),
             health.config_epoch.load(Ordering::Relaxed),
+            health.enabled.load(Ordering::Relaxed),
         );
         match UnixStream::connect(DAEMON_SOCKET) {
             Ok(mut stream) => {

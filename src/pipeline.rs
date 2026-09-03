@@ -177,8 +177,35 @@ pub fn run(
     };
     menubar_status(&capturer, &loaded_model, &overlay);
 
+    let mut was_enabled = true;
     loop {
         let cfg = shared.read().unwrap().clone();
+
+        // Master switch: when policy disables censoring, drain frames but
+        // do no work, clear anything on screen, and say so in the
+        // heartbeat so the daemon knows this is policy, not tampering.
+        health
+            .enabled
+            .store(cfg.detection.enabled, Ordering::Relaxed);
+        if !cfg.detection.enabled {
+            if was_enabled {
+                was_enabled = false;
+                held.clear();
+                highlights.clear();
+                health.boxes.store(0, Ordering::Relaxed);
+                overlay.set_regions(Vec::new())?;
+                let _ = overlay.set_status("censoring disabled by policy".into());
+                tracing::warn!("censoring disabled by policy");
+            }
+            while capturer.try_recv().is_some() {}
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        if !was_enabled {
+            was_enabled = true;
+            tracing::info!("censoring re-enabled by policy");
+            menubar_status(&capturer, &loaded_model, &overlay);
+        }
 
         // Hot-swap the detector on model change.
         if cfg.detection.model != loaded_model {

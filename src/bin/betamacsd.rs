@@ -58,12 +58,200 @@ impl Paths {
 }
 
 /// Last heartbeat seen from the agent.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct AgentState {
     last_seen: Option<Instant>,
     pid: u32,
     capture_ok: bool,
     config_epoch: u64,
+    /// False when policy disables censoring — healthy by policy.
+    enabled: bool,
+}
+
+impl Default for AgentState {
+    fn default() -> Self {
+        Self {
+            last_seen: None,
+            pid: 0,
+            capture_ok: true,
+            config_epoch: 0,
+            enabled: true,
+        }
+    }
+}
+
+/// Layer-4 local enforcement (docs/managed-mode.md): when the censor is
+/// detectably not protecting an active session — Screen Recording
+/// revoked, agent killed/silenced beyond what repair fixes — for longer
+/// than the grace period, load a pf ruleset that blocks all traffic
+/// except loopback, DHCP, DNS, SSH-in (recovery), and the otactl
+/// origins (management keeps working). pfctl is root-only, so a
+/// standard user cannot lift it; the rules cover every interface, so
+/// tethering or another Wi-Fi doesn't escape. Cleared automatically the
+/// moment health returns. The anchor lives under com.apple/* because
+/// the stock /etc/pf.conf evaluates that tree — no config edits.
+struct Quarantine {
+    engaged: bool,
+    unhealthy_since: Option<Instant>,
+    /// BETAMACSD_NO_QUARANTINE=1, non-root, or a test prefix disables.
+    armed: bool,
+    /// BETAMACSD_QUARANTINE_DRYRUN=1: full logic, log instead of pfctl.
+    dry_run: bool,
+    /// Default 180s; BETAMACSD_QUARANTINE_GRACE_SECS overrides.
+    grace: Duration,
+    rules_path: PathBuf,
+}
+
+const PF_ANCHOR: &str = "com.apple/250.BetamacsQuarantine";
+const QUARANTINE_GRACE: Duration = Duration::from_secs(180);
+const HEARTBEAT_FRESH: Duration = Duration::from_secs(60);
+/// Management hosts that stay reachable under quarantine.
+const ALLOWED_HOSTS: [&str; 2] = [
+    "otactl-device.docker.newton.haus",
+    "otactl.docker.newton.haus",
+];
+
+impl Quarantine {
+    fn new(paths: &Paths) -> Self {
+        let dry_run = std::env::var_os("BETAMACSD_QUARANTINE_DRYRUN").is_some();
+        let armed = (dry_run
+            || (unsafe { libc_geteuid() } == 0
+                && std::env::var_os("BETAMACSD_PREFIX").is_none()))
+            && std::env::var_os("BETAMACSD_NO_QUARANTINE").is_none();
+        if !armed {
+            tracing::info!("network quarantine disarmed (env/uid/prefix)");
+        }
+        let grace = std::env::var("BETAMACSD_QUARANTINE_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(QUARANTINE_GRACE);
+        Self {
+            engaged: false,
+            unhealthy_since: None,
+            armed,
+            dry_run,
+            grace,
+            rules_path: paths.managed_dir.join("quarantine.rules"),
+        }
+    }
+
+    /// Called from the watch loop. Healthy means: no active console
+    /// session, censoring disabled by policy, or a fresh heartbeat with
+    /// working capture.
+    fn evaluate(&mut self, agent: &AgentState) {
+        if !self.armed {
+            return;
+        }
+        let session_active = std::fs::metadata("/dev/console")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.uid() != 0
+            })
+            .unwrap_or(false);
+        let healthy = !session_active
+            || !agent.enabled
+            || (agent
+                .last_seen
+                .is_some_and(|t| t.elapsed() < HEARTBEAT_FRESH)
+                && agent.capture_ok);
+        if healthy {
+            self.unhealthy_since = None;
+            if self.engaged {
+                self.release();
+            }
+            return;
+        }
+        let since = *self.unhealthy_since.get_or_insert_with(Instant::now);
+        if !self.engaged && since.elapsed() >= self.grace {
+            tracing::warn!(
+                "censor unprotected for {}s (heartbeat {:?}s old, captureOk {}) — engaging network quarantine",
+                since.elapsed().as_secs(),
+                agent.last_seen.map(|t| t.elapsed().as_secs()),
+                agent.capture_ok,
+            );
+            self.engage();
+        }
+    }
+
+    fn engage(&mut self) {
+        let allowed: Vec<String> = ALLOWED_HOSTS
+            .iter()
+            .flat_map(|h| {
+                use std::net::ToSocketAddrs;
+                format!("{h}:443")
+                    .to_socket_addrs()
+                    .map(|a| a.map(|s| s.ip().to_string()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mgmt = if allowed.is_empty() {
+            tracing::warn!("could not resolve management hosts; quarantine allows DNS only");
+            String::new()
+        } else {
+            format!(
+                "pass out quick proto tcp from any to {{ {} }} port 443\n",
+                allowed.join(", "),
+            )
+        };
+        let rules = format!(
+            "# betamacs quarantine — loaded by betamacsd when the censor is\n\
+             # detectably not protecting an active session. Removed on recovery.\n\
+             pass quick on lo0 all\n\
+             pass out quick proto udp from any port 68 to any port 67\n\
+             pass out quick proto {{ udp, tcp }} from any to any port 53\n\
+             {mgmt}\
+             pass in quick proto tcp from any to any port 22\n\
+             block drop quick all\n",
+        );
+        if self.dry_run {
+            tracing::warn!("DRY RUN: would load pf anchor {PF_ANCHOR}:\n{rules}");
+            self.engaged = true;
+            return;
+        }
+        if let Err(e) = std::fs::write(&self.rules_path, &rules) {
+            tracing::error!("could not write quarantine rules: {e}");
+            return;
+        }
+        let _ = std::process::Command::new("/sbin/pfctl").arg("-E").output();
+        match std::process::Command::new("/sbin/pfctl")
+            .args(["-a", PF_ANCHOR, "-f"])
+            .arg(&self.rules_path)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                self.engaged = true;
+                tracing::warn!("network quarantine ENGAGED (pf anchor {PF_ANCHOR})");
+            }
+            Ok(out) => tracing::error!(
+                "pfctl load failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+            Err(e) => tracing::error!("pfctl spawn failed: {e}"),
+        }
+    }
+
+    fn release(&mut self) {
+        if self.dry_run {
+            tracing::warn!("DRY RUN: would flush pf anchor {PF_ANCHOR}");
+            self.engaged = false;
+            return;
+        }
+        match std::process::Command::new("/sbin/pfctl")
+            .args(["-a", PF_ANCHOR, "-F", "all"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                self.engaged = false;
+                tracing::warn!("network quarantine released (censor healthy again)");
+            }
+            Ok(out) => tracing::error!(
+                "pfctl flush failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+            Err(e) => tracing::error!("pfctl spawn failed: {e}"),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -130,10 +318,12 @@ fn main() -> Result<()> {
     }
 
     // Watchdog loop.
+    let mut quarantine = Quarantine::new(&paths);
     let mut last_integrity = Instant::now() - Duration::from_secs(3600);
     loop {
         std::thread::sleep(Duration::from_secs(15));
         watch_agent(&agent);
+        quarantine.evaluate(&agent.lock().unwrap().clone());
         if last_integrity.elapsed() >= Duration::from_secs(600) {
             last_integrity = Instant::now();
             check_integrity(&paths);
@@ -169,6 +359,7 @@ fn handle_client(
                 a.pid = msg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 a.capture_ok = msg.get("captureOk").and_then(|v| v.as_bool()).unwrap_or(true);
                 a.config_epoch = msg.get("configEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                a.enabled = msg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
                 if !a.capture_ok {
                     tracing::warn!("agent reports capture unhealthy (Screen Recording revoked?)");
                 }
@@ -211,11 +402,12 @@ fn handle_client(
             Some("status") => {
                 let a = agent.lock().unwrap().clone();
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
                     a.config_epoch,
+                    a.enabled,
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());

@@ -89,14 +89,24 @@ Small, dependency-light second binary in this repo. Root LaunchDaemon,
    KeepAlive and next-login re-load bring it back, and the heartbeat gap
    is observed.
 3. **Watchdog daemon** — betamacsd as described.
-4. **Detection with consequences** (documented for later):
-   - **Local network quarantine (pf)** — on sustained censor-down
-     (heartbeat lost, TCC revoked, integrity unrepairable), betamacsd
-     loads a pf anchor blocking all traffic except loopback, DHCP/DNS,
-     and the otactl origins (so management and recovery keep working).
-     `pfctl` is root-only, so a standard user cannot lift it; the rules
-     apply to every interface, so tethering or joining another Wi-Fi
-     doesn't escape it. Cleared automatically when health returns.
+4. **Detection with consequences**:
+   - **Local network quarantine (pf) — IMPLEMENTED.** When a console
+     session is active, censoring is enabled by policy, and the censor
+     is detectably not protecting (heartbeat stale/absent, or capture
+     unhealthy — e.g. Screen Recording revoked) for longer than the
+     grace period (180 s; `BETAMACSD_QUARANTINE_GRACE_SECS`), betamacsd
+     loads a pf ruleset into the anchor
+     `com.apple/250.BetamacsQuarantine` (evaluated by the stock
+     /etc/pf.conf, nothing edited) blocking all traffic except
+     loopback, DHCP, DNS, inbound SSH (recovery), and the otactl
+     origins. `pfctl` is root-only, so a standard user cannot lift it;
+     the rules cover every interface, so tethering or another Wi-Fi
+     doesn't escape. Released automatically when health returns.
+     `BETAMACSD_NO_QUARANTINE=1` disarms;
+     `BETAMACSD_QUARANTINE_DRYRUN=1` logs instead of loading.
+     Disabled-by-policy (the signed config's `detection.enabled:
+     false`) is reported in the heartbeat and treated as healthy — a
+     sanctioned off-switch never quarantines.
    - **UniFi backstop (off-device)** — hausmeister reports betamacs
      health to otactl; network policy keys the device's internet access
      to it (nh-parentalcontrol VLAN infrastructure). Covers what local
@@ -122,6 +132,35 @@ Screen Time is neither an obstacle nor a defense here:
 - Screen Time's web content filter coexists fine with a pf quarantine
   and with our capture pipeline. Using Screen Time *alongside* betamacs
   for app/time limits is complementary and unaffected.
+
+## Config authority over time (design notes)
+
+- **otactl stays the config home.** Signed artifacts give authenticity,
+  epoch anti-rollback, channels, audit, and offline-cache semantics for
+  free. Time-*varying* policy does not need server-side timing: it
+  belongs inside the package, evaluated locally — the named-config +
+  layer system was built for exactly this, and a future `schedule`
+  module (time windows → layer stacks) slots in without touching the
+  delivery pipeline. `detection.enabled` (implemented) is the
+  policy-controlled off switch. If genuinely dynamic per-device config
+  is ever needed, otactl's `device_app_configs`-style endpoint is the
+  growth path — not a reason to move now.
+- **Timed change-locks** (typeserver integration, planned): typeserver's
+  timed secrets are real timelock cryptography — data keys wrapped to a
+  future drand (League of Entropy) round via tlock/IBE, extend-only,
+  with optional k-of-n quorum early-unlock. The fit for betamacs is
+  locking the *ability to publish config*: encrypt the
+  `betamacs-config` publisher key under a generated passphrase, store
+  the passphrase as a `decrypt_at` secret, shred the plaintext key —
+  until the round arrives, no one (parent included) can sign a config
+  change, and the lock can only ever be extended. Known bypass to close
+  server-side later: an otactl admin can enroll a fresh publisher; a
+  per-app "publish freeze until T" in otactl (refusing uploads and new
+  publisher enrollment for the app) turns that from a two-minute
+  workaround into a deliberate server-policy change. Full cryptographic
+  enforcement (a second, tlock-held authoring key required by
+  betamacsd) is possible but heavier than the pestering threat model
+  warrants.
 
 ## Residual risks (accepted)
 

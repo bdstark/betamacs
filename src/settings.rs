@@ -71,6 +71,11 @@ pub struct ModulePatches {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionSettings {
+    /// Master switch: when false, nothing is scanned or censored. Only a
+    /// signed config can flip this on a managed install, and the daemon
+    /// treats "disabled by policy" as healthy (no quarantine).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// "320n" | "640m" | absolute model path.
     pub model: String,
     /// Minimum confidence for a detection to count (0..1).
@@ -113,9 +118,15 @@ fn default_highlight_floor() -> f32 {
     0.15
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +166,7 @@ impl Default for DetectionSettings {
             "ANUS_EXPOSED",
         ];
         Self {
+            enabled: true,
             model: "320n".into(),
             confidence_threshold: 0.35,
             iou_threshold: 0.45,
@@ -181,7 +193,7 @@ impl DetectionSettings {
             ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
         }
         set!(
-            model, confidence_threshold, iou_threshold, min_region_px, capture_fps,
+            enabled, model, confidence_threshold, iou_threshold, min_region_px, capture_fps,
             tile_grid, hold_ms, borderline_margin, debounce_count, debounce_window_ms,
             highlight_enabled, highlight_floor
         );

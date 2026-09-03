@@ -90,6 +90,14 @@ export class BmDetectionModule extends LitElement {
 
     return html`
       <bm-section heading="Engine">
+        <bm-switch
+          label="Censoring enabled"
+          hint="Master switch: off means nothing is scanned or censored (the watchdog treats this as policy, not tampering)"
+          .value=${d.enabled}
+          source=${src("enabled")}
+          @field-change=${(e: CustomEvent) => setOverride("enabled", e.detail)}
+          @reset=${() => clearOverride("enabled")}
+        ></bm-switch>
         <bm-select
           label="Model"
           hint="640m is more accurate but ~5x slower per frame"

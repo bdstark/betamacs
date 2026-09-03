@@ -59,6 +59,8 @@ export const TRIGGER_GROUPS: { label: string; classes: NudenetClass[] }[] = [
 ];
 
 export interface DetectionSettings {
+  /** Master switch: when false nothing is scanned or censored. */
+  enabled: boolean;
   model: string;
   confidenceThreshold: number;
   iouThreshold: number;
@@ -172,6 +174,7 @@ export function defaultDetection(): DetectionSettings {
     "ANUS_EXPOSED",
   ]);
   return {
+    enabled: true,
     model: "320n",
     confidenceThreshold: 0.35,
     iouThreshold: 0.45,
