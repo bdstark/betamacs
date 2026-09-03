@@ -19,6 +19,7 @@ public final class BetamacsPlugin: HausmeisterPlugin {
 
   static let appName = "betamacs"
   static let configApp = "betamacs-config"
+  static let tasksApp = "betamacs-tasks"
   static let arch = "arm64"
   static let appFormat = "macos-app-zip"
 
@@ -65,6 +66,11 @@ public final class BetamacsPlugin: HausmeisterPlugin {
       do { _ = try await self.checkAndPushConfig() } catch {
         self.host.log.error("betamacs: config: \(error)")
       }
+      if self.tasksEntitled {
+        do { _ = try await self.checkAndPushTasks() } catch {
+          self.host.log.error("betamacs: tasks: \(error)")
+        }
+      }
       do { _ = try await self.checkAndInstallApp() } catch {
         self.host.log.error("betamacs: app: \(error)")
       }
@@ -88,6 +94,10 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     var lines: [String] = []
     do { lines.append("Betamacs settings: \(try await checkAndPushConfig()).") }
     catch { lines.append("Betamacs settings: check failed — \(error).") }
+    if tasksEntitled {
+      do { lines.append("Betamacs tasks: \(try await checkAndPushTasks()).") }
+      catch { lines.append("Betamacs tasks: check failed — \(error).") }
+    }
     do { lines.append("Betamacs app: \(try await checkAndInstallApp()).") }
     catch { lines.append("Betamacs app: check failed — \(error).") }
     return lines.joined(separator: "\n")
@@ -99,6 +109,12 @@ public final class BetamacsPlugin: HausmeisterPlugin {
   /// the same with 403 NOT_ENTITLED, so this is about not asking.
   private var entitled: Bool {
     host.entitlements?.extensions.contains { $0.app == BetamacsPlugin.configApp } ?? false
+  }
+
+  /// The task bank is a separate cross-app fetch with its own ext: grant;
+  /// skip it cleanly when ungranted rather than provoke a 403.
+  private var tasksEntitled: Bool {
+    host.entitlements?.extensions.contains { $0.app == BetamacsPlugin.tasksApp } ?? false
   }
 
   private func refreshStatus() {
@@ -129,6 +145,30 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     guard let reply = try? DaemonSocket.roundTrip(["type": "status"]),
           let epoch = reply["configEpoch"] as? Int, epoch >= 0 else { return 0 }
     return UInt64(epoch)
+  }
+
+  private func daemonTasksEpoch() -> UInt64 {
+    guard let reply = try? DaemonSocket.roundTrip(["type": "status"]),
+          let epoch = reply["tasksEpoch"] as? Int, epoch >= 0 else { return 0 }
+    return UInt64(epoch)
+  }
+
+  // MARK: task bank
+
+  /// Fetch and deliver the challenge task bank (`betamacs-tasks`) when a
+  /// newer epoch is available — same signed-envelope courier flow as
+  /// config, to a separate artifact so questions version independently.
+  private func checkAndPushTasks() async throws -> String {
+    let (response, client) = try await fetchManifest(app: BetamacsPlugin.tasksApp)
+    let m = response.manifest
+    let daemonEpoch = daemonTasksEpoch()
+    if let epoch = m.epoch, epoch <= daemonEpoch {
+      return "up to date (epoch \(daemonEpoch))"
+    }
+    let artifact = try await fetchArtifact(app: BetamacsPlugin.tasksApp, manifest: m, client: client)
+    try deliver(type: "tasks", response: response, artifact: artifact)
+    host.log.notice("betamacs: pushed task bank \(m.version) (epoch \(m.epoch ?? 0))")
+    return "pushed \(m.version) (epoch \(m.epoch ?? 0))"
   }
 
   // MARK: settings envelopes

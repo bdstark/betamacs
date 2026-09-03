@@ -7,10 +7,14 @@ import "./components/controls.js";
 import "./components/layers.js";
 import "./modules/detection.js";
 import "./modules/censor.js";
+import "./modules/challenge.js";
+import "./modules/exposure.js";
 
 const TABS = [
   { id: "detection", label: "Detection engine" },
   { id: "censor", label: "Black box censor" },
+  { id: "challenge", label: "Activity challenges" },
+  { id: "exposure", label: "Exposure budget" },
   { id: "layers", label: "Layers & package" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
@@ -191,6 +195,8 @@ export class BmApp extends LitElement {
 
       ${this.tab === "detection" ? html`<bm-detection-module></bm-detection-module>` : ""}
       ${this.tab === "censor" ? html`<bm-censor-module></bm-censor-module>` : ""}
+      ${this.tab === "challenge" ? html`<bm-challenge-module></bm-challenge-module>` : ""}
+      ${this.tab === "exposure" ? html`<bm-exposure-module></bm-exposure-module>` : ""}
       ${this.tab === "layers" ? html`<bm-layers></bm-layers>` : ""}
     `;
   }
