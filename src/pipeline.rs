@@ -24,7 +24,7 @@ use anyhow::Result;
 use crate::capture::Frame;
 use crate::capture_sck::SckCapturer;
 use crate::censor_fx;
-use crate::detect::{Detection, Detector};
+use crate::detect::{Detection, Detector, TileCache};
 use crate::overlay::{CensorRegion, OverlayHandle};
 use crate::settings::{CensorMode, CensorSettings, Effective};
 
@@ -131,13 +131,17 @@ pub fn run(
     use std::sync::atomic::Ordering;
     let initial = shared.read().unwrap().clone();
     let (model_path, input_size) = initial.detection.model_path();
-    let mut detector = Detector::new(&model_path, input_size)?;
+    // Detector pool: [0] always exists; extras are built lazily so frames
+    // from multiple monitors can be scanned in parallel.
+    let mut detectors = vec![Detector::new(&model_path, input_size)?];
     let mut loaded_model = initial.detection.model.clone();
     let mut consecutive_failures = 0u32;
     let mut capturer = SckCapturer::new(initial.detection.capture_fps)?;
     // Per-monitor held boxes, each with its own last-seen time so one
     // region dropping out (confidence wobble) doesn't take others with it.
     let mut held: HashMap<u32, Vec<HeldBox>> = HashMap::new();
+    // Per-monitor tile caches so detect_tiled can skip unchanged tiles.
+    let mut tile_caches: HashMap<u32, TileCache> = HashMap::new();
     // Per-monitor debug highlights (flagged but not blocked), replaced
     // wholesale on each processed frame — same change-driven lifetime as
     // censor boxes: no frame means the screen (and they) stay put.
@@ -213,7 +217,8 @@ pub fn run(
             match Detector::new(&path, size) {
                 Ok(d) => {
                     tracing::info!("switched detector to {}", path.display());
-                    detector = d;
+                    detectors = vec![d];
+                    tile_caches.clear();
                     loaded_model = cfg.detection.model.clone();
                     menubar_status(&capturer, &loaded_model, &overlay);
                 }
@@ -330,26 +335,75 @@ pub fn run(
 
         let hold = Duration::from_millis(cfg.detection.hold_ms);
         let mut changed = false;
-        for (monitor_id, frame) in &latest {
-            let tick = Instant::now();
-            // With highlighting on, detect down to the highlight floor so
-            // sub-threshold regions are visible; blocking still requires
-            // the full confidence threshold below.
-            let detect_floor = if cfg.detection.highlight_enabled {
-                cfg.detection
-                    .highlight_floor
-                    .min(cfg.detection.confidence_threshold)
-                    .max(0.05)
-            } else {
-                cfg.detection.confidence_threshold
-            };
-            let detections = match detector.detect_tiled(
+        // With highlighting on, detect down to the highlight floor so
+        // sub-threshold regions are visible; blocking still requires
+        // the full confidence threshold below.
+        let detect_floor = if cfg.detection.highlight_enabled {
+            cfg.detection
+                .highlight_floor
+                .min(cfg.detection.confidence_threshold)
+                .max(0.05)
+        } else {
+            cfg.detection.confidence_threshold
+        };
+        // Grow the pool to one detector per fresh frame; on build failure
+        // fall back to scanning them serially with detectors[0].
+        if latest.len() > detectors.len() {
+            let (path, size) = cfg.detection.model_path();
+            while detectors.len() < latest.len() {
+                match Detector::new(&path, size) {
+                    Ok(d) => detectors.push(d),
+                    Err(e) => {
+                        tracing::warn!("extra detector build failed, scanning serially: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+        let tick = Instant::now();
+        let jobs: Vec<(u32, &Frame, TileCache)> = latest
+            .iter()
+            .map(|(id, frame)| (*id, frame, tile_caches.remove(id).unwrap_or_default()))
+            .collect();
+        let detect = |detector: &mut Detector, frame: &Frame, cache: &mut TileCache| {
+            detector.detect_tiled(
                 &frame.image,
                 cfg.detection.tile_grid,
                 0.2,
                 detect_floor,
                 cfg.detection.iou_threshold,
-            ) {
+                cache,
+            )
+        };
+        let results: Vec<(u32, Result<Vec<Detection>>, TileCache)> =
+            if jobs.len() > 1 && detectors.len() >= jobs.len() {
+                std::thread::scope(|scope| {
+                    jobs.into_iter()
+                        .zip(detectors.iter_mut())
+                        .map(|((id, frame, mut cache), detector)| {
+                            let detect = &detect;
+                            scope.spawn(move || {
+                                let result = detect(detector, frame, &mut cache);
+                                (id, result, cache)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect()
+                })
+            } else {
+                jobs.into_iter()
+                    .map(|(id, frame, mut cache)| {
+                        let result = detect(&mut detectors[0], frame, &mut cache);
+                        (id, result, cache)
+                    })
+                    .collect()
+            };
+        for (monitor_id, result, cache) in results {
+            tile_caches.insert(monitor_id, cache);
+            let frame = &latest[&monitor_id];
+            let detections = match result {
                 Ok(d) => {
                     consecutive_failures = 0;
                     d
@@ -364,7 +418,7 @@ pub fn run(
                         match Detector::new(&path, size) {
                             Ok(d) => {
                                 tracing::warn!("rebuilt detector session after repeated failures");
-                                detector = d;
+                                detectors = vec![d];
                                 consecutive_failures = 0;
                             }
                             Err(e) => tracing::error!("detector rebuild failed: {e}"),
@@ -416,12 +470,12 @@ pub fn run(
                         region
                     })
                     .collect();
-                let entry = highlights.entry(*monitor_id).or_default();
+                let entry = highlights.entry(monitor_id).or_default();
                 if *entry != boxes {
                     *entry = boxes;
                     changed = true;
                 }
-            } else if highlights.remove(monitor_id).is_some_and(|h| !h.is_empty()) {
+            } else if highlights.remove(&monitor_id).is_some_and(|h| !h.is_empty()) {
                 changed = true;
             }
             let regions: Vec<(CensorRegion, f32)> = flagged
@@ -448,7 +502,7 @@ pub fn run(
             // instead of leaving a trail. Unclaimed boxes linger `hold_ms`
             // (confidence-wobble grace, per box).
             let now = Instant::now();
-            let entry = held.entry(*monitor_id).or_default();
+            let entry = held.entry(monitor_id).or_default();
             let before: Vec<CensorRegion> = entry.iter().map(|b| b.region.clone()).collect();
             let mut claimed = vec![false; entry.len()];
             let strong_threshold =
@@ -534,7 +588,7 @@ pub fn run(
             });
             let after: Vec<CensorRegion> = entry.iter().map(|b| b.region.clone()).collect();
             if entry.is_empty() {
-                held.remove(monitor_id);
+                held.remove(&monitor_id);
             }
 
             if after != before {

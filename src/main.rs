@@ -546,6 +546,7 @@ fn probe(model_override: Option<String>) -> Result<()> {
             0.2,
             d.confidence_threshold,
             d.iou_threshold,
+            &mut detect::TileCache::default(),
         )?;
         tracing::info!(
             "{}: {} detection(s) in {:?}",
