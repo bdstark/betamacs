@@ -16,12 +16,23 @@ use overlay::{CensorRegion, OverlayApp};
 use settings::{CensorSettings, Effective, Package};
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "betamacs=info,ort=error".into()),
-        )
-        .init();
+    // Launched from the .app bundle (e.g. as a login item) the working
+    // directory is "/" and stderr goes nowhere, so relative paths are
+    // pinned to a per-user data dir and the log goes to a file there.
+    let log_file = bundle_resources()
+        .map(|res| enter_data_dir(&res))
+        .transpose()?;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "betamacs=info,ort=error".into());
+    match log_file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(Arc::new(file))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
 
     // A silent thread panic would leave the app half-dead with no trace in
     // the log; record it and exit loudly so a supervisor can restart us.
@@ -45,6 +56,49 @@ fn main() -> Result<()> {
         "demo" => demo(),
         _ => run(model, censor_in_captures),
     }
+}
+
+/// Contents/Resources of the .app we are running from, or None when the
+/// executable is not inside a bundle (plain `cargo run`).
+fn bundle_resources() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents")
+        .then(|| contents.join("Resources"))
+}
+
+/// Make the per-user data dir the working directory so the existing
+/// relative paths (config/, models/) keep working, with models/ a symlink
+/// into the bundle. Returns the opened log file.
+fn enter_data_dir(resources: &std::path::Path) -> Result<std::fs::File> {
+    let data = std::env::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no home directory"))?
+        .join("Library/Application Support/betamacs");
+    std::fs::create_dir_all(&data)?;
+    std::env::set_current_dir(&data)?;
+
+    let models = data.join("models");
+    match std::fs::symlink_metadata(&models) {
+        // Re-point at the current bundle in case the app moved.
+        Ok(m) if m.file_type().is_symlink() => std::fs::remove_file(&models)?,
+        Ok(_) => {} // a real directory the user manages; leave it
+        Err(_) => {}
+    }
+    if std::fs::symlink_metadata(&models).is_err() {
+        std::os::unix::fs::symlink(resources.join("models"), &models)?;
+    }
+
+    let log_path = data.join("betamacs.log");
+    if let Ok(m) = std::fs::metadata(&log_path)
+        && m.len() > 5 * 1024 * 1024
+    {
+        let _ = std::fs::rename(&log_path, data.join("betamacs.log.old"));
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?)
 }
 
 /// Continuous censoring: overlay event loop on the main thread (macOS
@@ -94,9 +148,13 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
             token,
         }),
         port,
-        PathBuf::from(
-            std::env::var("BETAMACS_WEBAPP_DIR").unwrap_or_else(|_| "webapp/dist".into()),
-        ),
+        std::env::var("BETAMACS_WEBAPP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                bundle_resources()
+                    .map(|r| r.join("webapp"))
+                    .unwrap_or_else(|| PathBuf::from("webapp/dist"))
+            }),
     );
 
     std::thread::spawn(move || {

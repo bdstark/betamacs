@@ -98,6 +98,33 @@ everyone else's captures show them. Debug: `BETAMACS_NO_PROTECT=1`
 forces boxes into captures so the demo can verify they render.
 
 Requires macOS Screen Recording permission for the terminal/app running it.
+
+## .app + LaunchAgent (survives reboot, restarts on crash)
+
+```bash
+scripts/make-app.sh              # -> dist/betamacs.app (signed)
+ditto dist/betamacs.app /Applications/betamacs.app
+launchctl kickstart -k gui/$UID/com.bdstark.betamacs   # restart after reinstall
+```
+
+`~/Library/LaunchAgents/com.bdstark.betamacs.plist` runs the bundle's
+binary with `RunAtLoad` + `KeepAlive`, so it starts at login and launchd
+relaunches it on any exit (the panic hook's loud `exit(101)` counts on
+this). First-time load: `launchctl bootstrap gui/$UID <plist>`; stop for
+good with `launchctl bootout gui/$UID/com.bdstark.betamacs`. Early
+launch failures (before the logger starts) land in the data dir's
+`launchd.log`.
+
+When the executable finds itself inside a bundle it pins the working
+directory to `~/Library/Application Support/betamacs` (config, api-token,
+`betamacs.log` — rotated at 5 MB), symlinks `models/` into the bundle's
+Resources, and serves the bundled webapp; `cargo run` from the checkout is
+unchanged. Signing uses the first Developer ID Application identity (or
+`BETAMACS_SIGN_IDENTITY`), so the Screen Recording grant — enable
+"betamacs" once under System Settings → Privacy & Security → Screen &
+System Audio Recording — survives rebuilds. Login items launch once and
+are not restarted on crash; use a LaunchAgent with `KeepAlive` instead if
+that matters.
 Note: NudeNet's GitHub release downloads are login-gated; the fetch script
 works around this via the API asset endpoint (see script comments).
 
