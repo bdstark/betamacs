@@ -122,9 +122,12 @@ Requires macOS Screen Recording permission for the terminal/app running it.
 
 ```bash
 scripts/make-app.sh              # -> dist/betamacs.app (signed)
+rm -rf /Applications/betamacs.app && ditto dist/betamacs.app /Applications/betamacs.app
 ```
 
-Copy `dist/betamacs.app` anywhere (e.g. `/Applications`) and open it
+(Remove before copying: `ditto` onto an existing bundle merges, and
+stale files from the previous build break the code-signature seal.)
+Open the copied app
 once: a bundled hand launch self-installs. It writes
 `~/Library/LaunchAgents/com.bdstark.betamacs.plist` pointing at its own
 bundle (`RunAtLoad` + `KeepAlive`), replaces any loaded agent with it,
