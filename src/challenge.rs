@@ -19,6 +19,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use crate::heartbeat::Health;
 use crate::prompt;
 use crate::settings::{Answer, ChallengeSettings, Effective, Task, TaskBank};
@@ -97,7 +99,54 @@ fn pick<'a>(
     pool.last().copied()
 }
 
-/// True if `input` satisfies the task's answer.
+/// Normalize input into the canonical string that gets hashed — must match
+/// the `publish.sh tasks` transform exactly (number: fixed-6-decimal then
+/// trimmed; text/choice: trimmed, lowercased per `ignore_case`).
+fn canonical(answer: &Answer, input: &str) -> Option<String> {
+    let t = input.trim();
+    match answer {
+        Answer::Number { .. } => {
+            let v: f64 = t.parse().ok()?;
+            let mut s = format!("{v:.6}");
+            while s.contains('.') && s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+            Some(s)
+        }
+        Answer::Text { ignore_case, .. } => Some(if *ignore_case {
+            t.to_lowercase()
+        } else {
+            t.to_string()
+        }),
+        Answer::Choice { .. } => Some(t.to_lowercase()),
+        Answer::Line { .. } => Some(t.to_string()),
+    }
+}
+
+/// sha256(salt || 0x00 || canonical), hex — the shipped answer hash.
+fn hash_one(salt: &str, canonical: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0u8]);
+    h.update(canonical.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// True if `input` satisfies the task — via the shipped answer hashes when
+/// present (the secure path), else the plaintext answer.
+fn check_task(task: &Task, input: &str) -> bool {
+    if let Some(hashes) = &task.answer_hash {
+        return canonical(&task.answer, input)
+            .map(|c| hash_one(&task.id, &c))
+            .is_some_and(|h| hashes.iter().any(|x| x.eq_ignore_ascii_case(&h)));
+    }
+    check(&task.answer, input)
+}
+
+/// True if `input` satisfies the task's plaintext answer.
 fn check(answer: &Answer, input: &str) -> bool {
     let input = input.trim();
     match answer {
@@ -148,7 +197,7 @@ fn run_challenge(task: &Task, cfg: &ChallengeSettings, health: &Health) -> bool 
     loop {
         let text = present(task, wrong > 0);
         match prompt::ask(&text, cfg.answer_window_sec) {
-            Some(ans) if check(&task.answer, &ans) => return true,
+            Some(ans) if check_task(task, &ans) => return true,
             Some(_) => {
                 wrong += 1;
                 if wrong >= cfg.max_attempts.max(1) {
@@ -219,6 +268,41 @@ mod tests {
     }
 
     #[test]
+    fn canonical_number_is_stable() {
+        let n = Answer::Number { value: 0.0, tolerance: 0.0 };
+        assert_eq!(canonical(&n, "29").as_deref(), Some("29"));
+        assert_eq!(canonical(&n, "29.0").as_deref(), Some("29"));
+        assert_eq!(canonical(&n, " 3.140 ").as_deref(), Some("3.14"));
+        assert_eq!(canonical(&n, "not a number"), None);
+    }
+
+    #[test]
+    fn hashed_answer_round_trips() {
+        // A task the publish transform would produce: neutered plaintext +
+        // answer_hash. The digest must match hash_one over the canonical
+        // input (this exact value is cross-checked against Python).
+        let task = Task {
+            id: "apples".into(),
+            category: "math-word".into(),
+            grade: 6,
+            weight: 1.0,
+            prompt: "?".into(),
+            hint: None,
+            answer: Answer::Number { value: 0.0, tolerance: 0.0 },
+            answer_hash: Some(vec![hash_one("apples", "29")]),
+        };
+        assert!(check_task(&task, "29"));
+        assert!(check_task(&task, "29.0")); // canonicalized to the same hash
+        assert!(!check_task(&task, "30"));
+        // Cross-checked against Python:
+        //   sha256(b"apples" + b"\x00" + b"29").hexdigest()
+        assert_eq!(
+            hash_one("apples", "29"),
+            "4c431117eff9f58de3d930a8fdde5f7b82153e79fcda87ea956077cc5548834b",
+        );
+    }
+
+    #[test]
     fn pick_respects_grade_and_category() {
         let bank = TaskBank {
             version: 1,
@@ -232,6 +316,7 @@ mod tests {
                     prompt: "?".into(),
                     hint: None,
                     answer: Answer::Number { value: 1.0, tolerance: 0.0 },
+                    answer_hash: None,
                 },
                 Task {
                     id: "b".into(),
@@ -241,6 +326,7 @@ mod tests {
                     prompt: "?".into(),
                     hint: None,
                     answer: Answer::Number { value: 2.0, tolerance: 0.0 },
+                    answer_hash: None,
                 },
             ],
         };

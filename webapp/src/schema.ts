@@ -169,6 +169,9 @@ export interface Task {
   prompt: string;
   hint?: string;
   answer: Answer;
+  /** Salted answer hashes emitted by `publish.sh tasks`; present in the
+   * shipped bank, absent in authored source. */
+  answerHash?: string[];
 }
 
 /** The betamacs-tasks artifact: standalone, independently versioned. */

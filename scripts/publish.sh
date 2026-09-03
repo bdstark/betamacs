@@ -88,6 +88,40 @@ if isinstance(d, dict) and "authorSignature" in d and "packageB64" in d:
 if not (isinstance(d, dict) and isinstance(d.get("tasks"), list)):
     sys.exit("%s is not a task bank ({version, tasks:[...]})" % sys.argv[1])
 PYEOF
+    # Hash answers so the shipped, on-device bank is not a cheat sheet: each
+    # task gets `answerHash` (per-task salted sha256 of the canonical
+    # answer) and its plaintext secret is neutered, keeping only type and
+    # presentation (e.g. choice options). Must match challenge.rs::canonical.
+    # Line answers are the shown text — not a secret — so they are left as-is.
+    HASHED="$FILE.hashed"
+    python3 - "$FILE" "$HASHED" <<'PYEOF'
+import json, sys, hashlib
+bank = json.load(open(sys.argv[1]))
+def canon_num(x):
+    s = "%.6f" % float(x)
+    return s.rstrip("0").rstrip(".") if "." in s else s
+def digest(salt, canon):
+    return hashlib.sha256(salt.encode() + b"\x00" + canon.encode()).hexdigest()
+for t in bank.get("tasks", []):
+    a = t.get("answer", {}) or {}
+    typ, salt, hashes = a.get("type"), t.get("id", ""), []
+    if typ == "number":
+        if not a.get("tolerance", 0):          # exact only; tolerant stays plaintext
+            hashes = [digest(salt, canon_num(a.get("value", 0)))]
+            a["value"] = 0
+    elif typ == "text":
+        norm = (lambda s: s.strip().lower()) if a.get("ignoreCase", True) else (lambda s: s.strip())
+        vals = ([a["value"]] if a.get("value") is not None else []) + list(a.get("anyOf", []))
+        hashes = [digest(salt, norm(v)) for v in vals]
+        a["value"], a["anyOf"] = None, []
+    elif typ == "choice":
+        hashes = [digest(salt, a.get("value", "").strip().lower())]
+        a["value"] = ""
+    if hashes:
+        t["answerHash"] = hashes
+json.dump(bank, open(sys.argv[2], "w"), indent=2)
+PYEOF
+    FILE="$HASHED"
     if [ -n "${BETAMACS_AUTHOR_SECRET:-}" ] || [ -f "${BETAMACS_AUTHOR_KEY:-$ROOT/author-key.pem}" ]; then
       "$ROOT/scripts/author-key.sh" sign "$FILE" "${BETAMACS_AUTHOR_TTL:-3600}"
       FILE="$FILE.authored"

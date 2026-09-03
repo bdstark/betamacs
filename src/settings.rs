@@ -572,6 +572,13 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     pub answer: Answer,
+    /// Salted hashes of the acceptable answers, emitted by `publish.sh
+    /// tasks` from the authored plaintext so a readable `tasks.json` is not
+    /// a cheat sheet. When present the agent checks input against these
+    /// (the plaintext `answer` keeps only type/presentation, e.g. choice
+    /// options); when absent it falls back to the plaintext `answer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_hash: Option<Vec<String>>,
 }
 
 /// The `betamacs-tasks` artifact: a standalone, independently-versioned
