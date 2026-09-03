@@ -111,6 +111,32 @@ be layered on later to cross-check or replace local minutes for that source
   daemon validates and commits, so a tampered agent can't mint minutes
   (it would instead go silent → normal quarantine).
 
+## Status (2026-09-03)
+
+Built: config schema (`EarnedTimeSettings`), the agent activity monitor
+(`src/earned.rs` — observes frontmost app/host + idle, resolves the schedule
+via `/bin/date`, reports earned seconds + policy each tick over the daemon
+socket), and the **daemon side** (`betamacsd`): the root-owned ledger
+(`earned-ledger.json`) with daily-cap/bank-ceiling and date-rollover reset,
+balance spend while online in a window, and the two-mode quarantine (Full vs
+Earning-mode, the latter allowing the earn-source hosts). Full-block reasons
+take precedence; earning-mode engages when the balance is depleted in a
+window and releases when it goes positive. Ledger logic is unit-tested and
+earning-mode engage/spend verified in a dry-run.
+
+Known limitations / decisions:
+- **Earning-mode allowlist covers web sources (`browserHostSuffix`) only** —
+  pf filters by resolved IP, so an app-only source (`bundleId`) can't be
+  selectively allowed while blocking everything else. App-based earning
+  relies on the app's offline content, or on earning during a non-gated
+  window. Documented; revisit if an app source needs online access to earn.
+- **Schedule/policy is resolved by the agent**, not the daemon (keeps the
+  daemon from parsing the full config). The daemon owns the *balance* (the
+  un-fakeable part) and caps agent-reported credit; a tampered agent's worst
+  case is bounded by the daily cap, and a killed agent trips the normal
+  full-block watchdog. Acceptable for the threat model (tamper-evidence, not
+  tamper-proof). Move gate resolution into the daemon if that hardens.
+
 ## Open questions
 
 - Bank decay policy (hoarding vs. fairness).
