@@ -159,6 +159,11 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         model_path.display(),
         initial.detection.capture_fps,
     );
+    let menubar_status = |capturer: &SckCapturer, model: &str, overlay: &OverlayHandle| {
+        let n = capturer.display_origins().len();
+        let _ = overlay.set_status(format!("monitoring {n} display(s) · model {model}"));
+    };
+    menubar_status(&capturer, &loaded_model, &overlay);
 
     loop {
         let cfg = shared.read().unwrap().clone();
@@ -171,6 +176,7 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                     tracing::info!("switched detector to {}", path.display());
                     detector = d;
                     loaded_model = cfg.detection.model.clone();
+                    menubar_status(&capturer, &loaded_model, &overlay);
                 }
                 Err(e) => tracing::error!("model switch to {} failed: {e}", path.display()),
             }
@@ -188,6 +194,7 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                     last_frame_at.clear();
                     probe_hashes.clear();
                     streams_started = Instant::now();
+                    menubar_status(&capturer, &loaded_model, &overlay);
                 }
                 Err(e) => tracing::error!("stream rebuild failed: {e}"),
             }
@@ -269,6 +276,7 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                         last_frame_at.clear();
                         probe_hashes.clear();
                         streams_started = Instant::now();
+                        menubar_status(&capturer, &loaded_model, &overlay);
                     }
                     Err(e) => tracing::error!("stream rebuild failed: {e}"),
                 }

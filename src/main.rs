@@ -2,6 +2,7 @@ mod capture;
 mod capture_sck;
 mod censor_fx;
 mod detect;
+mod menubar;
 mod overlay;
 mod pipeline;
 mod server;
@@ -229,6 +230,17 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8787);
     tracing::info!("settings UI: http://127.0.0.1:{port}/  (token: {token})");
+
+    // Menu bar status item; the settings link carries the token in the
+    // URL fragment so the web UI connects without a manual paste.
+    match menubar::MenuBar::new(
+        format!("http://127.0.0.1:{port}/#token={token}"),
+        std::env::current_dir()?.join("betamacs.log"),
+    ) {
+        Some(mb) => app.set_menubar(mb),
+        None => tracing::warn!("menu bar item unavailable (not on main thread?)"),
+    }
+
     server::spawn(
         Arc::new(server::ServerState {
             package: Mutex::new(package),

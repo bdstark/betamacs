@@ -25,6 +25,14 @@ class Store {
     this.pkg.textSets ??= [];
     this.connection =
       readJson<Connection>(CONN_KEY) ?? { url: defaultAppUrl(), token: "" };
+    // Accept a token handed over in the URL fragment (the app's menu bar
+    // "Open Settings…" deep link), persist it, and scrub it from the bar.
+    const handoff = location.hash.match(/token=([0-9a-f]+)/)?.[1];
+    if (handoff) {
+      this.connection = { ...this.connection, token: handoff };
+      localStorage.setItem(CONN_KEY, JSON.stringify(this.connection));
+      history.replaceState(null, "", location.pathname + location.search);
+    }
   }
 
   get effective(): Effective {

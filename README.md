@@ -85,6 +85,11 @@ GET  /api/status     # app + resolved effective settings
 Thresholds, triggers, scales, colors, and hold time apply live; a model
 change hot-swaps the detector; capture fps / tile layout need a restart.
 
+In run mode the app also puts a 🛡 item in the menu bar showing live
+status (displays/model monitored, censor boxes on screen) with an
+"Open Settings…" entry that deep-links into the web UI, handing the API
+token over in the URL fragment so no paste is needed.
+
 ## Setup
 
 ```bash

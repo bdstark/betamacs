@@ -75,6 +75,8 @@ impl PartialEq for CensorRegion {
 pub enum OverlayMsg {
     Regions(Vec<CensorRegion>),
     Style(CensorSettings),
+    /// Status text for the menu bar's "monitoring" line.
+    Status(String),
 }
 
 /// Handle used by the pipeline/server threads to push updates.
@@ -97,6 +99,13 @@ impl OverlayHandle {
             .send_event(OverlayMsg::Style(style))
             .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
     }
+
+    /// Update the menu bar's "monitoring" status line.
+    pub fn set_status(&self, text: String) -> Result<()> {
+        self.proxy
+            .send_event(OverlayMsg::Status(text))
+            .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
+    }
 }
 
 pub struct OverlayApp {
@@ -113,6 +122,8 @@ pub struct OverlayApp {
     next_noise_tick: Option<Instant>,
     /// xorshift state for noise generation.
     rng: u64,
+    /// Menu bar status item, when installed (run mode only).
+    menubar: Option<crate::menubar::MenuBar>,
 }
 
 impl OverlayApp {
@@ -139,8 +150,14 @@ impl OverlayApp {
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0x9e3779b97f4a7c15)
                     | 1,
+                menubar: None,
             },
         ))
+    }
+
+    /// Install the menu bar status item (main thread, run mode only).
+    pub fn set_menubar(&mut self, menubar: crate::menubar::MenuBar) {
+        self.menubar = Some(menubar);
     }
 
     fn content_protected(&self) -> bool {
@@ -206,6 +223,9 @@ impl OverlayApp {
         }
         self.visible = regions.len();
         self.last_regions = regions;
+        if let Some(mb) = &self.menubar {
+            mb.set_boxes(self.visible);
+        }
         self.schedule_noise();
     }
 
@@ -278,6 +298,11 @@ impl ApplicationHandler<OverlayMsg> for OverlayApp {
         match msg {
             OverlayMsg::Regions(regions) => self.apply_regions(event_loop, regions),
             OverlayMsg::Style(style) => self.apply_style(style),
+            OverlayMsg::Status(text) => {
+                if let Some(mb) = &self.menubar {
+                    mb.set_status(&text);
+                }
+            }
         }
     }
 
