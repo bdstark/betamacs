@@ -14,12 +14,64 @@
 //! below is where the agent will propose deltas for the daemon to commit.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::heartbeat::Health;
-use crate::settings::{EarnSource, Effective};
+use crate::heartbeat::{Health, DAEMON_SOCKET};
+use crate::settings::{EarnSource, EarnedTimeSettings, Effective};
+
+/// Is the earned-time gate active right now? Enabled, and the local day/time
+/// falls inside a schedule window. Uses `/bin/date` to avoid a timezone
+/// dependency. Empty schedule = never gated.
+fn gate_active(cfg: &EarnedTimeSettings) -> bool {
+    if !cfg.enabled || cfg.schedule.is_empty() {
+        return false;
+    }
+    let Ok(out) = Command::new("/bin/date").args(["+%u %H%M"]).output() else {
+        return false;
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    let dow: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let hhmm: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(9999);
+    let day = ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        .get(dow)
+        .copied()
+        .unwrap_or("");
+    let parse = |t: &str| -> Option<u32> {
+        let (h, m) = t.split_once(':')?;
+        Some(h.trim().parse::<u32>().ok()? * 100 + m.trim().parse::<u32>().ok()?)
+    };
+    cfg.schedule.iter().any(|w| {
+        w.days.iter().any(|d| d.eq_ignore_ascii_case(day))
+            && matches!((parse(&w.from), parse(&w.to)), (Some(f), Some(t)) if hhmm >= f && hhmm < t)
+    })
+}
+
+/// Report this tick's earned seconds + resolved policy to betamacsd, which
+/// owns the authoritative balance ledger and the pf gate. Sent on the
+/// daemon's own socket (reachable even under an earning-mode lockout, which
+/// allows loopback). Silently skipped when there is no daemon (unmanaged).
+fn report_earn(secs: u32, gate_active: bool, cfg: &EarnedTimeSettings) {
+    let hosts = cfg
+        .sources
+        .iter()
+        .filter_map(|s| s.matcher.browser_host_suffix.clone())
+        .map(|h| format!("{h:?}")) // debug-quotes with JSON-safe escaping
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        "{{\"type\":\"earn\",\"secs\":{secs},\"gateActive\":{gate_active},\"spendRatio\":{},\"dailyCapMin\":{},\"maxBankMin\":{},\"allowHosts\":[{hosts}]}}\n",
+        cfg.spend_ratio, cfg.daily_earn_cap_min, cfg.max_bank_min,
+    );
+    if let Ok(mut s) = UnixStream::connect(DAEMON_SOCKET) {
+        let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+        let _ = s.write_all(line.as_bytes());
+    }
+}
 
 /// How often we sample the foreground state. The design calls for ~20s.
 const TICK: Duration = Duration::from_secs(20);
@@ -144,11 +196,13 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
     // The daemon ledger doesn't exist yet, so `health` is unused for now; it
     // stays in the signature so wiring the report path later needs no change
     // at the call site.
-    let _ = &health;
+    let _ = &health; // reserved; earned-time reports over the daemon socket
     std::thread::spawn(move || {
-        // Running per-source earned minutes for this process's lifetime. The
-        // authoritative, persisted balance will live in betamacsd's ledger.
+        // Running per-source earned minutes for this process's lifetime (for
+        // the log); the authoritative persisted balance is betamacsd's.
         let mut earned: HashMap<String, f64> = HashMap::new();
+        // Fractional seconds not yet reported (reports are whole seconds).
+        let mut carry = 0.0_f64;
         let mut last = Instant::now();
         loop {
             std::thread::sleep(TICK);
@@ -158,47 +212,44 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
             last = now;
 
             if !cfg.enabled {
-                continue; // disabled by policy: observe nothing
-            }
-
-            // Pause crediting while the user is idle.
-            let idle = idle_seconds().unwrap_or(0.0);
-            if idle > cfg.idle_timeout_sec as f64 {
-                tracing::debug!(
-                    "earned: idle {idle:.0}s > {}s — not crediting this tick",
-                    cfg.idle_timeout_sec
-                );
+                report_earn(0, false, &cfg); // clear any stale gate state
                 continue;
             }
+            let gate = gate_active(&cfg);
 
-            let frontmost = frontmost_bundle_id();
-            // Only pay the osascript cost for a browser URL when some source
-            // actually keys off a host and the frontmost app is a browser.
-            let need_host = cfg
-                .sources
-                .iter()
-                .any(|s| s.matcher.browser_host_suffix.is_some());
-            let browser_host = if need_host {
-                frontmost.as_deref().and_then(browser_url_host)
-            } else {
-                None
-            };
-
-            for src in &cfg.sources {
-                if source_matches(src, frontmost.as_deref(), browser_host.as_deref()) {
-                    let delta = elapsed_min * src.earn_ratio as f64;
-                    let total = earned.entry(src.name.clone()).or_insert(0.0);
-                    *total += delta;
-                    tracing::info!(
-                        "earned: +{delta:.2} min on \"{}\" (session total {:.1} min)",
-                        src.name,
-                        *total
-                    );
-                    // TODO: report earned delta to betamacsd ledger (the
-                    // daemon owns the persisted balance and applies the
-                    // daily cap / bank ceiling / min-session rules).
+            // Credit only while the user is present (not idle).
+            let mut credited_min = 0.0_f64;
+            if idle_seconds().unwrap_or(0.0) <= cfg.idle_timeout_sec as f64 {
+                let frontmost = frontmost_bundle_id();
+                // Only pay the osascript URL cost when a source keys off a
+                // host and the frontmost app is a browser.
+                let need_host = cfg
+                    .sources
+                    .iter()
+                    .any(|s| s.matcher.browser_host_suffix.is_some());
+                let browser_host = if need_host {
+                    frontmost.as_deref().and_then(browser_url_host)
+                } else {
+                    None
+                };
+                for src in &cfg.sources {
+                    if source_matches(src, frontmost.as_deref(), browser_host.as_deref()) {
+                        let delta = elapsed_min * src.earn_ratio as f64;
+                        credited_min += delta;
+                        let total = earned.entry(src.name.clone()).or_insert(0.0);
+                        *total += delta;
+                        tracing::info!(
+                            "earned: +{delta:.2} min on \"{}\" (session total {:.1} min)",
+                            src.name,
+                            *total
+                        );
+                    }
                 }
             }
+            carry += credited_min * 60.0;
+            let whole = carry.floor().max(0.0) as u32;
+            carry -= whole as f64;
+            report_earn(whole, gate, &cfg);
         }
     });
 }

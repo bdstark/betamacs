@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 const AGENT_LABEL: &str = "com.bdstark.betamacs";
 const APP_PATH: &str = "/Applications/betamacs.app";
@@ -90,6 +91,137 @@ impl Default for AgentState {
     }
 }
 
+/// Root-owned earned-time balance (docs/earned-time.md part B). The child
+/// cannot edit it; the agent only proposes earned deltas (capped here).
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct EarnedLedger {
+    /// Local YYYY-MM-DD the daily total belongs to (reset on rollover).
+    date: String,
+    earned_today_min: f64,
+    balance_min: f64,
+}
+
+/// The earned-time gate: owns the ledger and the latest policy snapshot the
+/// agent resolved (the agent knows the schedule and config; the daemon owns
+/// the balance the child can't fake, and drives the pf earning-mode gate).
+struct EarnedGate {
+    ledger: EarnedLedger,
+    ledger_path: PathBuf,
+    gate_active: bool,
+    spend_ratio: f64,
+    daily_cap_min: f64,
+    max_bank_min: f64,
+    allow_hosts: Vec<String>,
+    last_report: Option<Instant>,
+    last_tick: Instant,
+}
+
+impl EarnedGate {
+    fn new(paths: &Paths) -> Self {
+        let ledger_path = paths.managed_dir.join("earned-ledger.json");
+        let ledger = std::fs::read_to_string(&ledger_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self {
+            ledger,
+            ledger_path,
+            gate_active: false,
+            spend_ratio: 1.0,
+            daily_cap_min: 0.0,
+            max_bank_min: 0.0,
+            allow_hosts: Vec::new(),
+            last_report: None,
+            last_tick: Instant::now(),
+        }
+    }
+
+    fn today() -> String {
+        std::process::Command::new("/bin/date")
+            .args(["+%F"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn persist(&self) {
+        if let Ok(s) = serde_json::to_string(&self.ledger) {
+            let tmp = self.ledger_path.with_extension("json.tmp");
+            if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.ledger_path);
+            }
+        }
+    }
+
+    /// Apply an agent earn report: store the policy snapshot and bank `secs`
+    /// of earned credit, capped by the daily cap and the bank ceiling.
+    fn apply_report(
+        &mut self,
+        secs: u32,
+        gate_active: bool,
+        spend_ratio: f64,
+        daily_cap_min: f64,
+        max_bank_min: f64,
+        allow_hosts: Vec<String>,
+    ) {
+        let today = Self::today();
+        if !today.is_empty() && self.ledger.date != today {
+            self.ledger.date = today;
+            self.ledger.earned_today_min = 0.0;
+        }
+        self.gate_active = gate_active;
+        self.spend_ratio = spend_ratio.max(0.0);
+        self.daily_cap_min = daily_cap_min.max(0.0);
+        self.max_bank_min = max_bank_min.max(0.0);
+        self.allow_hosts = allow_hosts;
+        self.last_report = Some(Instant::now());
+
+        let mut add = secs as f64 / 60.0;
+        if self.daily_cap_min > 0.0 {
+            add = add.min((self.daily_cap_min - self.ledger.earned_today_min).max(0.0));
+        }
+        if add > 0.0 {
+            self.ledger.earned_today_min += add;
+            self.ledger.balance_min += add;
+            if self.max_bank_min > 0.0 {
+                self.ledger.balance_min = self.ledger.balance_min.min(self.max_bank_min);
+            }
+            self.persist();
+        }
+    }
+
+    /// Watch-loop tick. `full_blocked` means a full quarantine reason
+    /// (tamper/exposure/challenge) is already active and supersedes this.
+    /// Returns the earning-mode allowlist when the internet should be gated
+    /// to only the earn sources (gate active + balance depleted), else None.
+    fn tick(&mut self, full_blocked: bool) -> Option<Vec<String>> {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+
+        // A stale snapshot (agent gone) isn't trusted for gating — the
+        // heartbeat watchdog covers a dead agent with a full block.
+        let fresh = self
+            .last_report
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+        if !self.gate_active || !fresh || full_blocked {
+            return None;
+        }
+        if self.ledger.balance_min > 0.0 {
+            // Spending: time online inside a gate window burns balance.
+            let spent = elapsed.as_secs_f64() / 60.0 * self.spend_ratio;
+            if spent > 0.0 {
+                self.ledger.balance_min = (self.ledger.balance_min - spent).max(0.0);
+                self.persist();
+            }
+            None
+        } else {
+            Some(self.allow_hosts.clone()) // depleted → earning-mode lockout
+        }
+    }
+}
+
 /// Layer-4 local enforcement (docs/managed-mode.md): when the censor is
 /// detectably not protecting an active session — Screen Recording
 /// revoked, agent killed/silenced beyond what repair fixes — for longer
@@ -100,8 +232,18 @@ impl Default for AgentState {
 /// tethering or another Wi-Fi doesn't escape. Cleared automatically the
 /// moment health returns. The anchor lives under com.apple/* because
 /// the stock /etc/pf.conf evaluates that tree — no config edits.
+/// What the pf anchor is currently loaded with. `Full` blocks everything
+/// but management (tamper/exposure/challenge). `Earning` additionally allows
+/// the earn-source hosts, so a child with a depleted balance can still reach
+/// the approved sites to earn more time.
+#[derive(Clone, PartialEq)]
+enum QMode {
+    Full,
+    Earning(Vec<String>),
+}
+
 struct Quarantine {
-    engaged: bool,
+    engaged: Option<QMode>,
     unhealthy_since: Option<Instant>,
     /// BETAMACSD_NO_QUARANTINE=1, non-root, or a test prefix disables.
     armed: bool,
@@ -137,7 +279,7 @@ impl Quarantine {
             .map(Duration::from_secs)
             .unwrap_or(QUARANTINE_GRACE);
         Self {
-            engaged: false,
+            engaged: None,
             unhealthy_since: None,
             armed,
             dry_run,
@@ -146,32 +288,21 @@ impl Quarantine {
         }
     }
 
-    /// Called from the watch loop. Healthy means: no active console
-    /// session, censoring disabled by policy, or a fresh heartbeat with
-    /// working capture — and no unanswered challenge. A tripped exposure
-    /// budget overrides all of that with a fixed-duration lockout.
-    fn evaluate(&mut self, agent: &AgentState) {
+    /// Does a FULL-block reason apply right now (tamper/exposure/challenge)?
+    /// Healthy means: no active console session, censoring disabled by
+    /// policy, or a fresh heartbeat with working capture — and no unanswered
+    /// challenge. A tripped exposure budget forces a full block for its
+    /// fixed duration regardless of health. Pure decision; `apply` does pf.
+    fn want_full(&mut self, agent: &AgentState) -> bool {
         if !self.armed {
-            return;
+            return false;
         }
-        // Timed exposure penalty: hold the quarantine until the deadline
-        // regardless of activity or health, then fall through to normal
-        // recovery. This is the one lockout that is NOT released by the
-        // censor simply being healthy again.
         if agent
             .exposure_penalty_until
             .is_some_and(|until| until > Instant::now())
         {
-            if !self.engaged {
-                let left = agent
-                    .exposure_penalty_until
-                    .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
-                    .unwrap_or(0);
-                tracing::warn!("exposure budget exceeded — timed network quarantine ({left}s remaining)");
-                self.engage();
-            }
             self.unhealthy_since = None;
-            return;
+            return true;
         }
         let session_active = std::fs::metadata("/dev/console")
             .map(|m| {
@@ -188,26 +319,34 @@ impl Quarantine {
             && !agent.challenge_overdue;
         if healthy {
             self.unhealthy_since = None;
-            if self.engaged {
-                self.release();
-            }
-            return;
+            return false;
         }
         let since = *self.unhealthy_since.get_or_insert_with(Instant::now);
-        if !self.engaged && since.elapsed() >= self.grace {
-            tracing::warn!(
-                "censor unprotected for {}s (heartbeat {:?}s old, captureOk {}, challengeOverdue {}) — engaging network quarantine",
-                since.elapsed().as_secs(),
-                agent.last_seen.map(|t| t.elapsed().as_secs()),
-                agent.capture_ok,
-                agent.challenge_overdue,
-            );
-            self.engage();
+        since.elapsed() >= self.grace
+    }
+
+    /// Reconcile the pf anchor to the desired mode: `None` releases,
+    /// `Full`/`Earning` load the matching ruleset. A no-op when already in
+    /// the desired mode.
+    fn apply(&mut self, desired: Option<QMode>) {
+        if !self.armed || desired == self.engaged {
+            return;
+        }
+        match &desired {
+            None => self.release_pf(),
+            Some(mode) => {
+                let extra = match mode {
+                    QMode::Full => &[][..],
+                    QMode::Earning(hosts) => hosts.as_slice(),
+                };
+                self.load_pf(mode.clone(), extra);
+            }
         }
     }
 
-    fn engage(&mut self) {
-        let allowed: Vec<String> = ALLOWED_HOSTS
+    /// Resolve hostnames to a comma-joined IP list for a pf `to { ... }`.
+    fn resolve(hosts: &[&str]) -> Vec<String> {
+        hosts
             .iter()
             .flat_map(|h| {
                 use std::net::ToSocketAddrs;
@@ -216,29 +355,48 @@ impl Quarantine {
                     .map(|a| a.map(|s| s.ip().to_string()).collect::<Vec<_>>())
                     .unwrap_or_default()
             })
-            .collect();
-        let mgmt = if allowed.is_empty() {
+            .collect()
+    }
+
+    fn build_rules(&self, extra_hosts: &[String]) -> String {
+        let mgmt = Self::resolve(&ALLOWED_HOSTS);
+        let mut passes = String::new();
+        if mgmt.is_empty() {
             tracing::warn!("could not resolve management hosts; quarantine allows DNS only");
-            String::new()
         } else {
-            format!(
+            passes += &format!(
                 "pass out quick proto tcp from any to {{ {} }} port 443\n",
-                allowed.join(", "),
-            )
-        };
-        let rules = format!(
+                mgmt.join(", "),
+            );
+        }
+        let earn = Self::resolve(&extra_hosts.iter().map(String::as_str).collect::<Vec<_>>());
+        if !earn.is_empty() {
+            passes += &format!(
+                "pass out quick proto tcp from any to {{ {} }} port {{ 80, 443 }}\n",
+                earn.join(", "),
+            );
+        }
+        format!(
             "# betamacs quarantine — loaded by betamacsd when the censor is\n\
-             # detectably not protecting an active session. Removed on recovery.\n\
+             # unprotected, or the earned-time gate is depleted. Removed on recovery.\n\
              pass quick on lo0 all\n\
              pass out quick proto udp from any port 68 to any port 67\n\
              pass out quick proto {{ udp, tcp }} from any to any port 53\n\
-             {mgmt}\
+             {passes}\
              pass in quick proto tcp from any to any port 22\n\
              block drop quick all\n",
-        );
+        )
+    }
+
+    fn load_pf(&mut self, mode: QMode, extra_hosts: &[String]) {
+        let label = match &mode {
+            QMode::Full => "full".to_string(),
+            QMode::Earning(h) => format!("earning-mode (allow {})", h.join(", ")),
+        };
+        let rules = self.build_rules(extra_hosts);
         if self.dry_run {
-            tracing::warn!("DRY RUN: would load pf anchor {PF_ANCHOR}:\n{rules}");
-            self.engaged = true;
+            tracing::warn!("DRY RUN: would load pf anchor {PF_ANCHOR} [{label}]:\n{rules}");
+            self.engaged = Some(mode);
             return;
         }
         if let Err(e) = std::fs::write(&self.rules_path, &rules) {
@@ -252,8 +410,8 @@ impl Quarantine {
             .output()
         {
             Ok(out) if out.status.success() => {
-                self.engaged = true;
-                tracing::warn!("network quarantine ENGAGED (pf anchor {PF_ANCHOR})");
+                self.engaged = Some(mode);
+                tracing::warn!("network quarantine ENGAGED [{label}] (pf anchor {PF_ANCHOR})");
             }
             Ok(out) => tracing::error!(
                 "pfctl load failed: {}",
@@ -263,10 +421,10 @@ impl Quarantine {
         }
     }
 
-    fn release(&mut self) {
+    fn release_pf(&mut self) {
         if self.dry_run {
             tracing::warn!("DRY RUN: would flush pf anchor {PF_ANCHOR}");
-            self.engaged = false;
+            self.engaged = None;
             return;
         }
         match std::process::Command::new("/sbin/pfctl")
@@ -274,8 +432,8 @@ impl Quarantine {
             .output()
         {
             Ok(out) if out.status.success() => {
-                self.engaged = false;
-                tracing::warn!("network quarantine released (censor healthy again)");
+                self.engaged = None;
+                tracing::warn!("network quarantine released");
             }
             Ok(out) => tracing::error!(
                 "pfctl flush failed: {}",
@@ -318,6 +476,7 @@ fn main() -> Result<()> {
     };
 
     let agent: Arc<Mutex<AgentState>> = Arc::default();
+    let earned: Arc<Mutex<EarnedGate>> = Arc::new(Mutex::new(EarnedGate::new(&paths)));
 
     // Socket listener thread.
     let _ = std::fs::remove_file(&paths.socket);
@@ -331,16 +490,18 @@ fn main() -> Result<()> {
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o666))?;
     {
         let agent = agent.clone();
+        let earned = earned.clone();
         let managed_dir = paths.managed_dir.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
                         let agent = agent.clone();
+                        let earned = earned.clone();
                         let managed_dir = managed_dir.clone();
                         let verifier = verifier.clone();
                         std::thread::spawn(move || {
-                            handle_client(stream, &agent, &managed_dir, verifier.as_ref())
+                            handle_client(stream, &agent, &earned, &managed_dir, verifier.as_ref())
                         });
                     }
                     Err(e) => tracing::warn!("accept failed: {e}"),
@@ -355,7 +516,16 @@ fn main() -> Result<()> {
     loop {
         std::thread::sleep(Duration::from_secs(15));
         watch_agent(&agent);
-        quarantine.evaluate(&agent.lock().unwrap().clone());
+        // Full-block reasons (tamper/exposure/challenge) take precedence over
+        // the earned-time gate; a depleted gate falls back to earning-mode.
+        let want_full = quarantine.want_full(&agent.lock().unwrap().clone());
+        let earning = earned.lock().unwrap().tick(want_full);
+        let desired = if want_full {
+            Some(QMode::Full)
+        } else {
+            earning.map(QMode::Earning)
+        };
+        quarantine.apply(desired);
         if last_integrity.elapsed() >= Duration::from_secs(600) {
             last_integrity = Instant::now();
             check_integrity(&paths);
@@ -366,6 +536,7 @@ fn main() -> Result<()> {
 fn handle_client(
     stream: UnixStream,
     agent: &Mutex<AgentState>,
+    earned: &Mutex<EarnedGate>,
     managed_dir: &Path,
     verifier: Option<&envelope::Verifier>,
 ) {
@@ -418,6 +589,28 @@ fn handle_client(
                 if !a.capture_ok {
                     tracing::warn!("agent reports capture unhealthy (Screen Recording revoked?)");
                 }
+            }
+            Some("earn") => {
+                // Earned-time report from the agent's activity monitor: the
+                // agent resolved the schedule/policy; the daemon banks the
+                // (capped) credit and owns the balance and the pf gate.
+                let secs = msg.get("secs").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let gate_active = msg.get("gateActive").and_then(|v| v.as_bool()).unwrap_or(false);
+                let spend_ratio = msg.get("spendRatio").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let daily_cap = msg.get("dailyCapMin").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let max_bank = msg.get("maxBankMin").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let allow_hosts = msg
+                    .get("allowHosts")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|h| h.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                earned.lock().unwrap().apply_report(
+                    secs, gate_active, spend_ratio, daily_cap, max_bank, allow_hosts,
+                );
             }
             Some("envelope") => {
                 let reply = match apply_envelope(&line, managed_dir, verifier) {
@@ -475,8 +668,9 @@ fn handle_client(
                     .exposure_penalty_until
                     .map(|u| u.saturating_duration_since(Instant::now()).as_secs() as i64)
                     .unwrap_or(0);
+                let earned_balance_min = earned.lock().unwrap().ledger.balance_min;
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureLockoutSecs\":{}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
@@ -485,6 +679,7 @@ fn handle_client(
                     a.enabled,
                     a.challenge_overdue,
                     quarantine_secs,
+                    earned_balance_min,
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());
@@ -884,4 +1079,71 @@ fn plist_template(label: &str, program: &Path, extra: &str) -> String {
         program = program.display(),
         extra = extra,
     )
+}
+
+#[cfg(test)]
+mod earned_tests {
+    use super::*;
+
+    fn gate(path: &str) -> EarnedGate {
+        EarnedGate {
+            ledger: EarnedLedger::default(),
+            ledger_path: PathBuf::from(path),
+            gate_active: true,
+            spend_ratio: 1.0,
+            daily_cap_min: 0.0,
+            max_bank_min: 0.0,
+            allow_hosts: vec!["khanacademy.org".into()],
+            last_report: Some(Instant::now()),
+            last_tick: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn banks_and_caps_daily() {
+        let mut g = gate("/tmp/bm-earn-t1.json");
+        // 600s = 10 earned min, but the daily cap is 5.
+        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![]);
+        assert!((g.ledger.balance_min - 5.0).abs() < 1e-6);
+        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![]); // cap already hit
+        assert!((g.ledger.balance_min - 5.0).abs() < 1e-6);
+        let _ = std::fs::remove_file("/tmp/bm-earn-t1.json");
+    }
+
+    #[test]
+    fn bank_ceiling() {
+        let mut g = gate("/tmp/bm-earn-t2.json");
+        g.apply_report(6000, true, 1.0, 0.0, 30.0, vec![]); // 100 min, ceiling 30
+        assert!((g.ledger.balance_min - 30.0).abs() < 1e-6);
+        let _ = std::fs::remove_file("/tmp/bm-earn-t2.json");
+    }
+
+    #[test]
+    fn spends_then_locks_to_earning_mode() {
+        let mut g = gate("/tmp/bm-earn-t3.json");
+        g.ledger.balance_min = 1.0;
+        g.last_tick = Instant::now() - Duration::from_secs(30);
+        // Gate active, balance > 0 → spend, no lockout.
+        assert!(g.tick(false).is_none());
+        assert!(g.ledger.balance_min < 1.0 && g.ledger.balance_min > 0.0);
+        // Depleted → earning-mode allowlist.
+        g.ledger.balance_min = 0.0;
+        g.last_tick = Instant::now();
+        assert_eq!(g.tick(false), Some(vec!["khanacademy.org".to_string()]));
+        // A full-block reason supersedes the earned gate.
+        assert!(g.tick(true).is_none());
+        let _ = std::fs::remove_file("/tmp/bm-earn-t3.json");
+    }
+
+    #[test]
+    fn no_earning_when_inactive_or_stale() {
+        let mut g = gate("/tmp/bm-earn-t4.json");
+        g.ledger.balance_min = 0.0;
+        g.gate_active = false;
+        assert!(g.tick(false).is_none()); // outside a schedule window
+        g.gate_active = true;
+        g.last_report = Some(Instant::now() - Duration::from_secs(120)); // agent gone
+        assert!(g.tick(false).is_none());
+        let _ = std::fs::remove_file("/tmp/bm-earn-t4.json");
+    }
 }
