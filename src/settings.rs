@@ -96,8 +96,21 @@ pub struct DetectionSettings {
     pub debounce_count: u32,
     /// Lifetime of an unconfirmed borderline box after its last sighting (ms).
     pub debounce_window_ms: u64,
+    /// Debug/tuning overlay: outline (don't cover) detections of
+    /// trigger-enabled classes that were flagged but not blocked (low
+    /// confidence or under the size floor), labeled with class,
+    /// confidence, and size.
+    #[serde(default)]
+    pub highlight_enabled: bool,
+    /// Lowest confidence worth highlighting (0..1).
+    #[serde(default = "default_highlight_floor")]
+    pub highlight_floor: f32,
     /// Which NudeNet classes trigger censoring.
     pub triggers: BTreeMap<String, bool>,
+}
+
+fn default_highlight_floor() -> f32 {
+    0.15
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -123,6 +136,10 @@ pub struct DetectionPatch {
     pub debounce_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debounce_window_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_floor: Option<f32>,
     /// Merged per class, not replaced wholesale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triggers: Option<BTreeMap<String, bool>>,
@@ -148,6 +165,8 @@ impl Default for DetectionSettings {
             borderline_margin: 0.1,
             debounce_count: 2,
             debounce_window_ms: 3000,
+            highlight_enabled: false,
+            highlight_floor: default_highlight_floor(),
             triggers: CLASSES
                 .iter()
                 .map(|c| (c.to_string(), on_by_default.contains(c)))
@@ -163,7 +182,8 @@ impl DetectionSettings {
         }
         set!(
             model, confidence_threshold, iou_threshold, min_region_px, capture_fps,
-            tile_grid, hold_ms, borderline_margin, debounce_count, debounce_window_ms
+            tile_grid, hold_ms, borderline_margin, debounce_count, debounce_window_ms,
+            highlight_enabled, highlight_floor
         );
         if let Some(triggers) = &p.triggers {
             for (class, on) in triggers {

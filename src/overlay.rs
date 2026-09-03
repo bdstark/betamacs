@@ -47,6 +47,10 @@ pub struct CensorRegion {
     pub text_seed: u64,
     /// Processed interior pixels (blur/mosaic); None for box/static modes.
     pub content: Option<RegionContent>,
+    /// Debug highlight: Some(info label) renders this region as a
+    /// transparent outlined annotation (flagged-but-not-blocked) instead
+    /// of a censor box.
+    pub highlight: Option<String>,
 }
 
 impl CensorRegion {
@@ -63,6 +67,7 @@ impl PartialEq for CensorRegion {
         self.same_geometry(other)
             && self.trigger == other.trigger
             && self.text_seed == other.text_seed
+            && self.highlight == other.highlight
             && match (&self.content, &other.content) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(&a.rgba, &b.rgba),
@@ -207,6 +212,19 @@ impl OverlayApp {
                 let _ = window.request_inner_size(LogicalSize::new(region.width, region.height));
                 window.set_outer_position(LogicalPosition::new(region.x, region.y));
             }
+            // Pooled windows switch roles (censor <-> highlight), so the
+            // per-role styling is applied on every assignment.
+            let role_changed = self
+                .last_regions
+                .get(i)
+                .is_none_or(|prev| prev.highlight.is_some() != region.highlight.is_some());
+            if role_changed {
+                if region.highlight.is_some() {
+                    macos::apply_highlight_style(&self.windows[i]);
+                } else {
+                    macos::apply_style(&self.windows[i], &self.style);
+                }
+            }
             self.chromes[i].update(region, &self.style);
             self.render_interior(i, region);
             let window = &self.windows[i];
@@ -232,6 +250,10 @@ impl OverlayApp {
     /// Draw one region's interior according to the censor mode.
     fn render_interior(&mut self, i: usize, region: &CensorRegion) {
         let window = &self.windows[i];
+        if region.highlight.is_some() {
+            macos::clear_layer_contents(window);
+            return;
+        }
         match self.style.mode {
             CensorMode::Box => macos::clear_layer_contents(window),
             CensorMode::Blur | CensorMode::Mosaic => {
@@ -281,7 +303,16 @@ impl OverlayApp {
         for i in 0..self.windows.len() {
             let window = &self.windows[i];
             window.set_content_protected(protected);
-            macos::apply_style(window, &self.style);
+            // Don't clobber windows currently serving as highlights.
+            let is_highlight = self
+                .last_regions
+                .get(i)
+                .is_some_and(|r| r.highlight.is_some());
+            if is_highlight {
+                macos::apply_highlight_style(window);
+            } else {
+                macos::apply_style(window, &self.style);
+            }
             if let Some(region) = self.last_regions.get(i).cloned() {
                 self.chromes[i].update(&region, &self.style);
                 self.render_interior(i, &region);
@@ -380,6 +411,26 @@ mod macos {
         /// Set contents/fonts/frames for this box. Called whenever the
         /// window is (re)assigned a region or the style changes.
         pub fn update(&self, region: &CensorRegion, style: &CensorSettings) {
+            if let Some(info) = &region.highlight {
+                let color = highlight_color();
+                if let Some(text) = &self.text {
+                    text.setHidden(false);
+                    text.setStringValue(&NSString::from_str(info));
+                    text.setTextColor(Some(&color));
+                    text.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+                    text.sizeToFit();
+                    let size = text.frame().size;
+                    // Top-left corner, just inside the outline.
+                    text.setFrame(CGRect::new(
+                        CGPoint::new(3.0, (region.height as f64 - size.height - 3.0).max(0.0)),
+                        size,
+                    ));
+                }
+                if let Some(label) = &self.label {
+                    label.setHidden(true);
+                }
+                return;
+            }
             let (w, h) = (region.width as f64, region.height as f64);
             let overlay = &style.text_overlay;
             let (r, g, b, a) = parse_color(&overlay.font_color).unwrap_or((1.0, 1.0, 1.0, 1.0));
@@ -486,6 +537,29 @@ mod macos {
             frame.size.height,
             objc2_app_kit::NSScreen::screens(objc2::MainThreadMarker::new().unwrap()).len(),
         );
+    }
+
+    pub fn highlight_color() -> Retained<NSColor> {
+        NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 0.62, 0.04, 1.0)
+    }
+
+    /// Transparent, outlined, labeled: the flagged-but-not-blocked
+    /// debug annotation look.
+    pub fn apply_highlight_style(window: &Window) {
+        let Some(ns) = ns_window(window) else {
+            return;
+        };
+        ns.setOpaque(false);
+        ns.setBackgroundColor(Some(&NSColor::clearColor()));
+        ns.setAlphaValue(1.0);
+        if let Some(view) = ns.contentView() {
+            view.setWantsLayer(true);
+            if let Some(layer) = view.layer() {
+                layer.setBorderWidth(2.0);
+                let cg = highlight_color().CGColor();
+                layer.setBorderColor(Some(cg.as_ref()));
+            }
+        }
     }
 
     /// Fill color, opacity, and border on the content view's layer.

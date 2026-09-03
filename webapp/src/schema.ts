@@ -69,6 +69,10 @@ export interface DetectionSettings {
   borderlineMargin: number;
   debounceCount: number;
   debounceWindowMs: number;
+  /** Outline flagged-but-not-blocked detections with their parameters. */
+  highlightEnabled: boolean;
+  /** Lowest confidence worth highlighting (0..1). */
+  highlightFloor: number;
   triggers: Record<string, boolean>;
 }
 
@@ -178,6 +182,8 @@ export function defaultDetection(): DetectionSettings {
     borderlineMargin: 0.1,
     debounceCount: 2,
     debounceWindowMs: 3000,
+    highlightEnabled: false,
+    highlightFloor: 0.15,
     triggers: Object.fromEntries(NUDENET_CLASSES.map((c) => [c, onByDefault.has(c)])),
   };
 }

@@ -81,6 +81,7 @@ pub fn detection_to_region(
         trigger: det.class,
         text_seed,
         content: None,
+        highlight: None,
     }
 }
 
@@ -122,7 +123,12 @@ fn region_iou(a: &CensorRegion, b: &CensorRegion) -> f32 {
     if union <= 0.0 { 0.0 } else { inter / union }
 }
 
-pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()> {
+pub fn run(
+    shared: Arc<RwLock<Effective>>,
+    overlay: OverlayHandle,
+    health: Arc<crate::heartbeat::Health>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
     let initial = shared.read().unwrap().clone();
     let (model_path, input_size) = initial.detection.model_path();
     let mut detector = Detector::new(&model_path, input_size)?;
@@ -132,6 +138,10 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
     // Per-monitor held boxes, each with its own last-seen time so one
     // region dropping out (confidence wobble) doesn't take others with it.
     let mut held: HashMap<u32, Vec<HeldBox>> = HashMap::new();
+    // Per-monitor debug highlights (flagged but not blocked), replaced
+    // wholesale on each processed frame — same change-driven lifetime as
+    // censor boxes: no frame means the screen (and they) stay put.
+    let mut highlights: HashMap<u32, Vec<CensorRegion>> = HashMap::new();
     // Monotonic seed source for per-box text picks.
     let mut next_text_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -161,6 +171,8 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
     );
     let menubar_status = |capturer: &SckCapturer, model: &str, overlay: &OverlayHandle| {
         let n = capturer.display_origins().len();
+        health.streams.store(n as u32, Ordering::Relaxed);
+        health.capture_ok.store(true, Ordering::Relaxed);
         let _ = overlay.set_status(format!("monitoring {n} display(s) · model {model}"));
     };
     menubar_status(&capturer, &loaded_model, &overlay);
@@ -196,7 +208,10 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                     streams_started = Instant::now();
                     menubar_status(&capturer, &loaded_model, &overlay);
                 }
-                Err(e) => tracing::error!("stream rebuild failed: {e}"),
+                Err(e) => {
+                    health.capture_ok.store(false, Ordering::Relaxed);
+                    tracing::error!("stream rebuild failed: {e}");
+                }
             }
         }
         displays_were_asleep = displays_asleep;
@@ -278,7 +293,10 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                         streams_started = Instant::now();
                         menubar_status(&capturer, &loaded_model, &overlay);
                     }
-                    Err(e) => tracing::error!("stream rebuild failed: {e}"),
+                    Err(e) => {
+                        health.capture_ok.store(false, Ordering::Relaxed);
+                        tracing::error!("stream rebuild failed: {e}");
+                    }
                 }
             }
         }
@@ -287,11 +305,22 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         let mut changed = false;
         for (monitor_id, frame) in &latest {
             let tick = Instant::now();
+            // With highlighting on, detect down to the highlight floor so
+            // sub-threshold regions are visible; blocking still requires
+            // the full confidence threshold below.
+            let detect_floor = if cfg.detection.highlight_enabled {
+                cfg.detection
+                    .highlight_floor
+                    .min(cfg.detection.confidence_threshold)
+                    .max(0.05)
+            } else {
+                cfg.detection.confidence_threshold
+            };
             let detections = match detector.detect_tiled(
                 &frame.image,
                 cfg.detection.tile_grid,
                 0.2,
-                cfg.detection.confidence_threshold,
+                detect_floor,
                 cfg.detection.iou_threshold,
             ) {
                 Ok(d) => {
@@ -321,10 +350,53 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                 .iter()
                 .filter(|d| {
                     cfg.detection.triggers.get(d.class).copied().unwrap_or(false)
+                        && d.confidence >= cfg.detection.confidence_threshold
                         && d.bbox.2 >= cfg.detection.min_region_px
                         && d.bbox.3 >= cfg.detection.min_region_px
                 })
                 .collect();
+
+            // Flagged-but-not-blocked: trigger-enabled detections that
+            // missed the confidence threshold or the size floor become
+            // outlined annotations with their parameters.
+            if cfg.detection.highlight_enabled {
+                let boxes: Vec<CensorRegion> = detections
+                    .iter()
+                    .filter(|d| {
+                        cfg.detection.triggers.get(d.class).copied().unwrap_or(false)
+                            && !(d.confidence >= cfg.detection.confidence_threshold
+                                && d.bbox.2 >= cfg.detection.min_region_px
+                                && d.bbox.3 >= cfg.detection.min_region_px)
+                    })
+                    .map(|d| {
+                        let reason = if d.confidence < cfg.detection.confidence_threshold {
+                            format!(
+                                "below {:.0}% threshold",
+                                cfg.detection.confidence_threshold * 100.0
+                            )
+                        } else {
+                            format!("below {:.0}px size floor", cfg.detection.min_region_px)
+                        };
+                        let mut region = detection_to_region(frame, d, 100.0, 100.0, 0);
+                        region.highlight = Some(format!(
+                            "{} {:.0}% {}×{}px — {}",
+                            d.class,
+                            d.confidence * 100.0,
+                            d.bbox.2 as i32,
+                            d.bbox.3 as i32,
+                            reason,
+                        ));
+                        region
+                    })
+                    .collect();
+                let entry = highlights.entry(*monitor_id).or_default();
+                if *entry != boxes {
+                    *entry = boxes;
+                    changed = true;
+                }
+            } else if highlights.remove(monitor_id).is_some_and(|h| !h.is_empty()) {
+                changed = true;
+            }
             let regions: Vec<(CensorRegion, f32)> = flagged
                 .iter()
                 .map(|d| {
@@ -493,10 +565,12 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         }
 
         if changed {
-            let all: Vec<CensorRegion> = held
+            let mut all: Vec<CensorRegion> = held
                 .values()
                 .flat_map(|regions| regions.iter().map(|b| b.region.clone()))
                 .collect();
+            health.boxes.store(all.len() as u32, Ordering::Relaxed);
+            all.extend(highlights.values().flatten().cloned());
             overlay.set_regions(all)?;
         }
 

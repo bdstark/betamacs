@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
+base64 = "0.22.1"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+sha2 = "0.10.9"
+x509-cert = { version = "0.2.5", features = ["pem"] }
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 image = "0.25.10"

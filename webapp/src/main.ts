@@ -114,6 +114,7 @@ export class BmApp extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this.unsubscribe = store.subscribe(() => this.requestUpdate());
+    void store.probeManaged();
   }
   disconnectedCallback() {
     super.disconnectedCallback();
@@ -146,6 +147,9 @@ export class BmApp extends LitElement {
       <header>
         <h1>betamacs</h1>
         <span class="tag">settings</span>
+        ${store.managed
+          ? html`<span class="tag" title="Settings are pushed by the fleet; local changes are refused.">managed — read-only</span>`
+          : null}
       </header>
 
       <div class="connection">
@@ -166,7 +170,9 @@ export class BmApp extends LitElement {
             store.setConnection({ ...conn, token: (e.target as HTMLInputElement).value })}
         />
         <button @click=${this.pull}>Pull</button>
-        <button class="push" @click=${this.push}>Push to app</button>
+        <button class="push" @click=${this.push} ?disabled=${store.managed}>
+          ${store.managed ? "Managed by fleet" : "Push to app"}
+        </button>
         <span class="status">${store.status}</span>
       </div>
 

@@ -59,8 +59,17 @@ class). `src/settings.rs` and `webapp/src/schema.ts` implement the same
 contract and resolution.
 
 Modules: **detection** (model, confidence/IoU/minimum sliders, capture
-rate, tiling, hold time, grouped trigger switches) and **censor** (fill /
+rate, tiling, hold time, grouped trigger switches, near-miss
+highlighting — flagged-but-not-blocked detections outlined on screen
+with class/confidence/size for tuning) and **censor** (fill /
 border colors, x/y size percentages, trigger-label + random-text overlay).
+
+**Managed mode** (docs/managed-mode.md): building with a pinned otactl
+root cert (`otactl-root.pem` in the repo root) produces a fleet-managed
+app — settings are accepted only as otactl-signed envelopes via the
+`betamacsd` root watchdog daemon, the local API is read-only, and
+`sudo scripts/install-managed.sh` lays down the tamper-resistant
+root-owned install.
 Boxes render the trigger class and a randomly picked text via NSTextField
 subviews; the text pick is a stable hash of the box geometry so static
 boxes don't reshuffle their text.

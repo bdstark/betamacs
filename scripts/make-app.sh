@@ -15,15 +15,26 @@ APP="$OUT/betamacs.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)
 
 BIN="$ROOT/target/release/betamacs"
+DAEMON="$ROOT/target/release/betamacsd"
 [ -x "$BIN" ] || { echo "binary missing — run: cargo build --release" >&2; exit 1; }
+[ -x "$DAEMON" ] || { echo "betamacsd missing — run: cargo build --release" >&2; exit 1; }
 [ -f "$ROOT/models/320n.onnx" ] || { echo "models missing — run: scripts/fetch-model.sh 320n" >&2; exit 1; }
 [ -f "$ROOT/webapp/dist/index.html" ] || { echo "webapp not built — run: cd webapp && npm install && npm run build" >&2; exit 1; }
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/models" "$APP/Contents/Resources/webapp"
 cp "$BIN" "$APP/Contents/MacOS/betamacs"
+cp "$DAEMON" "$APP/Contents/MacOS/betamacsd"
 cp "$ROOT"/models/*.onnx "$APP/Contents/Resources/models/"
 cp -R "$ROOT/webapp/dist/." "$APP/Contents/Resources/webapp/"
+
+# A pinned otactl root turns the build into a MANAGED build: settings
+# are then accepted only as fleet-signed envelopes (docs/managed-mode.md).
+PIN="${BETAMACS_OTACTL_ROOT:-$ROOT/otactl-root.pem}"
+if [ -f "$PIN" ]; then
+  cp "$PIN" "$APP/Contents/Resources/otactl-root.pem"
+  echo "managed build: pinned otactl root from $PIN"
+fi
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -59,6 +70,9 @@ if [ -z "${BETAMACS_SIGN_IDENTITY:-}" ]; then
     BETAMACS_SIGN_IDENTITY="-"  # ad-hoc; TCC grants won't survive rebuilds
   fi
 fi
+# Nested executables must be signed before the bundle seal.
+codesign --force --sign "$BETAMACS_SIGN_IDENTITY" \
+  --identifier com.bdstark.betamacsd "$APP/Contents/MacOS/betamacsd"
 codesign --force --sign "$BETAMACS_SIGN_IDENTITY" \
   --identifier com.bdstark.betamacs "$APP"
 codesign --verify --strict "$APP"

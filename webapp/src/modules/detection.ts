@@ -218,6 +218,33 @@ export class BmDetectionModule extends LitElement {
         ></bm-slider>
       </bm-section>
 
+      <bm-section heading="Near-miss highlighting">
+        <p class="muted">
+          Debug/tuning overlay: detections of enabled trigger classes that
+          were flagged but <em>not</em> blocked (confidence below the
+          threshold, or under the size floor) are outlined on screen with
+          their class, confidence, and size — nothing is covered.
+        </p>
+        <bm-switch
+          label="Highlight near-misses"
+          .value=${d.highlightEnabled}
+          source=${src("highlightEnabled")}
+          @field-change=${(e: CustomEvent) => setOverride("highlightEnabled", e.detail)}
+          @reset=${() => clearOverride("highlightEnabled")}
+        ></bm-switch>
+        <bm-slider
+          label="Highlight floor"
+          hint="Lowest confidence worth annotating"
+          min="0.05"
+          max="0.5"
+          step="0.01"
+          .value=${d.highlightFloor}
+          source=${src("highlightFloor")}
+          @field-change=${(e: CustomEvent) => setOverride("highlightFloor", e.detail)}
+          @reset=${() => clearOverride("highlightFloor")}
+        ></bm-slider>
+      </bm-section>
+
       <bm-section heading="Triggers">
         <p class="muted">
           Which NudeNet detections cause censoring. Grouped for sanity; use the

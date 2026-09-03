@@ -31,6 +31,9 @@ pub struct ServerState {
     pub overlay: OverlayHandle,
     pub package_path: PathBuf,
     pub token: String,
+    /// Managed mode (docs/managed-mode.md): settings come only from
+    /// signed envelopes via betamacsd; the local API is read-only.
+    pub managed: bool,
 }
 
 pub fn load_or_create_token(path: &PathBuf) -> anyhow::Result<String> {
@@ -77,6 +80,13 @@ async fn put_package(
 ) -> Response {
     if !authed(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+    }
+    if state.managed {
+        return (
+            StatusCode::FORBIDDEN,
+            "this install is managed; settings are pushed by the fleet (signed envelopes only)",
+        )
+            .into_response();
     }
     // Unknown layer names are a client bug worth rejecting early.
     for layer in &package.layers {
@@ -130,6 +140,7 @@ async fn get_status(
     Json(serde_json::json!({
         "app": "betamacs",
         "version": env!("CARGO_PKG_VERSION"),
+        "managed": state.managed,
         "effective": effective,
     }))
     .into_response()

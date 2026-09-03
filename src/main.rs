@@ -2,6 +2,8 @@ mod capture;
 mod capture_sck;
 mod censor_fx;
 mod detect;
+mod envelope;
+mod heartbeat;
 mod menubar;
 mod overlay;
 mod pipeline;
@@ -56,7 +58,13 @@ fn main() -> Result<()> {
     // Bundled but launched by hand (Finder, `open`) rather than by launchd:
     // install/refresh the LaunchAgent and hand off to the instance it
     // starts, so copying the .app and opening it once is a full install.
+    // On a managed install (docs/managed-mode.md) the root-owned global
+    // agent already runs betamacs; a hand launch does nothing.
     if mode == "run" && log_file_bundled && std::env::var_os("BETAMACS_LAUNCHD").is_none() {
+        if PathBuf::from("/Library/LaunchAgents/com.bdstark.betamacs.plist").exists() {
+            tracing::info!("managed install detected; the global LaunchAgent owns this app");
+            return Ok(());
+        }
         return self_install().inspect_err(|e| tracing::error!("self-install failed: {e}"));
     }
 
@@ -195,9 +203,90 @@ fn enter_data_dir(resources: &std::path::Path) -> Result<std::fs::File> {
 /// Continuous censoring: overlay event loop on the main thread (macOS
 /// requirement), capture/detect pipeline and settings server on worker
 /// threads.
+/// Root-owned managed config directory, written only by betamacsd.
+const MANAGED_DIR: &str = "/Library/Application Support/betamacs";
+
+/// Read and re-verify the envelope betamacsd persisted. Rollback gating
+/// happened at write time (the daemon owns the epoch high-water), so
+/// this only proves authenticity and integrity.
+fn load_managed(verifier: &envelope::Verifier) -> Result<(Package, u64)> {
+    let raw = std::fs::read_to_string(PathBuf::from(MANAGED_DIR).join("envelope.json"))?;
+    let env: envelope::Envelope = serde_json::from_str(&raw)?;
+    let verified = verifier.verify(&env, 0)?;
+    let package: Package = serde_json::from_slice(&verified.artifact)?;
+    Ok((package, verified.epoch))
+}
+
+/// Re-verify and apply the managed config whenever betamacsd rewrites
+/// the envelope.
+fn spawn_managed_watch(
+    verifier: envelope::Verifier,
+    state: Arc<server::ServerState>,
+    overlay: overlay::OverlayHandle,
+    health: Arc<heartbeat::Health>,
+) {
+    std::thread::spawn(move || {
+        let path = PathBuf::from(MANAGED_DIR).join("envelope.json");
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut last = mtime(&path);
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let current = mtime(&path);
+            if current == last {
+                continue;
+            }
+            last = current;
+            match load_managed(&verifier) {
+                Ok((package, epoch)) => {
+                    let effective = package.resolve();
+                    *state.package.lock().unwrap() = package;
+                    *state.effective.write().unwrap() = effective.clone();
+                    if let Err(e) = overlay.set_style(effective.censor.clone()) {
+                        tracing::warn!("could not push managed style to overlay: {e}");
+                    }
+                    health
+                        .config_epoch
+                        .store(epoch, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!("managed config applied (epoch {epoch})");
+                }
+                Err(e) => tracing::error!("managed config update rejected: {e:#}"),
+            }
+        }
+    });
+}
+
 fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
+    // Managed mode (docs/managed-mode.md): a pinned otactl root in the
+    // bundle switches the settings source to signed envelopes and makes
+    // the local API read-only.
+    let verifier = bundle_resources()
+        .map(|r| r.join("otactl-root.pem"))
+        .filter(|p| p.exists())
+        .map(|p| {
+            std::fs::read(&p)
+                .map_err(anyhow::Error::from)
+                .and_then(|pem| envelope::Verifier::from_pem(&pem))
+        })
+        .transpose()?;
+    let managed = verifier.is_some();
+
+    let mut config_epoch = 0u64;
     let package_path = PathBuf::from("config/package.json");
-    let package = if package_path.exists() {
+    let package = if let Some(verifier) = &verifier {
+        match load_managed(verifier) {
+            Ok((package, epoch)) => {
+                tracing::info!("managed config loaded (epoch {epoch})");
+                config_epoch = epoch;
+                package
+            }
+            Err(e) => {
+                // Fail closed: no valid signed config means built-in
+                // defaults (all exposure classes trigger) — never "off".
+                tracing::error!("managed config unavailable ({e:#}); running default policy");
+                Package::starter()
+            }
+        }
+    } else if package_path.exists() {
         Package::load(&package_path)?
     } else {
         let starter = Package::starter();
@@ -241,14 +330,16 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
         None => tracing::warn!("menu bar item unavailable (not on main thread?)"),
     }
 
+    let state = Arc::new(server::ServerState {
+        package: Mutex::new(package),
+        effective: shared.clone(),
+        overlay: handle.clone(),
+        package_path,
+        token,
+        managed,
+    });
     server::spawn(
-        Arc::new(server::ServerState {
-            package: Mutex::new(package),
-            effective: shared.clone(),
-            overlay: handle.clone(),
-            package_path,
-            token,
-        }),
+        state.clone(),
         port,
         std::env::var("BETAMACS_WEBAPP_DIR")
             .map(PathBuf::from)
@@ -259,8 +350,19 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
             }),
     );
 
+    // Health reporting to betamacsd, and live pickup of managed config
+    // updates the daemon persists.
+    let health = heartbeat::Health::new();
+    health
+        .config_epoch
+        .store(config_epoch, std::sync::atomic::Ordering::Relaxed);
+    heartbeat::spawn(health.clone());
+    if let Some(verifier) = verifier {
+        spawn_managed_watch(verifier, state, handle.clone(), health.clone());
+    }
+
     std::thread::spawn(move || {
-        if let Err(e) = pipeline::run(shared, handle) {
+        if let Err(e) = pipeline::run(shared, handle, health) {
             tracing::error!("pipeline exited: {e}");
             std::process::exit(1);
         }
@@ -317,6 +419,7 @@ fn demo() -> Result<()> {
             trigger: "DEMO_TRIGGER",
             text_seed: 0,
             content: None,
+            highlight: None,
         };
         if let Err(e) = handle.set_regions(vec![region]) {
             tracing::error!("{e}");

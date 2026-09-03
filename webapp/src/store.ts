@@ -17,6 +17,8 @@ class Store {
   pkg: Package;
   connection: Connection;
   status = "";
+  /** True when the app reports fleet-managed mode: pushes are refused. */
+  managed = false;
   private listeners = new Set<Listener>();
 
   constructor() {
@@ -70,6 +72,22 @@ class Store {
       "content-type": "application/json",
       authorization: `Bearer ${this.connection.token}`,
     };
+  }
+
+  /** Ask the app whether it is fleet-managed (read-only UI). */
+  async probeManaged(): Promise<void> {
+    try {
+      const res = await fetch(`${this.connection.url}/api/status`, {
+        headers: this.headers(),
+      });
+      if (res.ok) {
+        const status = (await res.json()) as { managed?: boolean };
+        this.managed = !!status.managed;
+        this.notify();
+      }
+    } catch {
+      // Unreachable app: leave the last known state.
+    }
   }
 
   /** Pull the package currently stored in the app. */
