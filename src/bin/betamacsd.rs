@@ -107,6 +107,12 @@ struct EarnedLedger {
 struct EarnedGate {
     ledger: EarnedLedger,
     ledger_path: PathBuf,
+    /// The gate is OPEN unless this exists — a delivered, root-owned task
+    /// bank is the per-device marker of a managed (kid) device, gated by
+    /// the `ext:betamacs-tasks` entitlement. So earned-time (like
+    /// challenges) applies only to entitled devices even from a fleet-wide
+    /// config; an un-provisioned Mac (no bank) is never gated.
+    tasks_path: PathBuf,
     gate_active: bool,
     spend_ratio: f64,
     daily_cap_min: f64,
@@ -126,6 +132,7 @@ impl EarnedGate {
         Self {
             ledger,
             ledger_path,
+            tasks_path: paths.managed_dir.join("tasks.json"),
             gate_active: false,
             spend_ratio: 1.0,
             daily_cap_min: 0.0,
@@ -200,6 +207,13 @@ impl EarnedGate {
         let elapsed = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
 
+        // Open unless provisioned: no task bank => not a managed kid device
+        // (lacks the ext:betamacs-tasks grant), so never gate, even if a
+        // fleet-wide config enables earned-time. Banked balance is left
+        // untouched so it survives if the device is later provisioned.
+        if !self.tasks_path.exists() {
+            return None;
+        }
         // A stale snapshot (agent gone) isn't trusted for gating — the
         // heartbeat watchdog covers a dead agent with a full block.
         let fresh = self
@@ -1085,10 +1099,15 @@ fn plist_template(label: &str, program: &Path, extra: &str) -> String {
 mod earned_tests {
     use super::*;
 
+    // A gate with a task bank present (a provisioned kid device). `path` is
+    // unique per test; the bank sits beside it.
     fn gate(path: &str) -> EarnedGate {
+        let tasks = format!("{path}.tasks");
+        std::fs::write(&tasks, "{}").unwrap();
         EarnedGate {
             ledger: EarnedLedger::default(),
             ledger_path: PathBuf::from(path),
+            tasks_path: PathBuf::from(tasks),
             gate_active: true,
             spend_ratio: 1.0,
             daily_cap_min: 0.0,
@@ -1145,5 +1164,17 @@ mod earned_tests {
         g.last_report = Some(Instant::now() - Duration::from_secs(120)); // agent gone
         assert!(g.tick(false).is_none());
         let _ = std::fs::remove_file("/tmp/bm-earn-t4.json");
+        let _ = std::fs::remove_file("/tmp/bm-earn-t4.json.tasks");
+    }
+
+    #[test]
+    fn open_without_task_bank() {
+        // No bank (unprovisioned Mac, e.g. the parent's) => never gated,
+        // even with the gate active and a depleted balance.
+        let mut g = gate("/tmp/bm-earn-t5.json");
+        std::fs::remove_file(&g.tasks_path).unwrap(); // no bank delivered
+        g.ledger.balance_min = 0.0;
+        assert!(g.tick(false).is_none());
+        let _ = std::fs::remove_file("/tmp/bm-earn-t5.json");
     }
 }

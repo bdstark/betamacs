@@ -124,6 +124,16 @@ take precedence; earning-mode engages when the balance is depleted in a
 window and releases when it goes positive. Ledger logic is unit-tested and
 earning-mode engage/spend verified in a dry-run.
 
+**Open unless provisioned (per-device via entitlement, no channel needed):**
+the earned-time gate is a no-op on any device without a delivered task bank
+(`tasks.json`). The bank is the per-device marker of a managed (kid) device
+— it arrives only with the `ext:betamacs-tasks` grant and is written
+root-owned, so it can't be faked. This means earned-time (like challenges)
+can live in the single fleet-wide `stable` config and still apply only to
+entitled kid Macs: grant `ext:betamacs-tasks` to the kids, leave it off the
+parent's Mac, and the parent stays open even though it gets the same config.
+No `kids` channel or release promotions required.
+
 Known limitations / decisions:
 - **Earning-mode allowlist covers web sources (`browserHostSuffix`) only** —
   pf filters by resolved IP, so an app-only source (`bundleId`) can't be
