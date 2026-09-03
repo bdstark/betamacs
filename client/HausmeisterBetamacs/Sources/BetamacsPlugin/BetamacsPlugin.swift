@@ -187,34 +187,69 @@ public final class BetamacsPlugin: HausmeisterPlugin {
 
   // MARK: bootstrap
 
-  /// No daemon on this Mac: it is being onboarded. Install the app when
-  /// missing (fetched and verified through the same signed pipeline),
-  /// then have it register betamacsd via SMAppService — the one
-  /// privileged approval, made in System Settings → Login Items. Once
-  /// approved, the daemon roots the whole layout itself and the next
-  /// tick finds its socket.
+  /// Where betamacs is downloaded when /Applications isn't writable (the
+  /// non-admin managed Mac): the user's Downloads folder, the natural
+  /// place to drag an app to /Applications from. The drag triggers
+  /// Finder's authenticated copy — macOS asks for an admin password and
+  /// any admin can authorize — which is how the bundle reaches the
+  /// privileged location without hausmeister ever elevating.
+  private var downloadedAppURL: URL {
+    FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Downloads/betamacs.app", isDirectory: true)
+  }
+
+  /// No daemon on this Mac: it is being onboarded. Fetch and verify the
+  /// app through the signed pipeline, then get it somewhere runnable.
+  ///
+  /// hausmeister runs as the logged-in user with no root, so it can only
+  /// place the bundle where that user can write. On an admin Mac that is
+  /// /Applications directly, and we then register betamacsd via
+  /// SMAppService (one Login Items approval). On a NON-admin Mac
+  /// /Applications is read-only, so we instead download the verified
+  /// bundle to Downloads and reveal it: the user drags it to Applications,
+  /// macOS asks for an admin password (Finder's authenticated copy), and
+  /// then opens it — the hand launch self-installs the per-user agent and,
+  /// on the managed build, raises the betamacsd approval an admin
+  /// completes. hausmeister never tries to elevate; the download is the
+  /// whole of its job here.
   private func bootstrapIfNeeded() {
     guard !bootstrapAttempted, !checking else { return }
     bootstrapAttempted = true
+    // Already downloaded and waiting for the user to drag it across —
+    // don't re-fetch every run. Once it reaches /Applications and is
+    // opened (daemon approved for full managed mode) the socket appears
+    // and the normal update path takes over.
+    if FileManager.default.fileExists(atPath: downloadedAppURL.path),
+       !FileManager.default.fileExists(atPath: "/Applications/betamacs.app") {
+      statusLine = "downloaded — drag betamacs to Applications to install"
+      return
+    }
     checking = true
     Task { [weak self] in
       guard let self else { return }
       do {
-        if !FileManager.default.fileExists(atPath: "/Applications/betamacs.app") {
-          let (response, client) = try await self.fetchManifest(app: BetamacsPlugin.appName)
-          let artifact = try await self.fetchArtifact(
-            app: BetamacsPlugin.appName, manifest: response.manifest, client: client)
-          try self.installAppDirect(artifact: artifact, manifest: response.manifest)
-          self.host.settings.set(Int(response.manifest.epoch ?? 0), for: "appEpoch")
-        }
-        try BetamacsPlugin.run(
-          "/Applications/betamacs.app/Contents/MacOS/betamacs", ["install-daemon"])
-        self.host.log.notice("betamacs: bootstrap: daemon registration requested")
-        await MainActor.run {
-          self.statusLine = "approve betamacsd: System Settings → Login Items"
-          self.host.notify(
-            title: "Betamacs needs one approval",
-            body: "Allow \"betamacs\" under System Settings → Login Items to finish setup.")
+        let alreadyInstalled = FileManager.default.fileExists(atPath: "/Applications/betamacs.app")
+        let placed: (path: String, privileged: Bool) =
+          alreadyInstalled ? ("/Applications/betamacs.app", true) : try await self.downloadAndPlaceApp()
+        if placed.privileged {
+          try BetamacsPlugin.run("\(placed.path)/Contents/MacOS/betamacs", ["install-daemon"])
+          self.host.log.notice("betamacs: bootstrap: daemon registration requested")
+          await MainActor.run {
+            self.statusLine = "approve betamacsd: System Settings → Login Items"
+            self.host.notify(
+              title: "Betamacs needs one approval",
+              body: "Allow \"betamacs\" under System Settings → Login Items to finish setup.")
+          }
+        } else {
+          self.host.log.notice("betamacs: downloaded to \(placed.path) — awaiting drag to /Applications")
+          await MainActor.run {
+            self.statusLine = "downloaded — drag betamacs to Applications to install"
+            // Reveal it so the drag target is obvious.
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: placed.path)])
+            self.host.notify(
+              title: "Betamacs is ready to install",
+              body: "In your Downloads: drag betamacs to the Applications folder (you’ll be asked for an admin password), then open it.")
+          }
         }
       } catch {
         self.host.log.error("betamacs: bootstrap: \(error)")
@@ -224,13 +259,19 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     }
   }
 
-  /// First install only: place the verified bundle into /Applications
-  /// directly. Needs an admin session (the onboarding sitting); after
-  /// bootstrap, updates flow through the root daemon instead.
-  private func installAppDirect(artifact: Data, manifest m: ReleaseManifest) throws {
+  /// First install only: fetch the verified bundle and put it somewhere
+  /// runnable. Prefers /Applications (updates then flow through the root
+  /// daemon); when the user can't write there — a non-admin managed Mac,
+  /// the common case — downloads it to ~/Downloads instead and reports
+  /// which happened, so the caller can either register the daemon or hand
+  /// the download to the user to drag across.
+  private func downloadAndPlaceApp() async throws -> (path: String, privileged: Bool) {
+    let (response, client) = try await fetchManifest(app: BetamacsPlugin.appName)
+    let m = response.manifest
     if let format = m.format, !format.isEmpty, format != BetamacsPlugin.appFormat {
       throw ReleaseError.badArchive("unexpected artifact format \(format)")
     }
+    let artifact = try await fetchArtifact(app: BetamacsPlugin.appName, manifest: m, client: client)
     let fm = FileManager.default
     let staging = fm.temporaryDirectory
       .appendingPathComponent("betamacs-\(UUID().uuidString)", isDirectory: true)
@@ -247,13 +288,24 @@ public final class BetamacsPlugin: HausmeisterPlugin {
       throw ReleaseError.badArchive("no .app at the archive root")
     }
     try BetamacsPlugin.run("/usr/bin/codesign", ["--verify", "--strict", bundle.path])
+    host.settings.set(Int(m.epoch ?? 0), for: "appEpoch")
+
+    // Privileged location first; fall back to the user's own Applications.
+    let applications = URL(fileURLWithPath: "/Applications/betamacs.app")
     do {
-      try fm.moveItem(at: bundle, to: URL(fileURLWithPath: "/Applications/betamacs.app"))
+      try? fm.removeItem(at: applications)
+      try fm.moveItem(at: bundle, to: applications)
+      host.log.notice("betamacs: bootstrap installed \(m.version) at \(applications.path)")
+      return (applications.path, true)
     } catch {
-      throw ReleaseError.install(
-        "could not place /Applications/betamacs.app (admin session required): \(error.localizedDescription)")
+      let downloads = downloadedAppURL.deletingLastPathComponent()
+      try fm.createDirectory(at: downloads, withIntermediateDirectories: true)
+      try? fm.removeItem(at: downloadedAppURL)
+      try fm.moveItem(at: bundle, to: downloadedAppURL)
+      host.log.notice(
+        "betamacs: /Applications not writable, downloaded \(m.version) to \(downloadedAppURL.path) for drag-to-install")
+      return (downloadedAppURL.path, false)
     }
-    host.log.notice("betamacs: bootstrap installed \(m.version) at /Applications/betamacs.app")
   }
 
   static func run(_ tool: String, _ args: [String]) throws {
