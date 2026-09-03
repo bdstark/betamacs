@@ -84,12 +84,30 @@ pub fn detection_to_region(
     }
 }
 
-/// A borderline detection waiting for confirmation before it may create a
-/// box.
-struct PendingRegion {
+/// An on-screen censor box. Marginal calls always err toward covering:
+/// borderline detections (within the margin band above the threshold) get
+/// a box immediately, but stay provisional — dropped after the debounce
+/// window instead of the full hold — until re-sighted `debounce_count`
+/// times. Flicker thus costs a brief extra box, never a brief exposure.
+struct HeldBox {
     last_seen: Instant,
     sightings: u32,
     region: CensorRegion,
+}
+
+/// FNV-1a over a sparse pixel grid — cheap "did the screen change" check
+/// for the staleness watchdog, not a perceptual hash.
+fn frame_hash(img: &image::RgbaImage) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let (w, ht) = img.dimensions();
+    for y in (0..ht).step_by(16) {
+        for x in (0..w).step_by(16) {
+            for &b in &img.get_pixel(x, y).0[..3] {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    h
 }
 
 /// IoU between two censor regions, for matching a fresh detection to a
@@ -113,9 +131,7 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
     let mut capturer = SckCapturer::new(initial.detection.capture_fps)?;
     // Per-monitor held boxes, each with its own last-seen time so one
     // region dropping out (confidence wobble) doesn't take others with it.
-    let mut held: HashMap<u32, Vec<(Instant, CensorRegion)>> = HashMap::new();
-    // Per-monitor borderline detections awaiting confirmation.
-    let mut pending: HashMap<u32, Vec<PendingRegion>> = HashMap::new();
+    let mut held: HashMap<u32, Vec<HeldBox>> = HashMap::new();
     // Monotonic seed source for per-box text picks.
     let mut next_text_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -130,6 +146,13 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
     // Frame-rate accounting, logged every 10s to spot busy displays.
     let mut frame_counts: HashMap<u32, u32> = HashMap::new();
     let mut last_stats = Instant::now();
+    // Staleness watchdog state: when each display last delivered a frame,
+    // and the previous probe hash for displays that have gone silent.
+    const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+    let mut last_frame_at: HashMap<u32, Instant> = HashMap::new();
+    let mut probe_hashes: HashMap<u32, u64> = HashMap::new();
+    let mut streams_started = Instant::now();
+    let mut last_watchdog = Instant::now();
 
     tracing::info!(
         "pipeline running: model {}, change-driven capture at <= {:.1} fps",
@@ -160,7 +183,12 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         if displays_were_asleep && !displays_asleep {
             tracing::info!("display(s) woke; rebuilding capture streams");
             match SckCapturer::new(cfg.detection.capture_fps) {
-                Ok(new_capturer) => capturer = new_capturer,
+                Ok(new_capturer) => {
+                    capturer = new_capturer;
+                    last_frame_at.clear();
+                    probe_hashes.clear();
+                    streams_started = Instant::now();
+                }
                 Err(e) => tracing::error!("stream rebuild failed: {e}"),
             }
         }
@@ -178,6 +206,10 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
 
         for frame_id in latest.keys() {
             *frame_counts.entry(*frame_id).or_default() += 1;
+            // A delivered frame proves the stream is alive; drop any probe
+            // baseline so the watchdog starts fresh next time it goes quiet.
+            last_frame_at.insert(*frame_id, Instant::now());
+            probe_hashes.remove(frame_id);
         }
         if last_stats.elapsed() > Duration::from_secs(10) {
             if !frame_counts.is_empty() {
@@ -185,6 +217,62 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
             }
             frame_counts.clear();
             last_stats = Instant::now();
+        }
+
+        // Staleness watchdog, backing up the display-sleep rebuild above:
+        // change-driven capture means a healthy stream is silent on a
+        // static screen, so silence alone proves nothing. For displays
+        // silent a whole interval, take a cheap polled capture (matched to
+        // the stream by display origin); if two consecutive probes differ
+        // while the stream stayed silent, the screen is changing but frames
+        // aren't arriving — the stream is dead, rebuild them all.
+        if !displays_asleep && last_watchdog.elapsed() >= WATCHDOG_INTERVAL {
+            last_watchdog = Instant::now();
+            let silent: Vec<(u32, (i32, i32))> = capturer
+                .display_origins()
+                .into_iter()
+                .filter(|(id, _)| {
+                    last_frame_at
+                        .get(id)
+                        .map_or(streams_started.elapsed(), |t| t.elapsed())
+                        >= WATCHDOG_INTERVAL
+                })
+                .collect();
+            let mut stale = false;
+            if !silent.is_empty() {
+                match crate::capture::capture_all() {
+                    Ok(probes) => {
+                        for (id, origin) in &silent {
+                            let Some(probe) = probes.iter().find(|p| p.origin == *origin) else {
+                                continue;
+                            };
+                            let hash = frame_hash(&probe.image);
+                            if let Some(prev) = probe_hashes.insert(*id, hash)
+                                && prev != hash
+                            {
+                                tracing::warn!(
+                                    "display {id}: content changed while its stream was \
+                                     silent — stream is stale"
+                                );
+                                stale = true;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::debug!("watchdog probe capture failed: {e}"),
+                }
+            }
+            if stale {
+                tracing::warn!("rebuilding capture streams (staleness watchdog)");
+                match SckCapturer::new(cfg.detection.capture_fps) {
+                    Ok(new_capturer) => {
+                        capturer = new_capturer;
+                        last_frame_at.clear();
+                        probe_hashes.clear();
+                        streams_started = Instant::now();
+                    }
+                    Err(e) => tracing::error!("stream rebuild failed: {e}"),
+                }
+            }
         }
 
         let hold = Duration::from_millis(cfg.detection.hold_ms);
@@ -254,17 +342,18 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
             // (confidence-wobble grace, per box).
             let now = Instant::now();
             let entry = held.entry(*monitor_id).or_default();
-            let monitor_pending = pending.entry(*monitor_id).or_default();
-            let before: Vec<CensorRegion> = entry.iter().map(|(_, r)| r.clone()).collect();
+            let before: Vec<CensorRegion> = entry.iter().map(|b| b.region.clone()).collect();
             let mut claimed = vec![false; entry.len()];
             let strong_threshold =
                 cfg.detection.confidence_threshold + cfg.detection.borderline_margin.max(0.0);
+            let debounce_count = cfg.detection.debounce_count;
             for (region, confidence) in regions {
                 let best = entry
                     .iter()
                     .enumerate()
-                    .filter(|(j, (_, h))| !claimed[*j] && h.trigger == region.trigger)
-                    .map(|(j, (_, h))| {
+                    .filter(|(j, b)| !claimed[*j] && b.region.trigger == region.trigger)
+                    .map(|(j, b)| {
+                        let h = &b.region;
                         let iou = region_iou(h, &region);
                         let dx = (h.x + h.width / 2.0) - (region.x + region.width / 2.0);
                         let dy = (h.y + h.height / 2.0) - (region.y + region.height / 2.0);
@@ -278,77 +367,65 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                         claimed[j] = true;
                         // The box keeps its text for its whole lifetime.
                         let mut region = region;
-                        region.text_seed = entry[j].1.text_seed;
+                        region.text_seed = entry[j].region.text_seed;
                         // Dead-band: detection coordinates jitter slightly
                         // frame to frame; keep the existing geometry unless
                         // the box genuinely moved or resized.
-                        let existing = entry[j].1.clone();
+                        let existing = entry[j].region.clone();
                         let stable = (existing.x - region.x).abs() < 4.0
                             && (existing.y - region.y).abs() < 4.0
                             && (existing.width - region.width).abs() < 4.0
                             && (existing.height - region.height).abs() < 4.0;
-                        entry[j] = (now, if stable { existing } else { region });
-                    }
-                    None => {
-                        // A new box. Strong detections censor immediately;
-                        // borderline ones (within the margin band above the
-                        // threshold) must be sighted debounce_count times
-                        // within the debounce window first — this suppresses
-                        // one-frame threshold flickers.
-                        let strong =
-                            confidence >= strong_threshold || cfg.detection.debounce_count <= 1;
-                        if strong {
-                            entry.push((now, region));
-                            claimed.push(true);
-                        } else {
-                            let slot = monitor_pending.iter_mut().find(|p| {
-                                p.region.trigger == region.trigger
-                                    && region_iou(&p.region, &region) > 0.1
-                            });
-                            match slot {
-                                Some(p) => {
-                                    p.sightings += 1;
-                                    p.last_seen = now;
-                                    // Keep the original text seed; track the
-                                    // latest geometry.
-                                    let seed = p.region.text_seed;
-                                    p.region = region;
-                                    p.region.text_seed = seed;
-                                    if p.sightings >= cfg.detection.debounce_count {
-                                        tracing::info!(
-                                            "{}: borderline {} confirmed after {} sightings",
-                                            frame.monitor_name,
-                                            p.region.trigger,
-                                            p.sightings,
-                                        );
-                                        entry.push((now, p.region.clone()));
-                                        claimed.push(true);
-                                        p.sightings = 0; // recycled below by prune
-                                        p.last_seen = now - Duration::from_secs(3600);
-                                    }
-                                }
-                                None => {
-                                    tracing::debug!(
-                                        "{}: borderline {} at {:.0}% pending confirmation",
-                                        frame.monitor_name,
-                                        region.trigger,
-                                        confidence * 100.0,
-                                    );
-                                    monitor_pending.push(PendingRegion {
-                                        last_seen: now,
-                                        sightings: 1,
-                                        region,
-                                    });
-                                }
+                        let b = &mut entry[j];
+                        b.last_seen = now;
+                        b.region = if stable { existing } else { region };
+                        if b.sightings < debounce_count {
+                            b.sightings += 1;
+                            if b.sightings >= debounce_count {
+                                tracing::info!(
+                                    "{}: borderline {} confirmed after {} sightings",
+                                    frame.monitor_name,
+                                    b.region.trigger,
+                                    b.sightings,
+                                );
                             }
                         }
                     }
+                    None => {
+                        // A new box, covered immediately either way. Strong
+                        // detections are confirmed at birth; borderline ones
+                        // (within the margin band above the threshold) stay
+                        // provisional — short-lived unless re-sighted — so a
+                        // one-frame flicker costs a brief extra box rather
+                        // than a brief exposure.
+                        let strong = confidence >= strong_threshold;
+                        if !strong {
+                            tracing::debug!(
+                                "{}: borderline {} at {:.0}% covered provisionally",
+                                frame.monitor_name,
+                                region.trigger,
+                                confidence * 100.0,
+                            );
+                        }
+                        entry.push(HeldBox {
+                            last_seen: now,
+                            sightings: if strong { debounce_count } else { 1 },
+                            region,
+                        });
+                        claimed.push(true);
+                    }
                 }
             }
-            entry.retain(|(last_seen, _)| last_seen.elapsed() < hold);
             let debounce_window = Duration::from_millis(cfg.detection.debounce_window_ms.max(1));
-            monitor_pending.retain(|p| p.sightings > 0 && p.last_seen.elapsed() < debounce_window);
-            let after: Vec<CensorRegion> = entry.iter().map(|(_, r)| r.clone()).collect();
+            entry.retain(|b| {
+                let lifetime = if b.sightings >= debounce_count {
+                    hold
+                } else {
+                    debounce_window
+                };
+                b.last_seen.elapsed() < lifetime
+            });
+            let after: Vec<CensorRegion> = entry.iter().map(|b| b.region.clone()).collect();
             if entry.is_empty() {
                 held.remove(monitor_id);
             }
@@ -389,9 +466,9 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                     continue;
                 };
                 let frame_is_fresh = fresh.contains(monitor_id);
-                for (_, region) in entry.iter_mut() {
-                    if censor_changed || region.content.is_none() || frame_is_fresh {
-                        region.content = region_content(frame, region, &cfg.censor);
+                for b in entry.iter_mut() {
+                    if censor_changed || b.region.content.is_none() || frame_is_fresh {
+                        b.region.content = region_content(frame, &b.region, &cfg.censor);
                         changed = true;
                     }
                 }
@@ -400,8 +477,8 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
             // Leaving blur/mosaic: strip stale content so boxes render
             // their mode-appropriate interior.
             for entry in held.values_mut() {
-                for (_, region) in entry.iter_mut() {
-                    region.content = None;
+                for b in entry.iter_mut() {
+                    b.region.content = None;
                 }
             }
             changed = true;
@@ -410,7 +487,7 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         if changed {
             let all: Vec<CensorRegion> = held
                 .values()
-                .flat_map(|regions| regions.iter().map(|(_, r)| r.clone()))
+                .flat_map(|regions| regions.iter().map(|b| b.region.clone()))
                 .collect();
             overlay.set_regions(all)?;
         }

@@ -178,9 +178,9 @@ export class BmDetectionModule extends LitElement {
       <bm-section heading="Borderline debounce">
         <p class="muted">
           Detections scoring within the margin above the confidence threshold
-          are borderline: they only create a box after repeat sightings, which
-          suppresses one-frame threshold flickers. Strong detections always
-          censor immediately.
+          are borderline: they are covered immediately like everything else,
+          but the box is short-lived unless re-sighted. A one-frame flicker
+          costs a brief extra box, never a brief exposure.
         </p>
         <bm-slider
           label="Borderline margin"
@@ -195,7 +195,7 @@ export class BmDetectionModule extends LitElement {
         ></bm-slider>
         <bm-slider
           label="Required sightings"
-          hint="1 = borderline detections censor immediately"
+          hint="Sightings before a borderline box earns the full hold time; 1 = off"
           min="1"
           max="6"
           step="1"
@@ -206,7 +206,7 @@ export class BmDetectionModule extends LitElement {
         ></bm-slider>
         <bm-slider
           label="Sighting window"
-          hint="Sightings must occur within this window to confirm"
+          hint="How long an unconfirmed borderline box lasts after its last sighting"
           min="500"
           max="10000"
           step="250"

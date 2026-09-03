@@ -162,6 +162,8 @@ pub struct SckCapturer {
     tx: mpsc::Sender<Frame>,
     /// (displayID, stream) pairs.
     streams: Vec<(u32, Retained<SCStream>)>,
+    /// Info for each captured display, for the staleness watchdog.
+    displays: Vec<DisplayInfo>,
     // Keep delegates and queue alive for the life of the streams.
     _outputs: Vec<Retained<StreamOutput>>,
     _queue: DispatchRetained<DispatchQueue>,
@@ -179,11 +181,13 @@ impl SckCapturer {
 
         let mut streams = Vec::new();
         let mut outputs = Vec::new();
+        let mut infos = Vec::new();
         let displays = unsafe { content.displays() };
         for display in displays.iter() {
-            let (stream, output) = start_stream(&display, None, fps, tx.clone(), &queue)?;
+            let (stream, output, info) = start_stream(&display, None, fps, tx.clone(), &queue)?;
             streams.push((unsafe { display.displayID() }, stream));
             outputs.push(output);
+            infos.push(info);
         }
         anyhow::ensure!(!streams.is_empty(), "no displays found to capture");
         tracing::info!("started {} ScreenCaptureKit stream(s)", streams.len());
@@ -191,6 +195,7 @@ impl SckCapturer {
             rx,
             tx,
             streams,
+            displays: infos,
             _outputs: outputs,
             _queue: queue,
             self_excluded: false,
@@ -255,6 +260,13 @@ impl SckCapturer {
         self.tx.clone()
     }
 
+    /// (displayID, global origin in points) of every captured display, so
+    /// the staleness watchdog can match polled probe captures (which have
+    /// their own monitor ids) to streams by position.
+    pub fn display_origins(&self) -> Vec<(u32, (i32, i32))> {
+        self.displays.iter().map(|d| (d.id, d.origin)).collect()
+    }
+
     /// True if any captured display is currently asleep. Streams go stale
     /// across display sleep (they keep delivering frames of pre-sleep
     /// content), so the pipeline rebuilds the capturer on the wake
@@ -280,7 +292,7 @@ fn start_stream(
     fps: f32,
     tx: mpsc::Sender<Frame>,
     queue: &DispatchQueue,
-) -> Result<(Retained<SCStream>, Retained<StreamOutput>)> {
+) -> Result<(Retained<SCStream>, Retained<StreamOutput>, DisplayInfo)> {
     let (id, frame_rect, width, height) = unsafe {
         (
             display.displayID(),
@@ -325,7 +337,7 @@ fn start_stream(
         config
     };
 
-    let output = StreamOutput::new(tx, info);
+    let output = StreamOutput::new(tx, info.clone());
     let stream = unsafe {
         SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None)
     };
@@ -352,5 +364,5 @@ fn start_stream(
         height,
         (frame_rect.origin.x, frame_rect.origin.y),
     );
-    Ok((stream, output))
+    Ok((stream, output, info))
 }

@@ -87,13 +87,14 @@ pub struct DetectionSettings {
     /// Grace period before a censor box is released (ms).
     pub hold_ms: u64,
     /// Detections scoring below `confidence_threshold + borderline_margin`
-    /// are borderline: they only create a box after `debounce_count`
-    /// sightings within `debounce_window_ms`. 0 disables the band
-    /// (everything above threshold censors immediately).
+    /// are borderline: covered immediately like everything else, but the
+    /// box stays provisional — dropped `debounce_window_ms` after its last
+    /// sighting instead of getting the full hold — until it is sighted
+    /// `debounce_count` times. 0 disables the band.
     pub borderline_margin: f32,
-    /// Sightings needed to confirm a borderline detection (1 = off).
+    /// Sightings that graduate a borderline box to a full hold (1 = off).
     pub debounce_count: u32,
-    /// Window in which those sightings must occur (ms).
+    /// Lifetime of an unconfirmed borderline box after its last sighting (ms).
     pub debounce_window_ms: u64,
     /// Which NudeNet classes trigger censoring.
     pub triggers: BTreeMap<String, bool>,

@@ -37,6 +37,11 @@ capture (native ScreenCaptureKit stream per display, change-driven)
   the screen hasn't changed, so boxes stay — a static image stays covered
   indefinitely. Identical region sets are deduped before touching windows,
   otherwise overlay updates would re-trigger SCK change frames forever.
+  Marginal calls err toward covering: borderline detections get a box
+  immediately and only its *lifetime* is debounced (short unless
+  re-sighted). A staleness watchdog probes silent displays with a polled
+  capture every 30s and rebuilds the streams if the screen changed while
+  a stream delivered nothing, backing up display-sleep detection.
 - **config.rs** — thresholds, FPS, censored class list.
 
 - **detect.rs (tiling)** — each screen is scanned as the full frame plus a
