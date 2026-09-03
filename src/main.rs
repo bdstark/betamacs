@@ -1,5 +1,6 @@
 mod capture;
 mod capture_sck;
+mod censor_fx;
 mod detect;
 mod overlay;
 mod pipeline;
@@ -155,6 +156,7 @@ fn demo() -> Result<()> {
             height: 300.0,
             trigger: "DEMO_TRIGGER",
             text_seed: 0,
+            content: None,
         };
         if let Err(e) = handle.set_regions(vec![region]) {
             tracing::error!("{e}");

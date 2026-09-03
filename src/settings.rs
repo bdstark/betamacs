@@ -163,11 +163,138 @@ impl DetectionSettings {
 
 // ------------------------------------------------------------------- censor
 
-/// Black-box censor module settings.
+/// How a censor box renders its interior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CensorMode {
+    /// Solid fill (the original black box).
+    Box,
+    /// Blurred view of the content beneath.
+    Blur,
+    /// Pixelated view of the content beneath.
+    Mosaic,
+    /// Animated analog-TV static.
+    Static,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlurKind {
+    /// True gaussian blur.
+    Gaussian,
+    /// Fast box blur.
+    Box,
+    /// Downscale-and-average (strongest smoothing per unit of intensity).
+    Average,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlurSettings {
+    pub kind: BlurKind,
+    /// Blur strength, 1..100.
+    pub intensity: f32,
+}
+
+impl Default for BlurSettings {
+    fn default() -> Self {
+        Self {
+            kind: BlurKind::Gaussian,
+            intensity: 16.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MosaicSampling {
+    /// Cell = average of the pixels it covers.
+    Average,
+    /// Cell = gaussian-weighted sample.
+    Gaussian,
+    /// Cell = single point sample (harshest).
+    Nearest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMap {
+    /// Keep the source colors.
+    None,
+    /// Map cell luminance onto the low..high color range.
+    Luminance,
+    /// Luminance quantized into 4 bands of the color range.
+    Steps,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MosaicSettings {
+    /// Square cell edge in points.
+    pub cell_size_pt: f32,
+    pub sampling: MosaicSampling,
+    pub map: ColorMap,
+    /// Color range for luminance mapping.
+    pub color_low: String,
+    pub color_high: String,
+}
+
+impl Default for MosaicSettings {
+    fn default() -> Self {
+        Self {
+            cell_size_pt: 16.0,
+            sampling: MosaicSampling::Average,
+            map: ColorMap::None,
+            color_low: "#000000".into(),
+            color_high: "#ffffff".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticSettings {
+    /// Fraction of grains lit, 0..100.
+    pub density_pct: f32,
+    /// Frame regenerations per second; 0 = frozen.
+    pub speed_hz: f32,
+    /// Grain edge in millimeters (approximated via display DPI).
+    pub grain_mm: f32,
+    /// False = classic black/white; true = use the color range.
+    pub colored: bool,
+    pub color_low: String,
+    pub color_high: String,
+}
+
+impl Default for StaticSettings {
+    fn default() -> Self {
+        Self {
+            density_pct: 60.0,
+            speed_hz: 12.0,
+            grain_mm: 1.0,
+            colored: false,
+            color_low: "#000000".into(),
+            color_high: "#ffffff".into(),
+        }
+    }
+}
+
+/// Censor module settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CensorSettings {
-    /// Box fill color, #rrggbb.
+    /// How box interiors render.
+    pub mode: CensorMode,
+    /// Overall opacity of the censor graphic, 10..100. Below 100 the
+    /// content underneath shows through proportionally.
+    pub opacity_pct: f32,
+    /// Blur options (mode = blur).
+    pub blur: BlurSettings,
+    /// Mosaic options (mode = mosaic).
+    pub mosaic: MosaicSettings,
+    /// TV-static options (mode = static).
+    pub static_noise: StaticSettings,
+    /// Box fill color, #rrggbb (mode = box).
     pub fill_color: String,
     /// Box border color, #rrggbb.
     pub border_color: String,
@@ -190,6 +317,16 @@ pub struct CensorSettings {
 #[serde(rename_all = "camelCase")]
 pub struct CensorPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CensorMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity_pct: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blur: Option<BlurSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mosaic: Option<MosaicSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_noise: Option<StaticSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub border_color: Option<String>,
@@ -210,6 +347,11 @@ pub struct CensorPatch {
 impl Default for CensorSettings {
     fn default() -> Self {
         Self {
+            mode: CensorMode::Box,
+            opacity_pct: 100.0,
+            blur: BlurSettings::default(),
+            mosaic: MosaicSettings::default(),
+            static_noise: StaticSettings::default(),
             fill_color: "#000000".into(),
             border_color: "#000000".into(),
             border_width: 0.0,
@@ -228,6 +370,7 @@ impl CensorSettings {
             ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
         }
         set!(
+            mode, opacity_pct, blur, mosaic, static_noise,
             fill_color, border_color, border_width, x_scale_pct, y_scale_pct,
             show_trigger_label, censor_in_captures, text_overlay
         );
@@ -328,6 +471,10 @@ impl Package {
             detection: Some(p),
             censor: None,
         };
+        let censor = |p: CensorPatch| ModulePatches {
+            detection: None,
+            censor: Some(p),
+        };
         let all_triggers = |on: &[&str]| {
             Some(
                 CLASSES
@@ -388,6 +535,36 @@ impl Package {
                     "Large model (slower)",
                     detection(DetectionPatch {
                         model: Some("640m".into()),
+                        ..Default::default()
+                    }),
+                ),
+                cfg(
+                    "blur-soft",
+                    "Gaussian blur censor",
+                    censor(CensorPatch {
+                        mode: Some(CensorMode::Blur),
+                        blur: Some(BlurSettings {
+                            kind: BlurKind::Gaussian,
+                            intensity: 16.0,
+                        }),
+                        ..Default::default()
+                    }),
+                ),
+                cfg(
+                    "mosaic-classic",
+                    "Pixelated censor, true colors",
+                    censor(CensorPatch {
+                        mode: Some(CensorMode::Mosaic),
+                        mosaic: Some(MosaicSettings::default()),
+                        ..Default::default()
+                    }),
+                ),
+                cfg(
+                    "tv-static",
+                    "Animated black & white static",
+                    censor(CensorPatch {
+                        mode: Some(CensorMode::Static),
+                        static_noise: Some(StaticSettings::default()),
                         ..Default::default()
                     }),
                 ),

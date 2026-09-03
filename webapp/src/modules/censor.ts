@@ -2,7 +2,15 @@
 
 import { css, html, LitElement } from "lit";
 import { customElement } from "lit/decorators.js";
-import { valueSource, type CensorPatch, type TextOverlay } from "../schema.js";
+import {
+  valueSource,
+  type BlurSettings,
+  type CensorPatch,
+  type CensorSettings,
+  type MosaicSettings,
+  type StaticSettings,
+  type TextOverlay,
+} from "../schema.js";
 import { store } from "../store.js";
 import "../components/controls.js";
 
@@ -76,6 +84,41 @@ export class BmCensorModule extends LitElement {
     setOverride("textOverlay", { ...current, ...patch });
   }
 
+  private setBlur(patch: Partial<BlurSettings>) {
+    setOverride("blur", { ...store.effective.censor.blur, ...patch });
+  }
+
+  private setMosaic(patch: Partial<MosaicSettings>) {
+    setOverride("mosaic", { ...store.effective.censor.mosaic, ...patch });
+  }
+
+  private setStatic(patch: Partial<StaticSettings>) {
+    setOverride("staticNoise", { ...store.effective.censor.staticNoise, ...patch });
+  }
+
+  /** CSS approximation of the interior for the preview box. */
+  private previewInterior(c: CensorSettings): string {
+    switch (c.mode) {
+      case "blur":
+        return `background:linear-gradient(115deg,#c98,#967 40%,#789 60%,#546);filter:blur(${Math.min(c.blur.intensity / 3, 12)}px)`;
+      case "mosaic": {
+        const px = Math.max(c.mosaic.cellSizePt / 2, 3);
+        const [a, b] =
+          c.mosaic.map === "none" ? ["#c98", "#546"] : [c.mosaic.colorLow, c.mosaic.colorHigh];
+        return `background:repeating-conic-gradient(${a} 0% 25%, ${b} 0% 50%) 0 0/${px * 2}px ${px * 2}px`;
+      }
+      case "static": {
+        const [a, b] = c.staticNoise.colored
+          ? [c.staticNoise.colorLow, c.staticNoise.colorHigh]
+          : ["#111", "#eee"];
+        const g = Math.max(c.staticNoise.grainMm * 3, 2);
+        return `background:repeating-conic-gradient(${a} 0% 25%, ${b} 0% 50%) 0 0/${g * 2}px ${g * 2}px`;
+      }
+      default:
+        return `background:${c.fillColor}`;
+    }
+  }
+
   render() {
     const pkg = store.pkg;
     const c = store.effective.censor;
@@ -87,8 +130,9 @@ export class BmCensorModule extends LitElement {
         <div class="preview">
           <div
             class="box"
-            style="background:${c.fillColor};border:${c.borderWidth}px solid ${c
-              .borderColor};transform:scale(${c.xScalePct / 130}, ${c.yScalePct / 130})"
+            style="${this.previewInterior(c)};opacity:${c.opacityPct /
+            100};border:${c.borderWidth}px solid ${c.borderColor};transform:scale(${c.xScalePct /
+            130}, ${c.yScalePct / 130})"
           >
             <div>
               ${t.enabled && t.lines?.length
@@ -108,14 +152,194 @@ export class BmCensorModule extends LitElement {
         </div>
       </bm-section>
 
-      <bm-section heading="Box">
-        <bm-color
-          label="Fill color"
-          .value=${c.fillColor}
-          source=${src("fillColor")}
-          @field-change=${(e: CustomEvent) => setOverride("fillColor", e.detail)}
-          @reset=${() => clearOverride("fillColor")}
-        ></bm-color>
+      <bm-section heading="Censor">
+        <bm-select
+          label="Mode"
+          hint="How box interiors render; options below adapt to the mode"
+          .options=${[
+            { value: "box", label: "Solid box" },
+            { value: "blur", label: "Blur" },
+            { value: "mosaic", label: "Mosaic" },
+            { value: "static", label: "TV static" },
+          ]}
+          .value=${c.mode}
+          source=${src("mode")}
+          @field-change=${(e: CustomEvent) => setOverride("mode", e.detail)}
+          @reset=${() => clearOverride("mode")}
+        ></bm-select>
+        <bm-slider
+          label="Opacity"
+          hint="Below 100% the content underneath shows through"
+          min="10"
+          max="100"
+          step="5"
+          unit="%"
+          .value=${c.opacityPct}
+          source=${src("opacityPct")}
+          @field-change=${(e: CustomEvent) => setOverride("opacityPct", e.detail)}
+          @reset=${() => clearOverride("opacityPct")}
+        ></bm-slider>
+      </bm-section>
+
+      ${c.mode === "box"
+        ? html`<bm-section heading="Solid box">
+            <bm-color
+              label="Fill color"
+              .value=${c.fillColor}
+              source=${src("fillColor")}
+              @field-change=${(e: CustomEvent) => setOverride("fillColor", e.detail)}
+              @reset=${() => clearOverride("fillColor")}
+            ></bm-color>
+          </bm-section>`
+        : ""}
+      ${c.mode === "blur"
+        ? html`<bm-section heading="Blur">
+            <bm-select
+              label="Blur type"
+              .options=${[
+                { value: "gaussian", label: "Gaussian" },
+                { value: "box", label: "Box" },
+                { value: "average", label: "Average (downscale)" },
+              ]}
+              .value=${c.blur.kind}
+              source=${src("blur")}
+              @field-change=${(e: CustomEvent) => this.setBlur({ kind: e.detail })}
+              @reset=${() => clearOverride("blur")}
+            ></bm-select>
+            <bm-slider
+              label="Intensity"
+              min="1"
+              max="100"
+              step="1"
+              .value=${c.blur.intensity}
+              source=${src("blur")}
+              @field-change=${(e: CustomEvent) => this.setBlur({ intensity: e.detail })}
+              @reset=${() => clearOverride("blur")}
+            ></bm-slider>
+          </bm-section>`
+        : ""}
+      ${c.mode === "mosaic"
+        ? html`<bm-section heading="Mosaic">
+            <bm-slider
+              label="Pixel size"
+              min="4"
+              max="64"
+              step="2"
+              unit=" pt"
+              .value=${c.mosaic.cellSizePt}
+              source=${src("mosaic")}
+              @field-change=${(e: CustomEvent) => this.setMosaic({ cellSizePt: e.detail })}
+              @reset=${() => clearOverride("mosaic")}
+            ></bm-slider>
+            <bm-select
+              label="Pixel sampling"
+              hint="How each pixel's value is generated from the source"
+              .options=${[
+                { value: "average", label: "Average" },
+                { value: "gaussian", label: "Gaussian" },
+                { value: "nearest", label: "Point sample" },
+              ]}
+              .value=${c.mosaic.sampling}
+              source=${src("mosaic")}
+              @field-change=${(e: CustomEvent) => this.setMosaic({ sampling: e.detail })}
+              @reset=${() => clearOverride("mosaic")}
+            ></bm-select>
+            <bm-select
+              label="Color mapping"
+              hint="How source color/luminance maps into the color range"
+              .options=${[
+                { value: "none", label: "True colors" },
+                { value: "luminance", label: "Luminance → range" },
+                { value: "steps", label: "Luminance → 4 bands" },
+              ]}
+              .value=${c.mosaic.map}
+              source=${src("mosaic")}
+              @field-change=${(e: CustomEvent) => this.setMosaic({ map: e.detail })}
+              @reset=${() => clearOverride("mosaic")}
+            ></bm-select>
+            ${c.mosaic.map !== "none"
+              ? html`<bm-color
+                    label="Range low"
+                    .value=${c.mosaic.colorLow}
+                    source=${src("mosaic")}
+                    @field-change=${(e: CustomEvent) => this.setMosaic({ colorLow: e.detail })}
+                    @reset=${() => clearOverride("mosaic")}
+                  ></bm-color>
+                  <bm-color
+                    label="Range high"
+                    .value=${c.mosaic.colorHigh}
+                    source=${src("mosaic")}
+                    @field-change=${(e: CustomEvent) => this.setMosaic({ colorHigh: e.detail })}
+                    @reset=${() => clearOverride("mosaic")}
+                  ></bm-color>`
+              : ""}
+          </bm-section>`
+        : ""}
+      ${c.mode === "static"
+        ? html`<bm-section heading="TV static">
+            <bm-slider
+              label="Density"
+              hint="Fraction of grains lit"
+              min="5"
+              max="100"
+              step="5"
+              unit="%"
+              .value=${c.staticNoise.densityPct}
+              source=${src("staticNoise")}
+              @field-change=${(e: CustomEvent) => this.setStatic({ densityPct: e.detail })}
+              @reset=${() => clearOverride("staticNoise")}
+            ></bm-slider>
+            <bm-slider
+              label="Speed"
+              hint="Frame changes per second; 0 freezes the pattern"
+              min="0"
+              max="30"
+              step="1"
+              unit=" Hz"
+              .value=${c.staticNoise.speedHz}
+              source=${src("staticNoise")}
+              @field-change=${(e: CustomEvent) => this.setStatic({ speedHz: e.detail })}
+              @reset=${() => clearOverride("staticNoise")}
+            ></bm-slider>
+            <bm-slider
+              label="Grain size"
+              min="0.2"
+              max="5"
+              step="0.2"
+              unit=" mm"
+              .value=${c.staticNoise.grainMm}
+              source=${src("staticNoise")}
+              @field-change=${(e: CustomEvent) => this.setStatic({ grainMm: e.detail })}
+              @reset=${() => clearOverride("staticNoise")}
+            ></bm-slider>
+            <bm-switch
+              label="Colored static"
+              hint="Off = classic black & white"
+              .value=${c.staticNoise.colored}
+              source=${src("staticNoise")}
+              @field-change=${(e: CustomEvent) => this.setStatic({ colored: e.detail })}
+              @reset=${() => clearOverride("staticNoise")}
+            ></bm-switch>
+            ${c.staticNoise.colored
+              ? html`<bm-color
+                    label="Range low"
+                    .value=${c.staticNoise.colorLow}
+                    source=${src("staticNoise")}
+                    @field-change=${(e: CustomEvent) => this.setStatic({ colorLow: e.detail })}
+                    @reset=${() => clearOverride("staticNoise")}
+                  ></bm-color>
+                  <bm-color
+                    label="Range high"
+                    .value=${c.staticNoise.colorHigh}
+                    source=${src("staticNoise")}
+                    @field-change=${(e: CustomEvent) => this.setStatic({ colorHigh: e.detail })}
+                    @reset=${() => clearOverride("staticNoise")}
+                  ></bm-color>`
+              : ""}
+          </bm-section>`
+        : ""}
+
+      <bm-section heading="Border & size">
         <bm-color
           label="Border color"
           .value=${c.borderColor}

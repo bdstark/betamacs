@@ -23,9 +23,34 @@ use anyhow::Result;
 
 use crate::capture::Frame;
 use crate::capture_sck::SckCapturer;
+use crate::censor_fx;
 use crate::detect::{Detection, Detector};
 use crate::overlay::{CensorRegion, OverlayHandle};
-use crate::settings::Effective;
+use crate::settings::{CensorMode, CensorSettings, Effective};
+
+/// Crop a censor region out of its monitor's frame and process it per the
+/// censor mode. Returns None for modes that don't need source pixels.
+fn region_content(
+    frame: &Frame,
+    region: &CensorRegion,
+    censor: &CensorSettings,
+) -> Option<censor_fx::RegionContent> {
+    if !matches!(censor.mode, CensorMode::Blur | CensorMode::Mosaic) {
+        return None;
+    }
+    let scale = frame.pixel_to_point_scale();
+    let (img_w, img_h) = (frame.image.width(), frame.image.height());
+    let x = (((region.x - frame.origin.0 as f32) / scale).max(0.0) as u32).min(img_w - 1);
+    let y = (((region.y - frame.origin.1 as f32) / scale).max(0.0) as u32).min(img_h - 1);
+    let w = ((region.width / scale) as u32).clamp(1, img_w - x);
+    let h = ((region.height / scale) as u32).clamp(1, img_h - y);
+    let crop = image::imageops::crop_imm(&frame.image, x, y, w, h).to_image();
+    Some(match censor.mode {
+        CensorMode::Blur => censor_fx::blur(&crop, &censor.blur),
+        CensorMode::Mosaic => censor_fx::mosaic(&crop, &censor.mosaic, scale),
+        _ => unreachable!(),
+    })
+}
 
 /// Convert a detection on a captured frame into a censor box in global
 /// logical screen points, scaled by the censor module's x/y percentages.
@@ -55,6 +80,7 @@ pub fn detection_to_region(
         height: (y2 - y1).max(1.0),
         trigger: det.class,
         text_seed,
+        content: None,
     }
 }
 
@@ -87,6 +113,10 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
         .unwrap_or(0);
     let mut last_exclusion_attempt: Option<Instant> = None;
     let mut displays_were_asleep = capturer.any_display_asleep();
+    // Latest frame per monitor, kept so blur/mosaic content can be
+    // recomputed when the censor style changes without a fresh frame.
+    let mut last_frames: HashMap<u32, Frame> = HashMap::new();
+    let mut prev_censor = initial.censor.clone();
     // Frame-rate accounting, logged every 10s to spot busy displays.
     let mut frame_counts: HashMap<u32, u32> = HashMap::new();
     let mut last_stats = Instant::now();
@@ -272,6 +302,41 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                     );
                 }
             }
+        }
+
+        // Attach processed interiors (blur/mosaic). Reprocess a monitor's
+        // regions when a fresh frame arrived, a region has no content yet,
+        // or the censor style changed.
+        let censor_changed = cfg.censor != prev_censor;
+        if censor_changed {
+            prev_censor = cfg.censor.clone();
+        }
+        let fresh: std::collections::HashSet<u32> = latest.keys().copied().collect();
+        for (monitor_id, frame) in latest {
+            last_frames.insert(monitor_id, frame);
+        }
+        if matches!(cfg.censor.mode, CensorMode::Blur | CensorMode::Mosaic) {
+            for (monitor_id, entry) in held.iter_mut() {
+                let Some(frame) = last_frames.get(monitor_id) else {
+                    continue;
+                };
+                let frame_is_fresh = fresh.contains(monitor_id);
+                for (_, region) in entry.iter_mut() {
+                    if censor_changed || region.content.is_none() || frame_is_fresh {
+                        region.content = region_content(frame, region, &cfg.censor);
+                        changed = true;
+                    }
+                }
+            }
+        } else if censor_changed {
+            // Leaving blur/mosaic: strip stale content so boxes render
+            // their mode-appropriate interior.
+            for entry in held.values_mut() {
+                for (_, region) in entry.iter_mut() {
+                    region.content = None;
+                }
+            }
+            changed = true;
         }
 
         if changed {

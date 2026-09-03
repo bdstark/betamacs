@@ -86,7 +86,39 @@ export interface TextSet {
   lines: string[];
 }
 
+export type CensorMode = "box" | "blur" | "mosaic" | "static";
+export type BlurKind = "gaussian" | "box" | "average";
+export type MosaicSampling = "average" | "gaussian" | "nearest";
+export type ColorMap = "none" | "luminance" | "steps";
+
+export interface BlurSettings {
+  kind: BlurKind;
+  intensity: number;
+}
+
+export interface MosaicSettings {
+  cellSizePt: number;
+  sampling: MosaicSampling;
+  map: ColorMap;
+  colorLow: string;
+  colorHigh: string;
+}
+
+export interface StaticSettings {
+  densityPct: number;
+  speedHz: number;
+  grainMm: number;
+  colored: boolean;
+  colorLow: string;
+  colorHigh: string;
+}
+
 export interface CensorSettings {
+  mode: CensorMode;
+  opacityPct: number;
+  blur: BlurSettings;
+  mosaic: MosaicSettings;
+  staticNoise: StaticSettings;
   fillColor: string;
   borderColor: string;
   borderWidth: number;
@@ -146,6 +178,24 @@ export function defaultDetection(): DetectionSettings {
 
 export function defaultCensor(): CensorSettings {
   return {
+    mode: "box",
+    opacityPct: 100,
+    blur: { kind: "gaussian", intensity: 16 },
+    mosaic: {
+      cellSizePt: 16,
+      sampling: "average",
+      map: "none",
+      colorLow: "#000000",
+      colorHigh: "#ffffff",
+    },
+    staticNoise: {
+      densityPct: 60,
+      speedHz: 12,
+      grainMm: 1,
+      colored: false,
+      colorLow: "#000000",
+      colorHigh: "#ffffff",
+    },
     fillColor: "#000000",
     borderColor: "#000000",
     borderWidth: 0,

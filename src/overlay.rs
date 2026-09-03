@@ -17,18 +17,23 @@
 //! pipeline runs on a worker thread and sends updates through an
 //! `EventLoopProxy` user event.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::settings::CensorSettings;
+use crate::censor_fx::RegionContent;
+use crate::settings::{CensorMode, CensorSettings};
 
-/// A rectangle to black out, in global logical screen points (the same
-/// coordinate space as ScreenCaptureKit display origins).
-#[derive(Debug, Clone, PartialEq)]
+/// A censor rectangle in global logical screen points (the same coordinate
+/// space as ScreenCaptureKit display origins), plus optional processed
+/// pixels for its interior (blur/mosaic modes).
+#[derive(Debug, Clone)]
 pub struct CensorRegion {
     pub x: f32,
     pub y: f32,
@@ -40,6 +45,30 @@ pub struct CensorRegion {
     /// and preserved while it moves, so the text stays stable for the
     /// box's whole lifetime.
     pub text_seed: u64,
+    /// Processed interior pixels (blur/mosaic); None for box/static modes.
+    pub content: Option<RegionContent>,
+}
+
+impl CensorRegion {
+    pub fn same_geometry(&self, other: &Self) -> bool {
+        self.x == other.x
+            && self.y == other.y
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl PartialEq for CensorRegion {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_geometry(other)
+            && self.trigger == other.trigger
+            && self.text_seed == other.text_seed
+            && match (&self.content, &other.content) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(&a.rgba, &b.rgba),
+                _ => false,
+            }
+    }
 }
 
 #[derive(Debug)]
@@ -80,6 +109,10 @@ pub struct OverlayApp {
     /// otherwise re-trigger SCK change frames in a feedback loop).
     last_regions: Vec<CensorRegion>,
     style: CensorSettings,
+    /// Next TV-static animation frame, when mode = static and animated.
+    next_noise_tick: Option<Instant>,
+    /// xorshift state for noise generation.
+    rng: u64,
 }
 
 impl OverlayApp {
@@ -100,6 +133,12 @@ impl OverlayApp {
                 visible: 0,
                 last_regions: Vec::new(),
                 style,
+                next_noise_tick: None,
+                rng: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9e3779b97f4a7c15)
+                    | 1,
             },
         ))
     }
@@ -142,22 +181,23 @@ impl OverlayApp {
                 tracing::error!("{e}");
                 return;
             }
-            let window = &self.windows[i];
-            let _ = window.request_inner_size(LogicalSize::new(region.width, region.height));
-            window.set_outer_position(LogicalPosition::new(region.x, region.y));
+            let geometry_changed = self
+                .last_regions
+                .get(i)
+                .is_none_or(|prev| !prev.same_geometry(region));
+            if geometry_changed {
+                let window = &self.windows[i];
+                let _ = window.request_inner_size(LogicalSize::new(region.width, region.height));
+                window.set_outer_position(LogicalPosition::new(region.x, region.y));
+            }
             self.chromes[i].update(region, &self.style);
+            self.render_interior(i, region);
+            let window = &self.windows[i];
             window.set_visible(true);
             // winit's set_visible uses orderFront, which the window server
             // can ignore for a background (never-activated) app; this
             // orders the window in regardless of activation state.
             macos::order_front_regardless(window);
-            tracing::debug!(
-                "window {i}: requested {:?}, actual pos {:?} size {:?} visible {:?}",
-                region,
-                window.outer_position(),
-                window.inner_size(),
-                window.is_visible(),
-            );
             macos::debug_window_state(window, i);
         }
         // Hide the pooled surplus.
@@ -166,6 +206,50 @@ impl OverlayApp {
         }
         self.visible = regions.len();
         self.last_regions = regions;
+        self.schedule_noise();
+    }
+
+    /// Draw one region's interior according to the censor mode.
+    fn render_interior(&mut self, i: usize, region: &CensorRegion) {
+        let window = &self.windows[i];
+        match self.style.mode {
+            CensorMode::Box => macos::clear_layer_contents(window),
+            CensorMode::Blur | CensorMode::Mosaic => {
+                if let Some(content) = &region.content {
+                    macos::set_layer_contents(window, content);
+                }
+            }
+            CensorMode::Static => {
+                let content = macos::make_noise(
+                    window,
+                    region.width,
+                    region.height,
+                    &self.style.static_noise,
+                    &mut self.rng,
+                );
+                macos::set_layer_contents(window, &content);
+            }
+        }
+    }
+
+    /// (Re)arm the static-noise animation timer.
+    fn schedule_noise(&mut self) {
+        let animate = self.style.mode == CensorMode::Static
+            && self.visible > 0
+            && self.style.static_noise.speed_hz > 0.0;
+        self.next_noise_tick = animate.then(|| {
+            Instant::now()
+                + Duration::from_secs_f32(1.0 / self.style.static_noise.speed_hz.clamp(0.2, 30.0))
+        });
+    }
+
+    fn noise_tick(&mut self) {
+        for i in 0..self.visible {
+            if let Some(region) = self.last_regions.get(i).cloned() {
+                self.render_interior(i, &region);
+            }
+        }
+        self.schedule_noise();
     }
 
     fn apply_style(&mut self, style: CensorSettings) {
@@ -174,13 +258,16 @@ impl OverlayApp {
         }
         self.style = style;
         let protected = self.content_protected();
-        for (i, window) in self.windows.iter().enumerate() {
+        for i in 0..self.windows.len() {
+            let window = &self.windows[i];
             window.set_content_protected(protected);
             macos::apply_style(window, &self.style);
-            if let Some(region) = self.last_regions.get(i) {
-                self.chromes[i].update(region, &self.style);
+            if let Some(region) = self.last_regions.get(i).cloned() {
+                self.chromes[i].update(&region, &self.style);
+                self.render_interior(i, &region);
             }
         }
+        self.schedule_noise();
     }
 }
 
@@ -201,6 +288,20 @@ impl ApplicationHandler<OverlayMsg> for OverlayApp {
         _event: WindowEvent,
     ) {
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.next_noise_tick {
+            Some(due) => {
+                if Instant::now() >= due {
+                    self.noise_tick();
+                }
+                if let Some(next) = self.next_noise_tick {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                }
+            }
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
 }
 
 mod macos {
@@ -215,7 +316,10 @@ mod macos {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
+    use objc2_core_foundation::CFRetained;
+
     use super::CensorRegion;
+    use crate::censor_fx::RegionContent;
     use crate::settings::{parse_color, CensorSettings};
 
     /// The text fields drawn on a censor window: a centered random text
@@ -359,7 +463,7 @@ mod macos {
         );
     }
 
-    /// Fill color on the window, border on the content view's layer.
+    /// Fill color, opacity, and border on the content view's layer.
     pub fn apply_style(window: &Window, style: &CensorSettings) {
         let Some(ns) = ns_window(window) else {
             return;
@@ -367,6 +471,7 @@ mod macos {
         let (r, g, b, a) = parse_color(&style.fill_color).unwrap_or((0.0, 0.0, 0.0, 1.0));
         let fill = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a);
         ns.setBackgroundColor(Some(&fill));
+        ns.setAlphaValue((style.opacity_pct as f64 / 100.0).clamp(0.1, 1.0));
         if let Some(view) = ns.contentView() {
             view.setWantsLayer(true);
             if let Some(layer) = view.layer() {
@@ -377,6 +482,144 @@ mod macos {
                 let cg = border.CGColor();
                 layer.setBorderColor(Some(cg.as_ref()));
             }
+        }
+    }
+
+    fn content_layer(window: &Window) -> Option<Retained<objc2_quartz_core::CALayer>> {
+        let view = ns_window(window)?.contentView()?;
+        view.setWantsLayer(true);
+        view.layer()
+    }
+
+    /// Display processed RGBA pixels as the window's interior. Mosaic and
+    /// noise images are cell-resolution; nearest-neighbor magnification
+    /// keeps them crisp-blocky on the GPU.
+    pub fn set_layer_contents(window: &Window, content: &RegionContent) {
+        let Some(layer) = content_layer(window) else {
+            return;
+        };
+        let Some(image) = cg_image_from_rgba(content.width, content.height, &content.rgba) else {
+            tracing::warn!("could not build CGImage for censor content");
+            return;
+        };
+        unsafe {
+            layer.setMagnificationFilter(if content.pixelated {
+                objc2_quartz_core::kCAFilterNearest
+            } else {
+                objc2_quartz_core::kCAFilterLinear
+            });
+            // CALayer.contents takes a CGImage through the id-typed API.
+            let obj: &objc2::runtime::AnyObject =
+                &*(CFRetained::as_ptr(&image).as_ptr() as *const objc2::runtime::AnyObject);
+            layer.setContents(Some(obj));
+        }
+    }
+
+    /// Back to plain fill color (box mode).
+    pub fn clear_layer_contents(window: &Window) {
+        if let Some(layer) = content_layer(window) {
+            unsafe { layer.setContents(None) };
+        }
+    }
+
+    /// Points per millimeter of the window's display, from the display's
+    /// reported physical size; falls back to a typical desktop value.
+    fn points_per_mm(window: &Window) -> f32 {
+        let fallback = 6.0;
+        let Some(screen) = ns_window(window).and_then(|ns| ns.screen()) else {
+            return fallback;
+        };
+        let number = screen
+            .deviceDescription()
+            .objectForKey(&*objc2_foundation::NSString::from_str("NSScreenNumber"));
+        let Some(number) = number else { return fallback };
+        let display_id: u32 = unsafe {
+            objc2::msg_send![&*number, unsignedIntValue]
+        };
+        let size_mm = objc2_core_graphics::CGDisplayScreenSize(display_id);
+        let width_pt = screen.frame().size.width;
+        if size_mm.width > 1.0 && width_pt > 1.0 {
+            (width_pt / size_mm.width) as f32
+        } else {
+            fallback
+        }
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Generate one frame of analog-TV static at grain resolution.
+    pub fn make_noise(
+        window: &Window,
+        width_pt: f32,
+        height_pt: f32,
+        settings: &crate::settings::StaticSettings,
+        rng: &mut u64,
+    ) -> RegionContent {
+        let grain_pt = (settings.grain_mm.clamp(0.2, 10.0) * points_per_mm(window)).max(1.0);
+        let cells_w = ((width_pt / grain_pt).ceil() as u32).max(1);
+        let cells_h = ((height_pt / grain_pt).ceil() as u32).max(1);
+        let density = (settings.density_pct / 100.0).clamp(0.0, 1.0);
+        let low = parse_color(&settings.color_low).unwrap_or((0.0, 0.0, 0.0, 1.0));
+        let high = parse_color(&settings.color_high).unwrap_or((1.0, 1.0, 1.0, 1.0));
+        let mut rgba = vec![0u8; (cells_w * cells_h * 4) as usize];
+        for cell in rgba.chunks_exact_mut(4) {
+            let roll = xorshift(rng);
+            let lit = (roll & 0xffff) as f32 / 65535.0 < density;
+            let t = ((roll >> 16) & 0xffff) as f32 / 65535.0;
+            let (r, g, b) = if !lit {
+                (0.0, 0.0, 0.0)
+            } else if settings.colored {
+                (
+                    low.0 as f32 + (high.0 as f32 - low.0 as f32) * t,
+                    low.1 as f32 + (high.1 as f32 - low.1 as f32) * t,
+                    low.2 as f32 + (high.2 as f32 - low.2 as f32) * t,
+                )
+            } else {
+                (t, t, t)
+            };
+            cell[0] = (r * 255.0) as u8;
+            cell[1] = (g * 255.0) as u8;
+            cell[2] = (b * 255.0) as u8;
+            cell[3] = 255;
+        }
+        RegionContent {
+            width: cells_w,
+            height: cells_h,
+            rgba: std::sync::Arc::new(rgba),
+            pixelated: true,
+        }
+    }
+
+    fn cg_image_from_rgba(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Option<CFRetained<objc2_core_graphics::CGImage>> {
+        use objc2_core_graphics::{CGBitmapInfo, CGColorRenderingIntent, CGDataProvider, CGImage};
+        let data = objc2_core_foundation::CFData::from_bytes(rgba);
+        let provider = CGDataProvider::with_cf_data(Some(&data))?;
+        let space = objc2_core_graphics::CGColorSpace::new_device_rgb()?;
+        unsafe {
+            CGImage::new(
+                width as usize,
+                height as usize,
+                8,
+                32,
+                width as usize * 4,
+                Some(&space),
+                CGBitmapInfo(objc2_core_graphics::CGImageAlphaInfo::NoneSkipLast.0),
+                Some(&provider),
+                std::ptr::null(),
+                false,
+                CGColorRenderingIntent::RenderingIntentDefault,
+            )
         }
     }
 }
