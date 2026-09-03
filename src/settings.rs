@@ -86,6 +86,15 @@ pub struct DetectionSettings {
     pub tile_grid: u32,
     /// Grace period before a censor box is released (ms).
     pub hold_ms: u64,
+    /// Detections scoring below `confidence_threshold + borderline_margin`
+    /// are borderline: they only create a box after `debounce_count`
+    /// sightings within `debounce_window_ms`. 0 disables the band
+    /// (everything above threshold censors immediately).
+    pub borderline_margin: f32,
+    /// Sightings needed to confirm a borderline detection (1 = off).
+    pub debounce_count: u32,
+    /// Window in which those sightings must occur (ms).
+    pub debounce_window_ms: u64,
     /// Which NudeNet classes trigger censoring.
     pub triggers: BTreeMap<String, bool>,
 }
@@ -107,6 +116,12 @@ pub struct DetectionPatch {
     pub tile_grid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub borderline_margin: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_window_ms: Option<u64>,
     /// Merged per class, not replaced wholesale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triggers: Option<BTreeMap<String, bool>>,
@@ -129,6 +144,9 @@ impl Default for DetectionSettings {
             capture_fps: 4.0,
             tile_grid: 2,
             hold_ms: 1500,
+            borderline_margin: 0.1,
+            debounce_count: 2,
+            debounce_window_ms: 3000,
             triggers: CLASSES
                 .iter()
                 .map(|c| (c.to_string(), on_by_default.contains(c)))
@@ -142,7 +160,10 @@ impl DetectionSettings {
         macro_rules! set {
             ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
         }
-        set!(model, confidence_threshold, iou_threshold, min_region_px, capture_fps, tile_grid, hold_ms);
+        set!(
+            model, confidence_threshold, iou_threshold, min_region_px, capture_fps,
+            tile_grid, hold_ms, borderline_margin, debounce_count, debounce_window_ms
+        );
         if let Some(triggers) = &p.triggers {
             for (class, on) in triggers {
                 self.triggers.insert(class.clone(), *on);

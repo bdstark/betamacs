@@ -84,6 +84,14 @@ pub fn detection_to_region(
     }
 }
 
+/// A borderline detection waiting for confirmation before it may create a
+/// box.
+struct PendingRegion {
+    last_seen: Instant,
+    sightings: u32,
+    region: CensorRegion,
+}
+
 /// IoU between two censor regions, for matching a fresh detection to a
 /// held box.
 fn region_iou(a: &CensorRegion, b: &CensorRegion) -> f32 {
@@ -106,6 +114,8 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
     // Per-monitor held boxes, each with its own last-seen time so one
     // region dropping out (confidence wobble) doesn't take others with it.
     let mut held: HashMap<u32, Vec<(Instant, CensorRegion)>> = HashMap::new();
+    // Per-monitor borderline detections awaiting confirmation.
+    let mut pending: HashMap<u32, Vec<PendingRegion>> = HashMap::new();
     // Monotonic seed source for per-box text picks.
     let mut next_text_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -219,16 +229,19 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                         && d.bbox.3 >= cfg.detection.min_region_px
                 })
                 .collect();
-            let regions: Vec<CensorRegion> = flagged
+            let regions: Vec<(CensorRegion, f32)> = flagged
                 .iter()
                 .map(|d| {
                     next_text_seed = next_text_seed.wrapping_add(0x9e3779b97f4a7c15);
-                    detection_to_region(
-                        frame,
-                        d,
-                        cfg.censor.x_scale_pct,
-                        cfg.censor.y_scale_pct,
-                        next_text_seed,
+                    (
+                        detection_to_region(
+                            frame,
+                            d,
+                            cfg.censor.x_scale_pct,
+                            cfg.censor.y_scale_pct,
+                            next_text_seed,
+                        ),
+                        d.confidence,
                     )
                 })
                 .collect();
@@ -241,9 +254,12 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
             // (confidence-wobble grace, per box).
             let now = Instant::now();
             let entry = held.entry(*monitor_id).or_default();
+            let monitor_pending = pending.entry(*monitor_id).or_default();
             let before: Vec<CensorRegion> = entry.iter().map(|(_, r)| r.clone()).collect();
             let mut claimed = vec![false; entry.len()];
-            for region in regions {
+            let strong_threshold =
+                cfg.detection.confidence_threshold + cfg.detection.borderline_margin.max(0.0);
+            for (region, confidence) in regions {
                 let best = entry
                     .iter()
                     .enumerate()
@@ -274,12 +290,64 @@ pub fn run(shared: Arc<RwLock<Effective>>, overlay: OverlayHandle) -> Result<()>
                         entry[j] = (now, if stable { existing } else { region });
                     }
                     None => {
-                        entry.push((now, region));
-                        claimed.push(true);
+                        // A new box. Strong detections censor immediately;
+                        // borderline ones (within the margin band above the
+                        // threshold) must be sighted debounce_count times
+                        // within the debounce window first — this suppresses
+                        // one-frame threshold flickers.
+                        let strong =
+                            confidence >= strong_threshold || cfg.detection.debounce_count <= 1;
+                        if strong {
+                            entry.push((now, region));
+                            claimed.push(true);
+                        } else {
+                            let slot = monitor_pending.iter_mut().find(|p| {
+                                p.region.trigger == region.trigger
+                                    && region_iou(&p.region, &region) > 0.1
+                            });
+                            match slot {
+                                Some(p) => {
+                                    p.sightings += 1;
+                                    p.last_seen = now;
+                                    // Keep the original text seed; track the
+                                    // latest geometry.
+                                    let seed = p.region.text_seed;
+                                    p.region = region;
+                                    p.region.text_seed = seed;
+                                    if p.sightings >= cfg.detection.debounce_count {
+                                        tracing::info!(
+                                            "{}: borderline {} confirmed after {} sightings",
+                                            frame.monitor_name,
+                                            p.region.trigger,
+                                            p.sightings,
+                                        );
+                                        entry.push((now, p.region.clone()));
+                                        claimed.push(true);
+                                        p.sightings = 0; // recycled below by prune
+                                        p.last_seen = now - Duration::from_secs(3600);
+                                    }
+                                }
+                                None => {
+                                    tracing::debug!(
+                                        "{}: borderline {} at {:.0}% pending confirmation",
+                                        frame.monitor_name,
+                                        region.trigger,
+                                        confidence * 100.0,
+                                    );
+                                    monitor_pending.push(PendingRegion {
+                                        last_seen: now,
+                                        sightings: 1,
+                                        region,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
             entry.retain(|(last_seen, _)| last_seen.elapsed() < hold);
+            let debounce_window = Duration::from_millis(cfg.detection.debounce_window_ms.max(1));
+            monitor_pending.retain(|p| p.sightings > 0 && p.last_seen.elapsed() < debounce_window);
             let after: Vec<CensorRegion> = entry.iter().map(|(_, r)| r.clone()).collect();
             if entry.is_empty() {
                 held.remove(monitor_id);

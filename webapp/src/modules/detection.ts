@@ -175,6 +175,49 @@ export class BmDetectionModule extends LitElement {
         ></bm-slider>
       </bm-section>
 
+      <bm-section heading="Borderline debounce">
+        <p class="muted">
+          Detections scoring within the margin above the confidence threshold
+          are borderline: they only create a box after repeat sightings, which
+          suppresses one-frame threshold flickers. Strong detections always
+          censor immediately.
+        </p>
+        <bm-slider
+          label="Borderline margin"
+          hint="Band above the threshold that counts as borderline; 0 disables"
+          min="0"
+          max="0.3"
+          step="0.01"
+          .value=${d.borderlineMargin}
+          source=${src("borderlineMargin")}
+          @field-change=${(e: CustomEvent) => setOverride("borderlineMargin", e.detail)}
+          @reset=${() => clearOverride("borderlineMargin")}
+        ></bm-slider>
+        <bm-slider
+          label="Required sightings"
+          hint="1 = borderline detections censor immediately"
+          min="1"
+          max="6"
+          step="1"
+          .value=${d.debounceCount}
+          source=${src("debounceCount")}
+          @field-change=${(e: CustomEvent) => setOverride("debounceCount", e.detail)}
+          @reset=${() => clearOverride("debounceCount")}
+        ></bm-slider>
+        <bm-slider
+          label="Sighting window"
+          hint="Sightings must occur within this window to confirm"
+          min="500"
+          max="10000"
+          step="250"
+          unit=" ms"
+          .value=${d.debounceWindowMs}
+          source=${src("debounceWindowMs")}
+          @field-change=${(e: CustomEvent) => setOverride("debounceWindowMs", e.detail)}
+          @reset=${() => clearOverride("debounceWindowMs")}
+        ></bm-slider>
+      </bm-section>
+
       <bm-section heading="Triggers">
         <p class="muted">
           Which NudeNet detections cause censoring. Grouped for sanity; use the

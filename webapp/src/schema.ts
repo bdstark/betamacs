@@ -66,6 +66,9 @@ export interface DetectionSettings {
   captureFps: number;
   tileGrid: number;
   holdMs: number;
+  borderlineMargin: number;
+  debounceCount: number;
+  debounceWindowMs: number;
   triggers: Record<string, boolean>;
 }
 
@@ -172,6 +175,9 @@ export function defaultDetection(): DetectionSettings {
     captureFps: 4,
     tileGrid: 2,
     holdMs: 1500,
+    borderlineMargin: 0.1,
+    debounceCount: 2,
+    debounceWindowMs: 3000,
     triggers: Object.fromEntries(NUDENET_CLASSES.map((c) => [c, onByDefault.has(c)])),
   };
 }
