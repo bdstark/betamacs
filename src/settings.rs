@@ -63,6 +63,10 @@ pub struct ModulePatches {
     pub detection: Option<DetectionPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub censor: Option<CensorPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<ChallengePatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<ExposurePatch>,
 }
 
 // ---------------------------------------------------------------- detection
@@ -167,7 +171,7 @@ impl Default for DetectionSettings {
         ];
         Self {
             enabled: true,
-            model: "320n".into(),
+            model: "640m".into(),
             confidence_threshold: 0.35,
             iou_threshold: 0.45,
             min_region_px: 0.0,
@@ -229,6 +233,8 @@ pub enum CensorMode {
     Mosaic,
     /// Animated analog-TV static.
     Static,
+    /// Cover the detection with a fixed image.
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +339,51 @@ impl Default for StaticSettings {
     }
 }
 
+/// How the cover image is scaled to fill a censor box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFit {
+    /// Stretch to the box exactly, ignoring aspect ratio.
+    Stretch,
+    /// Scale to fit inside the box, preserving aspect (may letterbox — the
+    /// fill color shows in the gaps).
+    Contain,
+    /// Scale to fill the box, preserving aspect (crops overflow). Default:
+    /// guarantees full coverage with no distortion.
+    Cover,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageSettings {
+    /// Base64 (std) of the image file bytes (PNG/JPEG/…), carried in the
+    /// config so the cover image travels the signed pipeline. Takes
+    /// precedence over `path`. Empty = none.
+    #[serde(default)]
+    pub data: String,
+    /// Absolute path to an image file, for local/dev use when `data` is
+    /// empty. Empty = none.
+    #[serde(default)]
+    pub path: String,
+    /// How the image fills the box.
+    #[serde(default = "default_image_fit")]
+    pub fit: ImageFit,
+}
+
+fn default_image_fit() -> ImageFit {
+    ImageFit::Cover
+}
+
+impl Default for ImageSettings {
+    fn default() -> Self {
+        Self {
+            data: String::new(),
+            path: String::new(),
+            fit: default_image_fit(),
+        }
+    }
+}
+
 /// Censor module settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -348,6 +399,9 @@ pub struct CensorSettings {
     pub mosaic: MosaicSettings,
     /// TV-static options (mode = static).
     pub static_noise: StaticSettings,
+    /// Cover-image options (mode = image).
+    #[serde(default)]
+    pub image: ImageSettings,
     /// Box fill color, #rrggbb (mode = box).
     pub fill_color: String,
     /// Box border color, #rrggbb.
@@ -381,6 +435,8 @@ pub struct CensorPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_noise: Option<StaticSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub border_color: Option<String>,
@@ -401,11 +457,12 @@ pub struct CensorPatch {
 impl Default for CensorSettings {
     fn default() -> Self {
         Self {
-            mode: CensorMode::Box,
+            mode: CensorMode::Image,
             opacity_pct: 100.0,
             blur: BlurSettings::default(),
             mosaic: MosaicSettings::default(),
             static_noise: StaticSettings::default(),
+            image: ImageSettings::default(),
             fill_color: "#000000".into(),
             border_color: "#000000".into(),
             border_width: 0.0,
@@ -424,7 +481,7 @@ impl CensorSettings {
             ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
         }
         set!(
-            mode, opacity_pct, blur, mosaic, static_noise,
+            mode, opacity_pct, blur, mosaic, static_noise, image,
             fill_color, border_color, border_width, x_scale_pct, y_scale_pct,
             show_trigger_label, censor_in_captures, text_overlay
         );
@@ -461,14 +518,250 @@ impl Default for TextOverlay {
     }
 }
 
+// ------------------------------------------------------- activity challenge
+//
+// Liveness/attention checks. The *policy* (cadence, difficulty band, which
+// task categories are live, enforcement window) is a module patch carried
+// in the signed `betamacs-config` package, so it layers/overrides like
+// detection and censor. The *content* — the task bank itself — is a
+// SEPARATE signed artifact (`betamacs-tasks`, see `TaskBank`) so questions
+// version and swap independently of policy (per kid, or as kids age). The
+// policy references tasks only abstractly, by `category` and `grade`.
+
+/// How a challenge answer is checked. Authored in plaintext; the daemon may
+/// store a salted hash instead so the answer isn't recoverable from config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Answer {
+    /// Numeric answer, optional absolute tolerance (0 = exact).
+    Number {
+        value: f64,
+        #[serde(default)]
+        tolerance: f64,
+    },
+    /// Free text; `value` and/or any of `any_of` are accepted.
+    Text {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        #[serde(default)]
+        any_of: Vec<String>,
+        #[serde(default = "default_true")]
+        ignore_case: bool,
+    },
+    /// Type-this-line (anti-idle): exact match, trimmed.
+    Line { value: String },
+    /// Multiple choice: `options` are shown as buttons, `value` is correct.
+    Choice { options: Vec<String>, value: String },
+}
+
+/// One challenge task. Self-contained and offline-checkable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub id: String,
+    /// Selection filter / grouping, e.g. "math-word" or "type-line".
+    pub category: String,
+    /// Difficulty band; policy caps it with `max_grade`.
+    pub grade: u8,
+    /// Relative pick probability among eligible tasks.
+    #[serde(default = "default_weight")]
+    pub weight: f32,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    pub answer: Answer,
+}
+
+/// The `betamacs-tasks` artifact: a standalone, independently-versioned
+/// bank delivered as its own signed envelope (own epoch / anti-rollback),
+/// merged with the challenge policy at runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBank {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+}
+
+/// Challenge policy (lives in `betamacs-config`). Disabled by default; a
+/// missing/empty task bank makes it a no-op (never a lockout from absence).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChallengeSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Random cadence bounds, measured over active-session time.
+    pub interval_min_sec: u32,
+    pub interval_max_sec: u32,
+    /// Task categories drawn from the bank; empty = none eligible.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Never pick a task above this grade band.
+    pub max_grade: u8,
+    /// Time to answer before the challenge counts as unprotected (feeds the
+    /// daemon's quarantine, like a stale heartbeat).
+    pub answer_window_sec: u32,
+    /// Wrong answers allowed before a fresh task is picked.
+    pub max_attempts: u32,
+}
+
+impl Default for ChallengeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_min_sec: 2700,
+            interval_max_sec: 5400,
+            categories: Vec::new(),
+            max_grade: 6,
+            answer_window_sec: 120,
+            max_attempts: 3,
+        }
+    }
+}
+
+/// Partial challenge policy for layering.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChallengePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_min_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_max_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_grade: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_window_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+}
+
+impl ChallengeSettings {
+    pub fn apply(&mut self, p: &ChallengePatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, interval_min_sec, interval_max_sec, categories, max_grade,
+            answer_window_sec, max_attempts
+        );
+    }
+}
+
+// -------------------------------------------------------- exposure budget
+//
+// Quantifies how much the censor is firing — frequency, on-screen area, and
+// box count are all known per frame in the pipeline — and turns a sustained
+// excess into an escalating response: a soft warning popup ("Are you
+// looking at appropriate content?"), then, past a hard limit, a *timed*
+// internet lockout via the same betamacsd quarantine. Policy only; the
+// pipeline accumulates the metric and the daemon enforces the penalty.
+
+/// What the exposure budget accumulates over its rolling window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExposureMetric {
+    /// Count of distinct new detections (how OFTEN).
+    Events,
+    /// Seconds with at least one censor box present.
+    ActiveSeconds,
+    /// Integral of box count over time (how MANY).
+    BoxSeconds,
+    /// Integral of covered screen fraction over time (how much SPACE).
+    AreaSeconds,
+}
+
+/// Exposure-budget policy (lives in `betamacs-config`). Disabled by default.
+/// Two thresholds over rolling windows: `warn_*` raises the acknowledgement
+/// popup; `block_*` trips a `penalty_sec` network lockout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    pub metric: ExposureMetric,
+    /// Soft limit within `warn_window_sec` → warning popup.
+    pub warn_threshold: f32,
+    pub warn_window_sec: u32,
+    /// Hard limit within `block_window_sec` → timed quarantine.
+    pub block_threshold: f32,
+    pub block_window_sec: u32,
+    /// How long the internet stays cut once the hard limit trips.
+    pub penalty_sec: u32,
+    /// Minimum gap between warning popups.
+    pub warn_cooldown_sec: u32,
+}
+
+impl Default for ExposureSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            metric: ExposureMetric::Events,
+            warn_threshold: 20.0,
+            warn_window_sec: 300,
+            block_threshold: 40.0,
+            block_window_sec: 600,
+            penalty_sec: 900,
+            warn_cooldown_sec: 120,
+        }
+    }
+}
+
+/// Partial exposure policy for layering.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposurePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<ExposureMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_window_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_window_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub penalty_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_cooldown_sec: Option<u32>,
+}
+
+impl ExposureSettings {
+    pub fn apply(&mut self, p: &ExposurePatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, metric, warn_threshold, warn_window_sec, block_threshold,
+            block_window_sec, penalty_sec, warn_cooldown_sec
+        );
+    }
+}
+
+fn default_weight() -> f32 {
+    1.0
+}
+
 // ---------------------------------------------------------------- resolution
 
-/// Fully resolved settings for both modules.
+/// Fully resolved settings for all modules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Effective {
     pub detection: DetectionSettings,
     pub censor: CensorSettings,
+    #[serde(default)]
+    pub challenge: ChallengeSettings,
+    #[serde(default)]
+    pub exposure: ExposureSettings,
 }
 
 impl Package {
@@ -486,6 +779,12 @@ impl Package {
             }
             if let Some(p) = &patches.censor {
                 effective.censor.apply(p);
+            }
+            if let Some(p) = &patches.challenge {
+                effective.challenge.apply(p);
+            }
+            if let Some(p) = &patches.exposure {
+                effective.exposure.apply(p);
             }
         }
         // Pool the lines of the referenced text sets, in reference order.
@@ -523,11 +822,11 @@ impl Package {
         };
         let detection = |p: DetectionPatch| ModulePatches {
             detection: Some(p),
-            censor: None,
+            ..Default::default()
         };
         let censor = |p: CensorPatch| ModulePatches {
-            detection: None,
             censor: Some(p),
+            ..Default::default()
         };
         let all_triggers = |on: &[&str]| {
             Some(

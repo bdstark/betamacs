@@ -95,10 +95,11 @@ export interface TextSet {
   lines: string[];
 }
 
-export type CensorMode = "box" | "blur" | "mosaic" | "static";
+export type CensorMode = "box" | "blur" | "mosaic" | "static" | "image";
 export type BlurKind = "gaussian" | "box" | "average";
 export type MosaicSampling = "average" | "gaussian" | "nearest";
 export type ColorMap = "none" | "luminance" | "steps";
+export type ImageFit = "stretch" | "contain" | "cover";
 
 export interface BlurSettings {
   kind: BlurKind;
@@ -122,12 +123,21 @@ export interface StaticSettings {
   colorHigh: string;
 }
 
+export interface ImageSettings {
+  /** Base64 (std) of the image bytes, carried in the config. */
+  data: string;
+  /** Absolute path to an image file (local/dev use; ignored when data is set). */
+  path: string;
+  fit: ImageFit;
+}
+
 export interface CensorSettings {
   mode: CensorMode;
   opacityPct: number;
   blur: BlurSettings;
   mosaic: MosaicSettings;
   staticNoise: StaticSettings;
+  image: ImageSettings;
   fillColor: string;
   borderColor: string;
   borderWidth: number;
@@ -141,9 +151,69 @@ export interface CensorSettings {
 export type DetectionPatch = Partial<DetectionSettings>;
 export type CensorPatch = Partial<CensorSettings>;
 
+// ------------------------------------------------------- activity challenge
+// Policy lives here (betamacs-config); the task bank is a SEPARATE
+// betamacs-tasks artifact (TaskBank), versioned/swapped independently.
+
+export type Answer =
+  | { type: "number"; value: number; tolerance?: number }
+  | { type: "text"; value?: string; anyOf?: string[]; ignoreCase?: boolean }
+  | { type: "line"; value: string }
+  | { type: "choice"; options: string[]; value: string };
+
+export interface Task {
+  id: string;
+  category: string;
+  grade: number;
+  weight?: number;
+  prompt: string;
+  hint?: string;
+  answer: Answer;
+}
+
+/** The betamacs-tasks artifact: standalone, independently versioned. */
+export interface TaskBank {
+  version: number;
+  name?: string;
+  tasks: Task[];
+}
+
+export interface ChallengeSettings {
+  enabled: boolean;
+  intervalMinSec: number;
+  intervalMaxSec: number;
+  categories: string[];
+  maxGrade: number;
+  answerWindowSec: number;
+  maxAttempts: number;
+}
+export type ChallengePatch = Partial<ChallengeSettings>;
+
+// -------------------------------------------------------- exposure budget
+
+export type ExposureMetric =
+  | "events"
+  | "activeSeconds"
+  | "boxSeconds"
+  | "areaSeconds";
+
+export interface ExposureSettings {
+  enabled: boolean;
+  metric: ExposureMetric;
+  warnThreshold: number;
+  warnWindowSec: number;
+  blockThreshold: number;
+  blockWindowSec: number;
+  penaltySec: number;
+  warnCooldownSec: number;
+}
+export type ExposurePatch = Partial<ExposureSettings>;
+
 export interface ModulePatches {
   detection?: DetectionPatch;
   censor?: CensorPatch;
+  challenge?: ChallengePatch;
+  exposure?: ExposurePatch;
 }
 
 export interface NamedConfig {
@@ -163,6 +233,8 @@ export interface Package {
 export interface Effective {
   detection: DetectionSettings;
   censor: CensorSettings;
+  challenge: ChallengeSettings;
+  exposure: ExposureSettings;
 }
 
 export function defaultDetection(): DetectionSettings {
@@ -175,7 +247,7 @@ export function defaultDetection(): DetectionSettings {
   ]);
   return {
     enabled: true,
-    model: "320n",
+    model: "640m",
     confidenceThreshold: 0.35,
     iouThreshold: 0.45,
     minRegionPx: 0,
@@ -193,7 +265,7 @@ export function defaultDetection(): DetectionSettings {
 
 export function defaultCensor(): CensorSettings {
   return {
-    mode: "box",
+    mode: "image",
     opacityPct: 100,
     blur: { kind: "gaussian", intensity: 16 },
     mosaic: {
@@ -211,6 +283,7 @@ export function defaultCensor(): CensorSettings {
       colorLow: "#000000",
       colorHigh: "#ffffff",
     },
+    image: { data: "", path: "", fit: "cover" },
     fillColor: "#000000",
     borderColor: "#000000",
     borderWidth: 0,
@@ -257,14 +330,46 @@ function stripUndefined<T extends object>(o: T): Partial<T> {
 }
 
 /** Same resolution the Rust app performs. */
+export function defaultChallenge(): ChallengeSettings {
+  return {
+    enabled: false,
+    intervalMinSec: 2700,
+    intervalMaxSec: 5400,
+    categories: [],
+    maxGrade: 6,
+    answerWindowSec: 120,
+    maxAttempts: 3,
+  };
+}
+
+export function defaultExposure(): ExposureSettings {
+  return {
+    enabled: false,
+    metric: "events",
+    warnThreshold: 20,
+    warnWindowSec: 300,
+    blockThreshold: 40,
+    blockWindowSec: 600,
+    penaltySec: 900,
+    warnCooldownSec: 120,
+  };
+}
+
 export function resolve(pkg: Package): Effective {
-  const effective: Effective = { detection: defaultDetection(), censor: defaultCensor() };
+  const effective: Effective = {
+    detection: defaultDetection(),
+    censor: defaultCensor(),
+    challenge: defaultChallenge(),
+    exposure: defaultExposure(),
+  };
   const layerPatches = pkg.layers
     .map((name) => pkg.namedConfigs.find((c) => c.name === name)?.settings)
     .filter((s): s is ModulePatches => !!s);
   for (const patches of [...layerPatches, pkg.overrides]) {
     if (patches.detection) applyDetection(effective.detection, patches.detection);
     if (patches.censor) applyCensor(effective.censor, patches.censor);
+    if (patches.challenge) Object.assign(effective.challenge, patches.challenge);
+    if (patches.exposure) Object.assign(effective.exposure, patches.exposure);
   }
   effective.censor.textOverlay.lines = resolveTextLines(pkg, effective.censor.textOverlay);
   return effective;

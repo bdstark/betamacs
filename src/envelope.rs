@@ -21,10 +21,15 @@ use x509_cert::der::asn1::ObjectIdentifier;
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
-/// The otactl app names envelopes may carry: settings and the .app zip.
+/// The otactl app names envelopes may carry: settings, the .app zip, and
+/// the challenge task bank.
 pub const CONFIG_APP: &str = "betamacs-config";
 #[allow(dead_code)] // used by betamacsd, dead in the betamacs bin
 pub const APP_APP: &str = "betamacs";
+/// The challenge task bank — a separate, independently-versioned artifact.
+/// Author-signed like config (a bad bank can lock a kid out).
+#[allow(dead_code)] // used by betamacsd, dead in the betamacs bin
+pub const TASKS_APP: &str = "betamacs-tasks";
 
 const ALG_ECDSA_P256_SHA256: &str = "ecdsa-p256-sha256";
 /// ecdsa-with-SHA256 (certificate signature algorithm).
@@ -313,9 +318,12 @@ impl Verifier {
         }
 
         // Integral policy authorship: with an author key pinned, a config
-        // artifact must be a wrapper signed by the policy author — a key
-        // otactl never holds, so no server-side path can mint policy.
-        let artifact = if expected_app == CONFIG_APP && self.author_key.is_some() {
+        // or task-bank artifact must be a wrapper signed by the policy
+        // author — a key otactl never holds, so no server-side path can
+        // mint policy or the challenges that gate the network.
+        let artifact = if (expected_app == CONFIG_APP || expected_app == TASKS_APP)
+            && self.author_key.is_some()
+        {
             self.unwrap_authored(&artifact)?
         } else {
             artifact

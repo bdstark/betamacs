@@ -1,11 +1,13 @@
 mod capture;
 mod capture_sck;
 mod censor_fx;
+mod challenge;
 mod detect;
 mod envelope;
 mod heartbeat;
 mod menubar;
 mod overlay;
+mod prompt;
 mod smappservice;
 mod pipeline;
 mod server;
@@ -407,6 +409,10 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     if let Some(verifier) = verifier {
         spawn_managed_watch(verifier, state, handle.clone(), health.clone());
     }
+
+    // Activity-challenge scheduler (osascript prompts; enforced via the
+    // heartbeat's challengeOverdue signal). No-op until policy enables it.
+    challenge::spawn(shared.clone(), health.clone());
 
     std::thread::spawn(move || {
         if let Err(e) = pipeline::run(shared, handle, health) {

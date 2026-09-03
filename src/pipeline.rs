@@ -16,6 +16,7 @@
 //!     a static image must remain covered indefinitely
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ use crate::capture_sck::SckCapturer;
 use crate::censor_fx;
 use crate::detect::{Detection, Detector, TileCache};
 use crate::overlay::{CensorRegion, OverlayHandle};
-use crate::settings::{CensorMode, CensorSettings, Effective};
+use crate::settings::{CensorMode, CensorSettings, Effective, ExposureMetric};
 
 /// Crop a censor region out of its monitor's frame and process it per the
 /// censor mode. Returns None for modes that don't need source pixels.
@@ -94,6 +95,53 @@ struct HeldBox {
     last_seen: Instant,
     sightings: u32,
     region: CensorRegion,
+}
+
+/// Rolling accumulator for the exposure budget: timestamped metric
+/// increments, plus warn/block cooldown state, so the pipeline can tell
+/// "too much censoring, too fast" over a window from an occasional box.
+struct ExposureTracker {
+    events: VecDeque<(Instant, f32)>,
+    last_tick: Instant,
+    last_warn: Option<Instant>,
+    last_block: Option<Instant>,
+}
+
+impl ExposureTracker {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            last_tick: Instant::now(),
+            last_warn: None,
+            last_block: None,
+        }
+    }
+
+    fn record(&mut self, amount: f32) {
+        if amount > 0.0 {
+            self.events.push_back((Instant::now(), amount));
+        }
+    }
+
+    fn sum_within(&self, window: Duration) -> f32 {
+        let now = Instant::now();
+        self.events
+            .iter()
+            .filter(|(t, _)| now.duration_since(*t) <= window)
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
+    fn prune(&mut self, keep: Duration) {
+        let now = Instant::now();
+        while let Some((t, _)) = self.events.front() {
+            if now.duration_since(*t) > keep {
+                self.events.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// FNV-1a over a sparse pixel grid — cheap "did the screen change" check
@@ -182,6 +230,7 @@ pub fn run(
     menubar_status(&capturer, &loaded_model, &overlay);
 
     let mut was_enabled = true;
+    let mut exposure = ExposureTracker::new();
     loop {
         let cfg = shared.read().unwrap().clone();
 
@@ -335,6 +384,8 @@ pub fn run(
 
         let hold = Duration::from_millis(cfg.detection.hold_ms);
         let mut changed = false;
+        // Count fresh censor boxes this cycle for the "events" exposure metric.
+        let mut new_boxes = 0u32;
         // With highlighting on, detect down to the highlight floor so
         // sub-threshold regions are visible; blocking still requires
         // the full confidence threshold below.
@@ -574,6 +625,7 @@ pub fn run(
                             region,
                         });
                         claimed.push(true);
+                        new_boxes += 1;
                     }
                 }
             }
@@ -653,6 +705,85 @@ pub fn run(
             health.boxes.store(all.len() as u32, Ordering::Relaxed);
             all.extend(highlights.values().flatten().cloned());
             overlay.set_regions(all)?;
+        }
+
+        // Exposure budget: accumulate how much the censor is firing over a
+        // rolling window and escalate — a warning popup at the soft limit,
+        // and at the hard limit a one-shot request for a timed network
+        // lockout that betamacsd enforces (like tamper/uninstall, but for a
+        // fixed period). Policy only; disabled by default.
+        if cfg.exposure.enabled {
+            let ex = &cfg.exposure;
+            let now = Instant::now();
+            let dt = now
+                .saturating_duration_since(exposure.last_tick)
+                .min(Duration::from_secs(5))
+                .as_secs_f32();
+            exposure.last_tick = now;
+            let box_count: usize = held.values().map(|v| v.len()).sum();
+            let increment = match ex.metric {
+                ExposureMetric::Events => new_boxes as f32,
+                ExposureMetric::ActiveSeconds => {
+                    if box_count > 0 {
+                        dt
+                    } else {
+                        0.0
+                    }
+                }
+                ExposureMetric::BoxSeconds => box_count as f32 * dt,
+                ExposureMetric::AreaSeconds => {
+                    let box_area: f32 = held
+                        .values()
+                        .flatten()
+                        .map(|b| b.region.width * b.region.height)
+                        .sum();
+                    let screen_area: f32 = last_frames
+                        .values()
+                        .map(|f| f.logical_size.0 as f32 * f.logical_size.1 as f32)
+                        .sum();
+                    if screen_area > 0.0 {
+                        (box_area / screen_area).min(1.0) * dt
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            exposure.record(increment);
+            let keep =
+                Duration::from_secs(ex.warn_window_sec.max(ex.block_window_sec) as u64 + 5);
+            exposure.prune(keep);
+
+            let over_block = ex.block_threshold > 0.0
+                && exposure.sum_within(Duration::from_secs(ex.block_window_sec as u64))
+                    >= ex.block_threshold
+                && exposure
+                    .last_block
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(ex.penalty_sec as u64));
+            if over_block {
+                exposure.last_block = Some(now);
+                exposure.events.clear();
+                health
+                    .exposure_penalty_secs
+                    .store(ex.penalty_sec, Ordering::Relaxed);
+                health.exposure_over_budget.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "exposure budget exceeded ({:?}) — requesting {}s network lockout",
+                    ex.metric,
+                    ex.penalty_sec,
+                );
+            } else if ex.warn_threshold > 0.0
+                && exposure.sum_within(Duration::from_secs(ex.warn_window_sec as u64))
+                    >= ex.warn_threshold
+                && exposure
+                    .last_warn
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(ex.warn_cooldown_sec as u64))
+            {
+                exposure.last_warn = Some(now);
+                tracing::info!("exposure over warn threshold — showing prompt");
+                crate::prompt::warn(
+                    "Are you looking at appropriate content?\n\nA lot of flagged content has been detected. Please make a better choice.",
+                );
+            }
         }
 
         // In censor-in-captures mode the boxes are visible to capture, so

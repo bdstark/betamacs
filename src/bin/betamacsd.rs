@@ -66,6 +66,14 @@ struct AgentState {
     config_epoch: u64,
     /// False when policy disables censoring — healthy by policy.
     enabled: bool,
+    /// The agent has posed an activity challenge that has gone unanswered
+    /// past its window — treated as "unprotected" (quarantine after grace).
+    challenge_overdue: bool,
+    /// When the exposure budget was exceeded, the deadline until which a
+    /// TIMED network quarantine is held regardless of current activity.
+    /// Computed here from the heartbeat's requested penalty so the lockout
+    /// survives the agent being killed.
+    exposure_penalty_until: Option<Instant>,
 }
 
 impl Default for AgentState {
@@ -76,6 +84,8 @@ impl Default for AgentState {
             capture_ok: true,
             config_epoch: 0,
             enabled: true,
+            challenge_overdue: false,
+            exposure_penalty_until: None,
         }
     }
 }
@@ -138,9 +148,29 @@ impl Quarantine {
 
     /// Called from the watch loop. Healthy means: no active console
     /// session, censoring disabled by policy, or a fresh heartbeat with
-    /// working capture.
+    /// working capture — and no unanswered challenge. A tripped exposure
+    /// budget overrides all of that with a fixed-duration lockout.
     fn evaluate(&mut self, agent: &AgentState) {
         if !self.armed {
+            return;
+        }
+        // Timed exposure penalty: hold the quarantine until the deadline
+        // regardless of activity or health, then fall through to normal
+        // recovery. This is the one lockout that is NOT released by the
+        // censor simply being healthy again.
+        if agent
+            .exposure_penalty_until
+            .is_some_and(|until| until > Instant::now())
+        {
+            if !self.engaged {
+                let left = agent
+                    .exposure_penalty_until
+                    .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
+                    .unwrap_or(0);
+                tracing::warn!("exposure budget exceeded — timed network quarantine ({left}s remaining)");
+                self.engage();
+            }
+            self.unhealthy_since = None;
             return;
         }
         let session_active = std::fs::metadata("/dev/console")
@@ -149,12 +179,13 @@ impl Quarantine {
                 m.uid() != 0
             })
             .unwrap_or(false);
-        let healthy = !session_active
+        let healthy = (!session_active
             || !agent.enabled
             || (agent
                 .last_seen
                 .is_some_and(|t| t.elapsed() < HEARTBEAT_FRESH)
-                && agent.capture_ok);
+                && agent.capture_ok))
+            && !agent.challenge_overdue;
         if healthy {
             self.unhealthy_since = None;
             if self.engaged {
@@ -165,10 +196,11 @@ impl Quarantine {
         let since = *self.unhealthy_since.get_or_insert_with(Instant::now);
         if !self.engaged && since.elapsed() >= self.grace {
             tracing::warn!(
-                "censor unprotected for {}s (heartbeat {:?}s old, captureOk {}) — engaging network quarantine",
+                "censor unprotected for {}s (heartbeat {:?}s old, captureOk {}, challengeOverdue {}) — engaging network quarantine",
                 since.elapsed().as_secs(),
                 agent.last_seen.map(|t| t.elapsed().as_secs()),
                 agent.capture_ok,
+                agent.challenge_overdue,
             );
             self.engage();
         }
@@ -360,6 +392,29 @@ fn handle_client(
                 a.capture_ok = msg.get("captureOk").and_then(|v| v.as_bool()).unwrap_or(true);
                 a.config_epoch = msg.get("configEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
                 a.enabled = msg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                a.challenge_overdue = msg
+                    .get("challengeOverdue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // Exposure budget exceeded is edge-triggered: on each such
+                // report start (or extend) a timed lockout of the requested
+                // length. The daemon owns the deadline so killing the agent
+                // can't cut the penalty short.
+                if msg
+                    .get("exposureOverBudget")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let secs = msg.get("exposurePenaltySec").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if secs > 0 {
+                        let until = Instant::now() + Duration::from_secs(secs);
+                        a.exposure_penalty_until = Some(match a.exposure_penalty_until {
+                            Some(prev) if prev > until => prev, // keep the longer standing lockout
+                            _ => until,
+                        });
+                        tracing::warn!("agent reports exposure over budget — network lockout for {secs}s");
+                    }
+                }
                 if !a.capture_ok {
                     tracing::warn!("agent reports capture unhealthy (Screen Recording revoked?)");
                 }
@@ -372,6 +427,21 @@ fn handle_client(
                     }
                     Err(e) => {
                         tracing::warn!("envelope refused: {e:#}");
+                        format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::json!(e.to_string()))
+                    }
+                };
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
+            Some("tasks") => {
+                let reply = match apply_tasks_envelope(&line, managed_dir, verifier) {
+                    Ok(epoch) => {
+                        tracing::info!("accepted task-bank envelope, epoch {epoch}");
+                        "{\"ok\":true}\n".to_string()
+                    }
+                    Err(e) => {
+                        tracing::warn!("task-bank envelope refused: {e:#}");
                         format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::json!(e.to_string()))
                     }
                 };
@@ -401,13 +471,20 @@ fn handle_client(
             }
             Some("status") => {
                 let a = agent.lock().unwrap().clone();
+                let quarantine_secs = a
+                    .exposure_penalty_until
+                    .map(|u| u.saturating_duration_since(Instant::now()).as_secs() as i64)
+                    .unwrap_or(0);
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureLockoutSecs\":{}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
                     a.config_epoch,
+                    read_epoch(&managed_dir.join("epoch-tasks")),
                     a.enabled,
+                    a.challenge_overdue,
+                    quarantine_secs,
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());
@@ -436,6 +513,32 @@ fn apply_envelope(
     std::fs::write(&tmp, &verified.artifact)?;
     std::fs::rename(&tmp, managed_dir.join("package.json"))?;
     std::fs::write(managed_dir.join("envelope.json"), raw)?;
+    std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
+    Ok(verified.epoch)
+}
+
+/// Verify and persist a task-bank envelope; returns the accepted epoch.
+/// The bank is a separate artifact with its own epoch high-water, so a new
+/// question set can't be rolled back independently of config or the app.
+/// The daemon only takes custody and enforces (via the heartbeat signals);
+/// selection and answer-checking live in the agent, which reads this file
+/// like it reads package.json. Answers in the bank are stored hashed, so a
+/// world-readable tasks.json is not a cheat sheet.
+fn apply_tasks_envelope(
+    raw: &str,
+    managed_dir: &Path,
+    verifier: Option<&envelope::Verifier>,
+) -> Result<u64> {
+    let verifier = verifier.context("no pinned otactl root installed")?;
+    let env: envelope::Envelope = serde_json::from_str(raw).context("malformed envelope")?;
+    let epoch_path = managed_dir.join("epoch-tasks");
+    let verified = verifier.verify(&env, read_epoch(&epoch_path), envelope::TASKS_APP)?;
+
+    // Persist artifact then bump the epoch high-water last, so a crash never
+    // leaves the epoch ahead of the bank (mirrors apply_envelope).
+    let tmp = managed_dir.join("tasks.json.tmp");
+    std::fs::write(&tmp, &verified.artifact)?;
+    std::fs::rename(&tmp, managed_dir.join("tasks.json"))?;
     std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
     Ok(verified.epoch)
 }
