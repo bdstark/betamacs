@@ -39,7 +39,7 @@ case "${1:-}" in
   sign)
     FILE="${2:-}"
     [ -f "$FILE" ] || { echo "usage: author-key.sh sign <package.json> [ttl-seconds]" >&2; exit 1; }
-    TTL="${3:-3600}"
+    TTL="${3:-604800}"
     if [ -n "${BETAMACS_AUTHOR_SECRET:-}" ]; then
       : "${TYPESERVER_URL:?TYPESERVER_URL required for remote signing}"
       : "${TYPESERVER_SESSION:?TYPESERVER_SESSION (ts_session cookie) required for remote signing}"

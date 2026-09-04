@@ -57,7 +57,7 @@ PYEOF
     # BETAMACS_AUTHOR_SECRET is set) or a local key — upload the
     # author-signed wrapper; a pinned fleet refuses anything else.
     if [ -n "${BETAMACS_AUTHOR_SECRET:-}" ] || [ -f "${BETAMACS_AUTHOR_KEY:-$ROOT/author-key.pem}" ]; then
-      "$ROOT/scripts/author-key.sh" sign "$FILE" "${BETAMACS_AUTHOR_TTL:-3600}"
+      "$ROOT/scripts/author-key.sh" sign "$FILE" "${BETAMACS_AUTHOR_TTL:-604800}"
       FILE="$FILE.authored"
     elif [ -f "$ROOT/author-pubkey.pem" ]; then
       echo "WARNING: author-pubkey.pem exists but no author key found —" >&2
@@ -123,7 +123,7 @@ json.dump(bank, open(sys.argv[2], "w"), indent=2)
 PYEOF
     FILE="$HASHED"
     if [ -n "${BETAMACS_AUTHOR_SECRET:-}" ] || [ -f "${BETAMACS_AUTHOR_KEY:-$ROOT/author-key.pem}" ]; then
-      "$ROOT/scripts/author-key.sh" sign "$FILE" "${BETAMACS_AUTHOR_TTL:-3600}"
+      "$ROOT/scripts/author-key.sh" sign "$FILE" "${BETAMACS_AUTHOR_TTL:-604800}"
       FILE="$FILE.authored"
     elif [ -f "$ROOT/author-pubkey.pem" ]; then
       echo "WARNING: author-pubkey.pem exists but no author key found —" >&2
