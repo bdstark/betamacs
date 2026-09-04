@@ -214,9 +214,23 @@ struct FocusState {
 
 /// Advance the same-tab focus timer for one sample and trip a timed lockout
 /// when the active dwell on one URL exceeds the limit. Dwell accrues only
-/// while the user is NOT idle (active scrolling); passive video watching is
-/// idle and pauses it. Whitelisted hosts are exempt; a non-empty blacklist
-/// restricts monitoring to listed hosts.
+/// while the user is NOT idle; passive video watching is idle and pauses it.
+/// Whitelisted hosts are exempt; a non-empty blacklist restricts monitoring
+/// to listed hosts.
+///
+/// DESIGN NOTE — "active" here means *any* recent input (idle timer), which
+/// is a proxy for scrolling, not scrolling itself. So legitimate focused
+/// work on one page — reading while highlighting text, or writing an email —
+/// keeps input alive and would count toward the limit. Two mitigations:
+///   1. (in use) Scope with `blacklist_hosts` to feed/time-sink sites, so
+///      reading/writing on unlisted sites is never monitored. On a feed,
+///      "active" ≈ scrolling anyway.
+///   2. (future) Count real scroll events with a `CGEventTap` on
+///      `scrollWheel`, so only actual scrolling accrues (reading/typing with
+///      little scroll is exempt everywhere). More precise and site-list-free,
+///      but requires the heavier Accessibility/input-monitoring TCC grant, so
+///      it is deliberately not used yet. Add it if whole-web doomscroll
+///      detection (independent of a blacklist) is wanted.
 fn track_focus(
     fl: &FocusLimitSettings,
     health: &Health,
