@@ -35,6 +35,22 @@ pub fn spawn(health: Arc<Health>, handle: OverlayHandle) {
     });
 }
 
+/// Plain-language rendering of a daemon `quarantine.reason` for the HUD. Kept
+/// in sync with betamacsd's `QReason::as_str`. An unknown/future reason falls
+/// back to a generic "network locked" so a newer daemon never renders blank.
+fn lockdown_phrase(reason: &str) -> &'static str {
+    match reason {
+        "exposure" => "too many exposures",
+        "focus" => "too much scrolling",
+        "challenge" => "unanswered challenge",
+        "earned-gate" => "earn time to unlock (allowlist only)",
+        "clock-tamper" => "clock tampered",
+        "capture-unhealthy" => "screen recording off",
+        "heartbeat-stale" | "session/health" => "censor not reporting",
+        _ => "network locked",
+    }
+}
+
 fn compose(health: &Health) -> String {
     let d = daemon_status();
     let f = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_f64());
@@ -64,16 +80,41 @@ fn compose(health: &Health) -> String {
     let heartbeat = i("heartbeatAgeSecs");
     let tasks_epoch = i("tasksEpoch").unwrap_or(0);
 
-    let lockdown = if clock_tamper {
-        "LOCKED — clock tampered".to_string()
-    } else if lockout > 0 {
-        format!("LOCKED — timed penalty, {lockout}s left")
-    } else if challenge_overdue {
-        "LOCKED — unanswered challenge".to_string()
-    } else if gate && balance.is_some_and(|b| b <= 0.0) {
-        "LOCKED — earn time (allowlist only)".to_string()
-    } else {
-        "open".to_string()
+    // The lockdown line is driven by the daemon's authoritative `quarantine`
+    // object (active/reason/secsLeft) so it ALWAYS matches what pf is actually
+    // doing — previously this was re-derived here from a subset of signals and
+    // read "open" during full quarantines the daemon raised for other reasons
+    // (capture revoked, stale heartbeat, session/health). If the daemon is old
+    // or unreachable and omits `quarantine`, fall back to the legacy subset.
+    let quarantine = d.as_ref().and_then(|v| v.get("quarantine"));
+    let lockdown = match quarantine {
+        Some(q) => {
+            let active = q.get("active").and_then(|x| x.as_bool()).unwrap_or(false);
+            let reason = q.get("reason").and_then(|x| x.as_str()).unwrap_or("none");
+            let secs_left = q.get("secsLeft").and_then(|x| x.as_i64()).unwrap_or(0);
+            if !active {
+                "open".to_string()
+            } else {
+                let mut line = format!("LOCKED — {}", lockdown_phrase(reason));
+                if secs_left > 0 {
+                    line += &format!(", {secs_left}s left");
+                }
+                line
+            }
+        }
+        None => {
+            if clock_tamper {
+                "LOCKED — clock tampered".to_string()
+            } else if lockout > 0 {
+                format!("LOCKED — timed penalty, {lockout}s left")
+            } else if challenge_overdue {
+                "LOCKED — unanswered challenge".to_string()
+            } else if gate && balance.is_some_and(|b| b <= 0.0) {
+                "LOCKED — earn time (allowlist only)".to_string()
+            } else {
+                "open".to_string()
+            }
+        }
     };
 
     let mut s = String::new();

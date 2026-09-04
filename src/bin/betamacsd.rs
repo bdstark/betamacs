@@ -58,6 +58,17 @@ impl Paths {
     }
 }
 
+/// Which agent signal set the current `exposure_penalty_until` deadline.
+/// Both the exposure-budget trip and the same-tab focus limit fold into one
+/// timed lockout deadline; this remembers WHICH so the quarantine reason
+/// reported to the HUD is accurate ("too many exposures" vs "too much
+/// scrolling") rather than a generic "timed penalty".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PenaltySource {
+    Exposure,
+    Focus,
+}
+
 /// Last heartbeat seen from the agent.
 #[derive(Clone)]
 struct AgentState {
@@ -75,6 +86,9 @@ struct AgentState {
     /// Computed here from the heartbeat's requested penalty so the lockout
     /// survives the agent being killed.
     exposure_penalty_until: Option<Instant>,
+    /// Which signal owns the current `exposure_penalty_until` (whichever set
+    /// the standing deadline). None when no timed penalty is active.
+    penalty_source: Option<PenaltySource>,
     /// The agent detected the wall clock being CHANGED under a running
     /// instance — treated as tamper (quarantine), the same as a shut-down
     /// censor, until it clears.
@@ -94,6 +108,7 @@ impl Default for AgentState {
             enabled: true,
             challenge_overdue: false,
             exposure_penalty_until: None,
+            penalty_source: None,
             clock_tamper: false,
             last_clock_resync: None,
         }
@@ -289,6 +304,45 @@ enum QMode {
     Earning(Vec<String>),
 }
 
+/// Why the daemon is (or would be) fully blocking the network — the single
+/// source of truth for the "why is the internet off" question surfaced in the
+/// `status` reply and the HUD. `None` means no full block is in effect. Each
+/// variant maps to a stable wire string via `as_str`.
+///
+/// Timed variants (Exposure/Focus) carry a countdown via
+/// `AgentState::exposure_penalty_until`; EarnedGate is a legitimate
+/// no-countdown gate (spend earned time to lift it); the rest are health/tamper
+/// blocks that clear the moment the underlying condition clears.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum QReason {
+    #[default]
+    None,
+    Exposure,
+    Focus,
+    Challenge,
+    EarnedGate,
+    ClockTamper,
+    CaptureUnhealthy,
+    HeartbeatStale,
+    SessionHealth,
+}
+
+impl QReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            QReason::None => "none",
+            QReason::Exposure => "exposure",
+            QReason::Focus => "focus",
+            QReason::Challenge => "challenge",
+            QReason::EarnedGate => "earned-gate",
+            QReason::ClockTamper => "clock-tamper",
+            QReason::CaptureUnhealthy => "capture-unhealthy",
+            QReason::HeartbeatStale => "heartbeat-stale",
+            QReason::SessionHealth => "session/health",
+        }
+    }
+}
+
 struct Quarantine {
     engaged: Option<QMode>,
     unhealthy_since: Option<Instant>,
@@ -335,21 +389,34 @@ impl Quarantine {
         }
     }
 
-    /// Does a FULL-block reason apply right now (tamper/exposure/challenge)?
-    /// Healthy means: no active console session, censoring disabled by
-    /// policy, or a fresh heartbeat with working capture — and no unanswered
-    /// challenge. A tripped exposure budget forces a full block for its
-    /// fixed duration regardless of health. Pure decision; `apply` does pf.
-    fn want_full(&mut self, agent: &AgentState) -> bool {
+    /// Which FULL-block reason applies right now, or `QReason::None` when the
+    /// censor is healthy. This is the daemon's authoritative "why is the net
+    /// off" decision (minus the earned-time gate, which the caller folds in).
+    ///
+    /// Precedence, highest first:
+    ///   1. A timed penalty (exposure budget / same-tab focus) — immediate, no
+    ///      grace, supersedes everything; the reason names which one set it.
+    ///   2. A health/tamper reason (see `unhealthy_reason`) — but only after it
+    ///      has persisted past the grace window (debounced by `unhealthy_since`)
+    ///      so a transient blip doesn't quarantine.
+    ///
+    /// Pure decision; `apply` does the pf work.
+    fn want_full(&mut self, agent: &AgentState) -> QReason {
         if !self.armed {
-            return false;
+            return QReason::None;
         }
         if agent
             .exposure_penalty_until
             .is_some_and(|until| until > Instant::now())
         {
             self.unhealthy_since = None;
-            return true;
+            return match agent.penalty_source {
+                Some(PenaltySource::Focus) => QReason::Focus,
+                // Default to exposure if the source was somehow not recorded
+                // (e.g. a deadline restored across a restart) — never lie by
+                // reporting "none" while a timed lockout is in force.
+                _ => QReason::Exposure,
+            };
         }
         let session_active = std::fs::metadata("/dev/console")
             .map(|m| {
@@ -357,20 +424,50 @@ impl Quarantine {
                 m.uid() != 0
             })
             .unwrap_or(false);
-        let healthy = (!session_active
-            || !agent.enabled
-            || (agent
-                .last_seen
-                .is_some_and(|t| t.elapsed() < HEARTBEAT_FRESH)
-                && agent.capture_ok))
-            && !agent.challenge_overdue
-            && !agent.clock_tamper;
-        if healthy {
+        let reason = Self::unhealthy_reason(agent, session_active);
+        if reason == QReason::None {
             self.unhealthy_since = None;
-            return false;
+            return QReason::None;
         }
         let since = *self.unhealthy_since.get_or_insert_with(Instant::now);
-        since.elapsed() >= self.grace
+        if since.elapsed() >= self.grace {
+            reason
+        } else {
+            QReason::None
+        }
+    }
+
+    /// The non-timed full-block reason that applies to `agent` right now,
+    /// ignoring the grace debounce (that is `want_full`'s job). `None` when the
+    /// censor is healthy: no active console session, censoring disabled by
+    /// policy, or a fresh heartbeat with working capture — and no unanswered
+    /// challenge or clock tamper. `session_active` is whether a non-root
+    /// console session is logged in (passed in so this stays pure and
+    /// unit-testable; `want_full` reads /dev/console for it). Split out so the
+    /// reason-selection is unit-testable.
+    fn unhealthy_reason(agent: &AgentState, session_active: bool) -> QReason {
+        // Tamper first: a mid-run clock change is a hard signal regardless of
+        // session/heartbeat state.
+        if agent.clock_tamper {
+            return QReason::ClockTamper;
+        }
+        if agent.challenge_overdue {
+            return QReason::Challenge;
+        }
+        // An unprotected console session: someone is logged in and policy has
+        // censoring on, yet the agent isn't demonstrably protecting the
+        // screen. Pin the specific failure so the HUD can name it.
+        if session_active && agent.enabled {
+            if !agent.capture_ok {
+                return QReason::CaptureUnhealthy; // Screen Recording revoked
+            }
+            match agent.last_seen {
+                Some(t) if t.elapsed() >= HEARTBEAT_FRESH => return QReason::HeartbeatStale,
+                None => return QReason::SessionHealth, // agent never checked in
+                _ => {}                                // fresh + capture ok → healthy
+            }
+        }
+        QReason::None
     }
 
     /// Reconcile the pf anchor to the desired mode: `None` releases,
@@ -525,6 +622,11 @@ fn main() -> Result<()> {
 
     let agent: Arc<Mutex<AgentState>> = Arc::default();
     let earned: Arc<Mutex<EarnedGate>> = Arc::new(Mutex::new(EarnedGate::new(&paths)));
+    // The watchdog loop's latest full-block reason (including the earned-time
+    // gate), published here so the `status` handler reports the ACTUAL block
+    // state instead of re-deriving it from a subset of signals. Refreshed each
+    // watchdog tick; timed countdowns are recomputed live in the handler.
+    let quarantine_reason: Arc<Mutex<QReason>> = Arc::new(Mutex::new(QReason::None));
 
     // Socket listener thread.
     let _ = std::fs::remove_file(&paths.socket);
@@ -539,6 +641,7 @@ fn main() -> Result<()> {
     {
         let agent = agent.clone();
         let earned = earned.clone();
+        let quarantine_reason = quarantine_reason.clone();
         let managed_dir = paths.managed_dir.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -546,10 +649,18 @@ fn main() -> Result<()> {
                     Ok(stream) => {
                         let agent = agent.clone();
                         let earned = earned.clone();
+                        let quarantine_reason = quarantine_reason.clone();
                         let managed_dir = managed_dir.clone();
                         let verifier = verifier.clone();
                         std::thread::spawn(move || {
-                            handle_client(stream, &agent, &earned, &managed_dir, verifier.as_ref())
+                            handle_client(
+                                stream,
+                                &agent,
+                                &earned,
+                                &quarantine_reason,
+                                &managed_dir,
+                                verifier.as_ref(),
+                            )
                         });
                     }
                     Err(e) => tracing::warn!("accept failed: {e}"),
@@ -566,12 +677,23 @@ fn main() -> Result<()> {
         watch_agent(&agent);
         // Full-block reasons (tamper/exposure/challenge) take precedence over
         // the earned-time gate; a depleted gate falls back to earning-mode.
-        let want_full = quarantine.want_full(&agent.lock().unwrap().clone());
+        let full_reason = quarantine.want_full(&agent.lock().unwrap().clone());
+        let want_full = full_reason != QReason::None;
         let earning = earned.lock().unwrap().tick(want_full);
         let desired = if want_full {
             Some(QMode::Full)
         } else {
-            earning.map(QMode::Earning)
+            earning.clone().map(QMode::Earning)
+        };
+        // Publish the effective reason for the status handler: a full block's
+        // reason, else the earned-time gate when it engages earning-mode, else
+        // none. This is the single source of truth the HUD reads.
+        *quarantine_reason.lock().unwrap() = if want_full {
+            full_reason
+        } else if earning.is_some() {
+            QReason::EarnedGate
+        } else {
+            QReason::None
         };
         quarantine.apply(desired);
         if last_integrity.elapsed() >= Duration::from_secs(600) {
@@ -585,6 +707,7 @@ fn handle_client(
     stream: UnixStream,
     agent: &Mutex<AgentState>,
     earned: &Mutex<EarnedGate>,
+    quarantine_reason: &Mutex<QReason>,
     managed_dir: &Path,
     verifier: Option<&envelope::Verifier>,
 ) {
@@ -627,10 +750,13 @@ fn handle_client(
                     let secs = msg.get("exposurePenaltySec").and_then(|v| v.as_u64()).unwrap_or(0);
                     if secs > 0 {
                         let until = Instant::now() + Duration::from_secs(secs);
-                        a.exposure_penalty_until = Some(match a.exposure_penalty_until {
-                            Some(prev) if prev > until => prev, // keep the longer standing lockout
-                            _ => until,
-                        });
+                        // Keep the longer standing lockout; the source follows
+                        // whichever deadline actually stands, so the reported
+                        // reason matches the countdown the HUD shows.
+                        if a.exposure_penalty_until.is_none_or(|prev| until >= prev) {
+                            a.exposure_penalty_until = Some(until);
+                            a.penalty_source = Some(PenaltySource::Exposure);
+                        }
                         tracing::warn!("agent reports exposure over budget — network lockout for {secs}s");
                     }
                 }
@@ -644,10 +770,10 @@ fn handle_client(
                     let secs = msg.get("focusPenaltySec").and_then(|v| v.as_u64()).unwrap_or(0);
                     if secs > 0 {
                         let until = Instant::now() + Duration::from_secs(secs);
-                        a.exposure_penalty_until = Some(match a.exposure_penalty_until {
-                            Some(prev) if prev > until => prev,
-                            _ => until,
-                        });
+                        if a.exposure_penalty_until.is_none_or(|prev| until >= prev) {
+                            a.exposure_penalty_until = Some(until);
+                            a.penalty_source = Some(PenaltySource::Focus);
+                        }
                         tracing::warn!("agent reports same-tab focus limit — network lockout for {secs}s");
                     }
                 }
@@ -776,8 +902,18 @@ fn handle_client(
                 let assigned_tz = std::fs::read_to_string(managed_dir.join("assigned-timezone"))
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
+                // The authoritative block state, from the watchdog loop. The
+                // countdown is recomputed live here (the watchdog only ticks
+                // every 15s) so the HUD's timer is smooth; only timed penalties
+                // (exposure/focus) carry one — every other reason is a gate.
+                let reason = *quarantine_reason.lock().unwrap();
+                let quarantine_active = reason != QReason::None;
+                let quarantine_left = match reason {
+                    QReason::Exposure | QReason::Focus => quarantine_secs.max(0),
+                    _ => 0,
+                };
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
@@ -791,6 +927,9 @@ fn handle_client(
                     earned_balance_min,
                     earned_gate_active,
                     earned_today_min,
+                    quarantine_active,
+                    reason.as_str(),
+                    quarantine_left,
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());
@@ -1273,5 +1412,157 @@ mod earned_tests {
         g.ledger.balance_min = 0.0;
         assert!(g.tick(false).is_none());
         let _ = std::fs::remove_file("/tmp/bm-earn-t5.json");
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    // A healthy agent: session-protected, fresh heartbeat, capture ok, no
+    // penalties/tamper/challenge. Individual tests flip one field.
+    fn healthy_agent() -> AgentState {
+        AgentState {
+            last_seen: Some(Instant::now()),
+            pid: 1234,
+            capture_ok: true,
+            config_epoch: 1,
+            enabled: true,
+            challenge_overdue: false,
+            exposure_penalty_until: None,
+            penalty_source: None,
+            clock_tamper: false,
+            last_clock_resync: None,
+        }
+    }
+
+    // An armed quarantine with zero grace, so want_full returns a health
+    // reason on the first unhealthy call rather than waiting out the debounce.
+    fn quarantine_no_grace() -> Quarantine {
+        Quarantine {
+            engaged: None,
+            unhealthy_since: None,
+            armed: true,
+            dry_run: true,
+            grace: Duration::ZERO,
+            rules_path: PathBuf::from("/tmp/bm-quar-test.rules"),
+        }
+    }
+
+    // session_active = true throughout: an unprotected logged-in session is
+    // the case the health reasons care about.
+    #[test]
+    fn healthy_is_none() {
+        assert_eq!(
+            Quarantine::unhealthy_reason(&healthy_agent(), true),
+            QReason::None
+        );
+    }
+
+    #[test]
+    fn capture_revoked_is_capture_unhealthy() {
+        let mut a = healthy_agent();
+        a.capture_ok = false;
+        assert_eq!(
+            Quarantine::unhealthy_reason(&a, true),
+            QReason::CaptureUnhealthy
+        );
+    }
+
+    #[test]
+    fn stale_heartbeat_is_heartbeat_stale() {
+        let mut a = healthy_agent();
+        a.last_seen = Some(Instant::now() - HEARTBEAT_FRESH - Duration::from_secs(5));
+        assert_eq!(
+            Quarantine::unhealthy_reason(&a, true),
+            QReason::HeartbeatStale
+        );
+    }
+
+    #[test]
+    fn never_seen_is_session_health() {
+        let mut a = healthy_agent();
+        a.last_seen = None;
+        assert_eq!(
+            Quarantine::unhealthy_reason(&a, true),
+            QReason::SessionHealth
+        );
+    }
+
+    #[test]
+    fn challenge_and_tamper_take_priority() {
+        // Challenge and tamper apply even when the session itself is protected
+        // (fresh, capture ok) and regardless of session_active.
+        let mut a = healthy_agent();
+        a.challenge_overdue = true;
+        assert_eq!(Quarantine::unhealthy_reason(&a, false), QReason::Challenge);
+        a.clock_tamper = true; // tamper outranks challenge
+        assert_eq!(Quarantine::unhealthy_reason(&a, true), QReason::ClockTamper);
+    }
+
+    #[test]
+    fn no_session_is_healthy() {
+        // Capture unhealthy but nobody is logged in → not a block.
+        let mut a = healthy_agent();
+        a.capture_ok = false;
+        assert_eq!(Quarantine::unhealthy_reason(&a, false), QReason::None);
+    }
+
+    #[test]
+    fn disabled_policy_is_healthy() {
+        // Censoring off by policy → an unhealthy capture is healthy-by-policy.
+        let mut a = healthy_agent();
+        a.enabled = false;
+        a.capture_ok = false;
+        assert_eq!(Quarantine::unhealthy_reason(&a, true), QReason::None);
+    }
+
+    #[test]
+    fn timed_penalty_names_its_source() {
+        let mut q = quarantine_no_grace();
+        let mut a = healthy_agent();
+        a.exposure_penalty_until = Some(Instant::now() + Duration::from_secs(600));
+        a.penalty_source = Some(PenaltySource::Exposure);
+        assert_eq!(q.want_full(&a), QReason::Exposure);
+        a.penalty_source = Some(PenaltySource::Focus);
+        assert_eq!(q.want_full(&a), QReason::Focus);
+        // Missing source but a live deadline → default to exposure, never None.
+        a.penalty_source = None;
+        assert_eq!(q.want_full(&a), QReason::Exposure);
+    }
+
+    #[test]
+    fn expired_penalty_is_not_a_reason() {
+        let mut q = quarantine_no_grace();
+        let mut a = healthy_agent();
+        a.exposure_penalty_until = Some(Instant::now() - Duration::from_secs(1));
+        a.penalty_source = Some(PenaltySource::Exposure);
+        // Deadline passed and the session is otherwise healthy → open.
+        assert_eq!(q.want_full(&a), QReason::None);
+    }
+
+    #[test]
+    fn disarmed_is_never_a_reason() {
+        let mut q = quarantine_no_grace();
+        q.armed = false;
+        let mut a = healthy_agent();
+        a.clock_tamper = true;
+        assert_eq!(q.want_full(&a), QReason::None);
+    }
+
+    #[test]
+    fn grace_debounces_health_reasons() {
+        // A health reason is withheld until it has persisted past the grace
+        // window; a timed penalty is immediate (no grace).
+        let mut q = quarantine_no_grace();
+        q.grace = Duration::from_secs(3600);
+        let mut a = healthy_agent();
+        a.challenge_overdue = true;
+        assert_eq!(q.want_full(&a), QReason::None); // within grace
+        // But an exposure penalty bypasses grace entirely.
+        a.challenge_overdue = false;
+        a.exposure_penalty_until = Some(Instant::now() + Duration::from_secs(600));
+        a.penalty_source = Some(PenaltySource::Exposure);
+        assert_eq!(q.want_full(&a), QReason::Exposure);
     }
 }

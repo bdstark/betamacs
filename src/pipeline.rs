@@ -788,7 +788,7 @@ pub fn run(
             {
                 exposure.last_warn = Some(now);
                 tracing::info!("exposure over warn threshold — showing prompt");
-                crate::prompt::warn(
+                crate::prompt::warn_exposure(
                     "Are you looking at appropriate content?\n\nA lot of flagged content has been detected. Please make a better choice.",
                 );
             }
