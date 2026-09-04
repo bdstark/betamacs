@@ -371,17 +371,37 @@ pub fn run(
                 highlights.clear();
                 health.boxes.store(0, Ordering::Relaxed);
                 overlay.set_regions(Vec::new())?;
+                // Detection is the only consumer of capture, so when censoring
+                // is off by policy there is nothing to capture FOR: tear the
+                // streams down entirely (macOS drops the screen-recording
+                // indicator) rather than recording frames only to discard them.
+                capturer.stop_streams();
+                health.streams.store(0, Ordering::Relaxed);
                 let _ = overlay.set_status("censoring disabled by policy".into());
-                tracing::warn!("censoring disabled by policy");
+                tracing::warn!("censoring disabled by policy — capture stopped");
             }
-            while capturer.try_recv().is_some() {}
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
         if !was_enabled {
-            was_enabled = true;
-            tracing::info!("censoring re-enabled by policy");
-            menubar_status(&capturer, &loaded_model, &overlay);
+            // Rebuild the streams that were stopped on disable; only clear the
+            // flag on a successful restart so a failed rebuild is retried.
+            match SckCapturer::new(cfg.detection.capture_fps) {
+                Ok(new_capturer) => {
+                    capturer = new_capturer;
+                    last_frame_at.clear();
+                    probe_hashes.clear();
+                    streams_started = Instant::now();
+                    last_exclusion_attempt = None;
+                    was_enabled = true;
+                    menubar_status(&capturer, &loaded_model, &overlay);
+                    tracing::info!("censoring re-enabled by policy — capture restarted");
+                }
+                Err(e) => {
+                    health.capture_ok.store(false, Ordering::Relaxed);
+                    tracing::error!("capture restart on re-enable failed: {e}");
+                }
+            }
         }
 
         // Screen-recording whitelist by frontmost app. When a whitelisted
