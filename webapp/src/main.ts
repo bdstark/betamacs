@@ -5,17 +5,26 @@ import { customElement, state } from "lit/decorators.js";
 import { store } from "./store.js";
 import "./components/controls.js";
 import "./components/layers.js";
+import "./components/publish.js";
+import "./components/assignment.js";
 import "./modules/detection.js";
 import "./modules/censor.js";
 import "./modules/challenge.js";
 import "./modules/exposure.js";
+import "./modules/clock.js";
+import "./modules/coverage.js";
+import "./modules/exclusions.js";
 
 const TABS = [
   { id: "detection", label: "Detection engine" },
   { id: "censor", label: "Black box censor" },
   { id: "challenge", label: "Activity challenges" },
   { id: "exposure", label: "Exposure budget" },
+  { id: "coverage", label: "Coverage escalation" },
+  { id: "exclusions", label: "Capture exclusions" },
+  { id: "clock", label: "Clock integrity" },
   { id: "layers", label: "Layers & package" },
+  { id: "assignment", label: "Devices" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
@@ -42,6 +51,15 @@ export class BmApp extends LitElement {
       color: var(--muted);
       font-size: 13px;
     }
+    details.dev {
+      margin-bottom: 16px;
+    }
+    details.dev summary {
+      color: var(--muted);
+      font-size: 12.5px;
+      cursor: pointer;
+      padding: 4px 2px;
+    }
     .connection {
       display: flex;
       gap: 8px;
@@ -51,7 +69,7 @@ export class BmApp extends LitElement {
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 10px 14px;
-      margin-bottom: 16px;
+      margin-top: 8px;
     }
     .connection input {
       background: var(--bg);
@@ -150,12 +168,16 @@ export class BmApp extends LitElement {
     return html`
       <header>
         <h1>betamacs</h1>
-        <span class="tag">settings</span>
+        <span class="tag">config</span>
         ${store.managed
           ? html`<span class="tag" title="Settings are pushed by the fleet; local changes are refused.">managed — read-only</span>`
           : null}
       </header>
 
+      <bm-store-bar></bm-store-bar>
+
+      <details class="dev">
+        <summary>Live app (dev): push/pull a running betamacs</summary>
       <div class="connection">
         <input
           class="url"
@@ -179,6 +201,7 @@ export class BmApp extends LitElement {
         </button>
         <span class="status">${store.status}</span>
       </div>
+      </details>
 
       <nav>
         ${TABS.map(
@@ -197,7 +220,11 @@ export class BmApp extends LitElement {
       ${this.tab === "censor" ? html`<bm-censor-module></bm-censor-module>` : ""}
       ${this.tab === "challenge" ? html`<bm-challenge-module></bm-challenge-module>` : ""}
       ${this.tab === "exposure" ? html`<bm-exposure-module></bm-exposure-module>` : ""}
+      ${this.tab === "coverage" ? html`<bm-coverage-module></bm-coverage-module>` : ""}
+      ${this.tab === "exclusions" ? html`<bm-exclusions-module></bm-exclusions-module>` : ""}
+      ${this.tab === "clock" ? html`<bm-clock-module></bm-clock-module>` : ""}
       ${this.tab === "layers" ? html`<bm-layers></bm-layers>` : ""}
+      ${this.tab === "assignment" ? html`<bm-assignment></bm-assignment>` : ""}
     `;
   }
 }

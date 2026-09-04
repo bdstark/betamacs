@@ -275,6 +275,32 @@ export interface ClockIntegritySettings {
 }
 export type ClockIntegrityPatch = Partial<ClockIntegritySettings>;
 
+// --------------------------------------------------------- coverage escalation
+// When flagged content keeps accumulating over a window, grow the censor box
+// scale so repeated/edge exposure is covered more aggressively; decays back to
+// baseline when activity subsides. Reuses the exposure metrics. Disabled by
+// default.
+export interface CoverageEscalationSettings {
+  enabled: boolean;
+  metric: ExposureMetric;
+  threshold: number;
+  windowSec: number;
+  startScale: number;
+  growthPerUnit: number;
+  maxScale: number;
+  decayPerSec: number;
+}
+export type CoverageEscalationPatch = Partial<CoverageEscalationSettings>;
+
+// ---------------------------------------------------------- capture exclusions
+// Apps whose windows are never captured/scanned (by bundle id). Disabled by
+// default with an empty list.
+export interface CaptureExclusionSettings {
+  enabled: boolean;
+  bundleIds: string[];
+}
+export type CaptureExclusionPatch = Partial<CaptureExclusionSettings>;
+
 export interface ModulePatches {
   detection?: DetectionPatch;
   censor?: CensorPatch;
@@ -283,6 +309,8 @@ export interface ModulePatches {
   earnedTime?: EarnedTimePatch;
   focusLimit?: FocusLimitPatch;
   clockIntegrity?: ClockIntegrityPatch;
+  coverageEscalation?: CoverageEscalationPatch;
+  captureExclusions?: CaptureExclusionPatch;
 }
 
 export interface NamedConfig {
@@ -307,6 +335,8 @@ export interface Effective {
   earnedTime: EarnedTimeSettings;
   focusLimit: FocusLimitSettings;
   clockIntegrity: ClockIntegritySettings;
+  coverageEscalation: CoverageEscalationSettings;
+  captureExclusions: CaptureExclusionSettings;
 }
 
 export function defaultDetection(): DetectionSettings {
@@ -461,6 +491,26 @@ export function defaultClockIntegrity(): ClockIntegritySettings {
   };
 }
 
+export function defaultCoverageEscalation(): CoverageEscalationSettings {
+  return {
+    enabled: false,
+    metric: "events",
+    threshold: 20,
+    windowSec: 300,
+    startScale: 1.5,
+    growthPerUnit: 0.05,
+    maxScale: 3.0,
+    decayPerSec: 0.1,
+  };
+}
+
+export function defaultCaptureExclusions(): CaptureExclusionSettings {
+  return {
+    enabled: false,
+    bundleIds: [],
+  };
+}
+
 export function resolve(pkg: Package): Effective {
   const effective: Effective = {
     detection: defaultDetection(),
@@ -470,6 +520,8 @@ export function resolve(pkg: Package): Effective {
     earnedTime: defaultEarnedTime(),
     focusLimit: defaultFocusLimit(),
     clockIntegrity: defaultClockIntegrity(),
+    coverageEscalation: defaultCoverageEscalation(),
+    captureExclusions: defaultCaptureExclusions(),
   };
   const layerPatches = pkg.layers
     .map((name) => pkg.namedConfigs.find((c) => c.name === name)?.settings)
@@ -482,6 +534,10 @@ export function resolve(pkg: Package): Effective {
     if (patches.earnedTime) Object.assign(effective.earnedTime, patches.earnedTime);
     if (patches.focusLimit) Object.assign(effective.focusLimit, patches.focusLimit);
     if (patches.clockIntegrity) Object.assign(effective.clockIntegrity, patches.clockIntegrity);
+    if (patches.coverageEscalation)
+      Object.assign(effective.coverageEscalation, patches.coverageEscalation);
+    if (patches.captureExclusions)
+      Object.assign(effective.captureExclusions, patches.captureExclusions);
   }
   effective.censor.textOverlay.lines = resolveTextLines(pkg, effective.censor.textOverlay);
   return effective;

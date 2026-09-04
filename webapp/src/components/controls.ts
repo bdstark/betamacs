@@ -255,6 +255,49 @@ export class BmText extends Field {
   }
 }
 
+@customElement("bm-list")
+export class BmList extends Field {
+  static styles = [
+    fieldStyles,
+    css`
+      .row {
+        grid-template-columns: 1fr;
+      }
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 68px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px;
+        font: inherit;
+        font-size: 13px;
+      }
+    `,
+  ];
+  /** One entry per line; blank lines are dropped. */
+  @property({ type: Array }) value: string[] = [];
+  @property() placeholder = "";
+
+  render() {
+    return this.row(html`
+      <textarea
+        placeholder=${this.placeholder}
+        .value=${this.value.join("\n")}
+        @change=${(e: Event) =>
+          this.emit(
+            (e.target as HTMLTextAreaElement).value
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean),
+          )}
+      ></textarea>
+    `);
+  }
+}
+
 @customElement("bm-section")
 export class BmSection extends LitElement {
   static styles = css`

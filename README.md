@@ -102,9 +102,9 @@ token over in the URL fragment so no paste is needed.
 ## Setup
 
 ```bash
-scripts/fetch-model.sh 320n   # or 640m
-cargo run --release           # continuous censoring, 320n model
-cargo run --release -- 640m   # more accurate model, slower
+scripts/fetch-model.sh 640m   # or 320n
+cargo run --release           # continuous censoring, 640m model
+cargo run --release -- 320n   # faster, less accurate model
 cargo run --release -- probe  # one-shot capture + detection with timings
 cargo run --release -- demo   # 8s black box + capture-exclusion self-check
 ```

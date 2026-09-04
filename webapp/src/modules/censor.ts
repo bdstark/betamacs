@@ -7,6 +7,7 @@ import {
   type BlurSettings,
   type CensorPatch,
   type CensorSettings,
+  type ImageSettings,
   type MosaicSettings,
   type StaticSettings,
   type TextOverlay,
@@ -96,9 +97,30 @@ export class BmCensorModule extends LitElement {
     setOverride("staticNoise", { ...store.effective.censor.staticNoise, ...patch });
   }
 
+  private setImage(patch: Partial<ImageSettings>) {
+    setOverride("image", { ...store.effective.censor.image, ...patch });
+  }
+
+  /** Read a picked file, store its bytes as base64 (clears any path). */
+  private async onImageFile(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const buf = await file.arrayBuffer();
+    let binary = "";
+    for (const byte of new Uint8Array(buf)) binary += String.fromCharCode(byte);
+    this.setImage({ data: btoa(binary), path: "" });
+  }
+
   /** CSS approximation of the interior for the preview box. */
   private previewInterior(c: CensorSettings): string {
     switch (c.mode) {
+      case "image":
+        if (c.image.data)
+          return `background:#000 center/${
+            c.image.fit === "stretch" ? "100% 100%" : c.image.fit
+          } no-repeat url("data:image;base64,${c.image.data}")`;
+        return `background:${c.fillColor}`;
       case "blur":
         return `background:linear-gradient(115deg,#c98,#967 40%,#789 60%,#546);filter:blur(${Math.min(c.blur.intensity / 3, 12)}px)`;
       case "mosaic": {
@@ -157,6 +179,7 @@ export class BmCensorModule extends LitElement {
           label="Mode"
           hint="How box interiors render; options below adapt to the mode"
           .options=${[
+            { value: "image", label: "Image" },
             { value: "box", label: "Solid box" },
             { value: "blur", label: "Blur" },
             { value: "mosaic", label: "Mosaic" },
@@ -181,6 +204,58 @@ export class BmCensorModule extends LitElement {
         ></bm-slider>
       </bm-section>
 
+      ${c.mode === "image"
+        ? html`<bm-section heading="Image">
+            <label class="muted" style="display:block;margin-bottom:8px">
+              Cover image
+              <input
+                type="file"
+                accept="image/*"
+                style="display:block;margin-top:6px"
+                @change=${(e: Event) => this.onImageFile(e)}
+              />
+            </label>
+            <div class="muted" style="margin-bottom:10px">
+              ${c.image.data
+                ? `Embedded image set (${Math.round((c.image.data.length * 3) / 4 / 1024)} KB).`
+                : c.image.path
+                  ? `Using file path: ${c.image.path}`
+                  : "No image set — boxes fall back to a solid fill until one is chosen."}
+              ${c.image.data
+                ? html` ·
+                    <a
+                      href="#"
+                      @click=${(e: Event) => {
+                        e.preventDefault();
+                        this.setImage({ data: "" });
+                      }}
+                      >clear</a
+                    >`
+                : ""}
+            </div>
+            <bm-select
+              label="Fit"
+              hint="How the image scales to each detection box"
+              .options=${[
+                { value: "cover", label: "Cover (fill, keep aspect, crop)" },
+                { value: "contain", label: "Contain (fit inside, keep aspect)" },
+                { value: "stretch", label: "Stretch (fill exactly)" },
+              ]}
+              .value=${c.image.fit}
+              source=${src("image")}
+              @field-change=${(e: CustomEvent) => this.setImage({ fit: e.detail })}
+              @reset=${() => clearOverride("image")}
+            ></bm-select>
+            <bm-color
+              label="Backdrop color"
+              hint="Shows behind the image where it doesn't cover (Contain)"
+              .value=${c.fillColor}
+              source=${src("fillColor")}
+              @field-change=${(e: CustomEvent) => setOverride("fillColor", e.detail)}
+              @reset=${() => clearOverride("fillColor")}
+            ></bm-color>
+          </bm-section>`
+        : ""}
       ${c.mode === "box"
         ? html`<bm-section heading="Solid box">
             <bm-color
