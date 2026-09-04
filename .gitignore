@@ -7,3 +7,4 @@ webapp/dist
 /otactl-root.pem
 /author-key.pem
 *.authored
+webapp/dist-store

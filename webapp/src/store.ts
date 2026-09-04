@@ -40,14 +40,21 @@ export interface StoreConfig {
 }
 
 export function defaultStoreConfig(): StoreConfig {
+  // Default to SAME-ORIGIN typeserver endpoints so a page served from
+  // typeserver at /betamacs/ needs zero endpoint config — its publish/read
+  // calls (credentials:"include") hit the same origin that served it, and the
+  // ts_session cookie authorizes them. publisherId/backendUrl are left blank:
+  // the server holds the publisher identity + otactl backend URL (its own
+  // env), so the browser never needs the publisher/mTLS details.
+  const origin = typeof location !== "undefined" ? location.origin : "";
   return {
     app: "betamacs-config",
     channel: "stable",
     arch: "arm64",
-    backendUrl: "",
-    publisherId: "betamacs-config",
-    publishEndpoint: "",
-    readEndpoint: "",
+    backendUrl: "", // server default (OTACTL_BACKEND_URL)
+    publisherId: "", // server default (OTACTL_PUBLISHER_ID)
+    publishEndpoint: origin ? `${origin}/api/betamacs/publish` : "",
+    readEndpoint: origin ? `${origin}/api/betamacs/config` : "",
   };
 }
 

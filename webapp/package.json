@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:store": "tsc --noEmit && vite build --base=/betamacs/ --outDir dist-store --emptyOutDir",
     "preview": "vite preview"
   },
   "dependencies": {

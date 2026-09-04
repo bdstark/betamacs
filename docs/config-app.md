@@ -450,6 +450,124 @@ Users-as-targets are future (a user → device(s) mapping layer above this).
 
 ---
 
+## Hosting & deploy (v1 — typeserver-hosted, same-origin)
+
+The config app ships as a static bundle **served by typeserver itself**, behind
+the same session gate as the publish endpoint. Same-origin is the point: the
+page's `fetch` calls use `credentials:"include"`, so the `ts_session` cookie
+that authorizes the page also authorizes its publish/read calls — no CORS, no
+second login, and the browser never handles the publisher cert or backend URL.
+
+### Route
+
+`GET /betamacs` (→ redirects to `/betamacs/`) serves the app. Unauthenticated
+requests redirect to `/login.html`, matching typeserver's other operator pages.
+Assets are served under `/betamacs/assets/…`, also gated. Full page URL in
+production: `https://<typeserver-origin>/betamacs/`.
+
+Wired in `cmd/server/main.go` as a `http.StripPrefix("/betamacs/",
+http.FileServer(http.Dir("./web/betamacs")))` guarded by `auth.authorized`.
+
+### Zero-config for a fresh page
+
+`defaultStoreConfig()` (`webapp/src/store.ts`) defaults the publish/read
+endpoints to **same-origin** (`${location.origin}/api/betamacs/publish` and
+`/api/betamacs/config`) and leaves `publisherId`/`backendUrl` **blank** — the
+server supplies those from its own env. So a freshly opened page needs only:
+app name (`betamacs-config`, pre-filled), channel (`stable`, pre-filled), and
+the config content (Import JSON or edit). Publish works with no manual endpoint
+setup. (Returning browsers with a previously persisted store config keep it.)
+
+### Build the static bundle
+
+Two independent Vite outputs from the one `webapp/` source, differing only in
+base path and output dir (the on-device build is unchanged):
+
+```
+cd webapp
+npm ci                 # first time (node_modules already present in this repo)
+
+# On-device build (base "/", -> webapp/dist) — bundled into betamacs.app. UNCHANGED.
+npm run build
+
+# Store build (base "/betamacs/", -> webapp/dist-store) — for typeserver.
+npm run build:store
+```
+
+`build:store` runs `tsc --noEmit && vite build --base=/betamacs/ --outDir
+dist-store --emptyOutDir`. Then place the bundle where typeserver serves it:
+
+```
+rm -rf ../../typeserver/web/betamacs        # path to your typeserver checkout
+mkdir -p ../../typeserver/web/betamacs
+cp -R dist-store/. ../../typeserver/web/betamacs/
+```
+
+`webapp/dist-store` is gitignored in this repo; the built bundle is committed in
+the **typeserver** repo under `web/betamacs/` (typeserver serves `./web` at
+runtime and its Dockerfile copies `/web` into the image). Re-run these steps and
+re-commit typeserver whenever the app changes.
+
+### Build & run typeserver
+
+```
+cd typeserver
+go build ./...                 # sanity
+make typeserver                # builds web + the server binary into ./build
+# production image + deploy (from the Makefile):
+make commit-docker-build       # commits, pushes, builds the image on the remote
+make docker-deploy             # docker compose up -d on the compose host
+```
+
+### Environment checklist (publish endpoint)
+
+The publish endpoint runs inside the typeserver process; give it:
+
+| Var | Value / purpose |
+|---|---|
+| `BETAMACS_AUTHOR_SECRET` | `"betamacs author"` — typeserver secret holding the author signing key (the oracle signs with it; a `LOCK_SECRET` timelock on it closes the config channel) |
+| `BETAMACS_AUTHOR_TTL` | author-signature validity window, seconds (default 3600) |
+| `BETAMACS_AUTHOR_PASSPHRASE` | only if that secret is passphrase-protected |
+| `OTACTL_BIN` | path to the `otactl` CLI in the image (default `otactl`; must be on PATH) |
+| `OTACTL_PUBLISHER_ID` | `betamacs-config` — publisher identity for upload + otactl authz |
+| `OTACTL_BACKEND_URL` | `https://otactl-device.docker.newton.haus` — otactl device origin the upload targets |
+| publisher mTLS cert/key | the `publisher-betamacs-config` client cert + key the `otactl boot-usb upload` mТLS presents |
+
+**Where otactl looks for the publisher cert/key:** the `otactl boot-usb`
+bridge/publisher identity lives in its app config dir —
+`${XDG_CONFIG_HOME:-$HOME/.config}/otactl-boot-usb/<instance>.crt` and
+`.key` (plus `-ca.crt`). Point at an explicit file set with `OTACTL_CONFIG`
+(a config whose `bridgeIdentity.certPath`/`keyPath` are set) or select a named
+identity with `OTACTL_INSTANCE_NAME`; for the very first upload before the
+enrollment CA is cached, `OTACTL_BACKEND_CA` supplies the backend's CA. In the
+scratch container, set `HOME`/`XDG_CONFIG_HOME` and mount the cert/key (e.g. a
+compose volume + secret), or bake them into the image. The browser needs none
+of this — it only ever talks to `/api/betamacs/publish` on the same origin.
+
+The whole endpoint does, server-side, exactly what
+`OTACTL_PUBLISHER_ID=betamacs-config OTACTL_BACKEND_URL=… scripts/publish.sh
+config <version>` does at the CLI on a host that already has the publisher cert.
+
+### Author-key rotation caveat
+
+`author-pubkey.pem` is baked into managed betamacs builds. A config signed by a
+**new** author key is only accepted by devices whose betamacs build carries the
+matching pinned pubkey. New-key configs need betamacs **>= 0.2.11** on the
+device; the fleet is currently on **0.2.16**, so rotation is safe now. If you
+rotate the author key, re-publish (re-sign) after the fleet has the build that
+pins the new key — a device on an older build would reject the new-key config
+and fail closed to strict defaults.
+
+### What v1 does NOT include
+
+- **Read-back** (`GET /api/betamacs/config`) is a documented `501` stub —
+  otactl exposes no operator resolve/download API to proxy yet. Load via
+  **Import JSON** (paste exported package or author wrapper); the UI degrades
+  gracefully.
+- **Device assignment** (`/api/betamacs/devices`, `/assign`) are `501` stubs —
+  need an otactl operator assignment API. The Devices tab loads against them
+  and shows the single-channel caveat.
+
 ## Future seams (not built now)
 
 - **Dashboards.** betamacs exposes live status via its daemon/statusframe and

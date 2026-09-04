@@ -223,7 +223,7 @@ export class BmStoreBar extends LitElement {
     const cfg = store.storeConfig;
     const dirty = store.dirty;
     const diff = dirty ? store.diff() : [];
-    const canPublish = !!cfg.publishEndpoint && !!cfg.backendUrl && !this.busy;
+    const canPublish = !!cfg.publishEndpoint && !this.busy;
 
     return html`
       <div class="panel">
@@ -252,12 +252,12 @@ export class BmStoreBar extends LitElement {
                 ${this.field("app", "App", "betamacs-config")}
                 ${this.field("channel", "Channel", "stable")}
                 ${this.field("arch", "Arch", "arm64")}
-                ${this.field("publisherId", "Publisher id", "betamacs-config")}
+                ${this.field("publisherId", "Publisher id", "(server default)")}
                 <label>otactl backend URL</label>
                 <input
                   class="full"
                   .value=${cfg.backendUrl}
-                  placeholder="https://<otactl device origin>"
+                  placeholder="(server default — leave blank to use OTACTL_BACKEND_URL)"
                   @change=${(e: Event) =>
                     store.setStoreConfig({
                       ...cfg,
