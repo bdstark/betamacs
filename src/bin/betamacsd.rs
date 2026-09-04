@@ -941,6 +941,28 @@ fn handle_client(
 }
 
 /// Verify and persist a config envelope; returns the accepted epoch.
+/// Generation-monotonic rollback refusal: reject an author-signed artifact
+/// whose `authoredAt` is older than the last accepted one. This is what
+/// replaced the old `notAfter` expiry — it catches a stashed old signing being
+/// re-uploaded over a newer one (the epoch alone misses that, since otactl
+/// stamps a fresh epoch at upload), WITHOUT ever making a valid config
+/// un-appliable. `authoredAt` is fixed-format RFC3339 (validated by envelope),
+/// so a lexical compare is chronological, and both values are server-stamped,
+/// so it never depends on the device clock. `authored` None (non-authored
+/// artifact) is a no-op.
+fn check_generation(hw_path: &Path, authored: &Option<String>) -> Result<()> {
+    let Some(authored) = authored else { return Ok(()) };
+    if let Ok(prev) = std::fs::read_to_string(hw_path) {
+        let prev = prev.trim();
+        if !prev.is_empty() && authored.as_str() < prev {
+            anyhow::bail!(
+                "generation rollback refused: authoredAt {authored} is before the accepted {prev}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn apply_envelope(
     raw: &str,
     managed_dir: &Path,
@@ -949,16 +971,21 @@ fn apply_envelope(
     let verifier = verifier.context("no pinned otactl root installed")?;
     let env: envelope::Envelope = serde_json::from_str(raw).context("malformed envelope")?;
     let epoch_path = managed_dir.join("epoch");
+    let authored_path = managed_dir.join("authored");
     let last_epoch: u64 = read_epoch(&epoch_path);
     let verified = verifier.verify(&env, last_epoch, envelope::CONFIG_APP)?;
+    check_generation(&authored_path, &verified.authored_at)?;
 
-    // Persist artifact + envelope atomically-ish, then bump the epoch
-    // high-water last so a crash never leaves epoch ahead of config.
+    // Persist artifact + envelope atomically-ish, then bump the epoch and
+    // generation high-waters last so a crash never leaves them ahead of config.
     let tmp = managed_dir.join("package.json.tmp");
     std::fs::write(&tmp, &verified.artifact)?;
     std::fs::rename(&tmp, managed_dir.join("package.json"))?;
     std::fs::write(managed_dir.join("envelope.json"), raw)?;
     std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
+    if let Some(authored) = &verified.authored_at {
+        std::fs::write(&authored_path, format!("{authored}\n"))?;
+    }
     Ok(verified.epoch)
 }
 
@@ -977,14 +1004,19 @@ fn apply_tasks_envelope(
     let verifier = verifier.context("no pinned otactl root installed")?;
     let env: envelope::Envelope = serde_json::from_str(raw).context("malformed envelope")?;
     let epoch_path = managed_dir.join("epoch-tasks");
+    let authored_path = managed_dir.join("authored-tasks");
     let verified = verifier.verify(&env, read_epoch(&epoch_path), envelope::TASKS_APP)?;
+    check_generation(&authored_path, &verified.authored_at)?;
 
-    // Persist artifact then bump the epoch high-water last, so a crash never
-    // leaves the epoch ahead of the bank (mirrors apply_envelope).
+    // Persist artifact then bump the epoch + generation high-waters last, so a
+    // crash never leaves them ahead of the bank (mirrors apply_envelope).
     let tmp = managed_dir.join("tasks.json.tmp");
     std::fs::write(&tmp, &verified.artifact)?;
     std::fs::rename(&tmp, managed_dir.join("tasks.json"))?;
     std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
+    if let Some(authored) = &verified.authored_at {
+        std::fs::write(&authored_path, format!("{authored}\n"))?;
+    }
     Ok(verified.epoch)
 }
 
@@ -1564,5 +1596,33 @@ mod quarantine_tests {
         a.exposure_penalty_until = Some(Instant::now() + Duration::from_secs(600));
         a.penalty_source = Some(PenaltySource::Exposure);
         assert_eq!(q.want_full(&a), QReason::Exposure);
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn generation_monotonicity() {
+        let dir = std::env::temp_dir().join(format!("betamacs-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hw = dir.join("authored");
+
+        // No high-water yet: anything is accepted, incl. a non-authored (None).
+        assert!(check_generation(&hw, &None).is_ok());
+        assert!(check_generation(&hw, &Some("2026-09-04T12:00:00Z".into())).is_ok());
+
+        // Seed the high-water; equal and newer are accepted, older is refused.
+        std::fs::write(&hw, "2026-09-04T12:00:00Z\n").unwrap();
+        assert!(check_generation(&hw, &Some("2026-09-04T12:00:00Z".into())).is_ok());
+        assert!(check_generation(&hw, &Some("2026-09-05T00:00:00Z".into())).is_ok());
+        let err = check_generation(&hw, &Some("2026-09-04T11:59:59Z".into())).unwrap_err();
+        assert!(err.to_string().contains("generation rollback refused"), "{err}");
+
+        // A non-authored artifact (None) is never gated by the high-water.
+        assert!(check_generation(&hw, &None).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

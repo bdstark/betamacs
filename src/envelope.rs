@@ -146,6 +146,14 @@ pub struct Verified {
     /// For operator-facing logs (unused by betamacs itself so far).
     #[allow(dead_code)]
     pub version: String,
+    /// RFC3339 `authoredAt` from the author wrapper, or None when the artifact
+    /// is not author-wrapped (e.g. the app zip). The daemon uses it for
+    /// generation-monotonic rollback refusal (a stashed old signing can't be
+    /// re-uploaded over a newer one) — the meaningful replacement for the old
+    /// `notAfter` expiry, which is no longer enforced. Read by betamacsd; the
+    /// betamacs agent bin shares this module but doesn't use it.
+    #[allow(dead_code)]
+    pub authored_at: Option<String>,
 }
 
 /// The author wrapper a config artifact must be when an author key is
@@ -321,32 +329,43 @@ impl Verifier {
         // or task-bank artifact must be a wrapper signed by the policy
         // author — a key otactl never holds, so no server-side path can
         // mint policy or the challenges that gate the network.
-        let artifact = if (expected_app == CONFIG_APP || expected_app == TASKS_APP)
+        let (artifact, authored_at) = if (expected_app == CONFIG_APP
+            || expected_app == TASKS_APP)
             && self.author_key.is_some()
         {
-            self.unwrap_authored(&artifact)?
+            let (bytes, at) = self.unwrap_authored(&artifact)?;
+            (bytes, Some(at))
         } else {
-            artifact
+            (artifact, None)
         };
         Ok(Verified {
             // Never lower the persisted high-water (absent epoch = 0).
             epoch: env.manifest.epoch.unwrap_or(0).max(last_epoch),
             artifact,
             version: env.manifest.version.clone(),
+            authored_at,
         })
     }
 
-    /// Verify the author wrapper and return the inner package bytes.
-    fn unwrap_authored(&self, artifact: &[u8]) -> Result<Vec<u8>> {
+    /// Verify the author wrapper and return the inner package bytes plus the
+    /// wrapper's `authoredAt` (for generation-monotonic rollback refusal).
+    ///
+    /// `notAfter` is intentionally NOT enforced as an expiry: an author
+    /// signature attests authorship, which does not expire, and expiring it
+    /// created a failure mode where a valid config became un-appliable and the
+    /// device silently coasted on stale policy. Anti-rollback is the epoch plus
+    /// the `authoredAt` high-water (enforced by the daemon). `notAfter` stays in
+    /// the wrapper only because it is covered by the existing signature; a v2
+    /// wrapper will drop it once the fleet no longer runs a build that expects
+    /// it in the signing input.
+    fn unwrap_authored(&self, artifact: &[u8]) -> Result<(Vec<u8>, String)> {
         let key = self.author_key.as_ref().expect("caller checked");
         let wrapper: AuthorWrapper = serde_json::from_slice(artifact)
             .context("config is not an author-signed wrapper (author key is pinned)")?;
-        let not_after = parse_rfc3339_utc(&wrapper.not_after)?;
-        anyhow::ensure!(
-            SystemTime::now() <= not_after,
-            "author signature expired at {} (stashed pre-signed config?)",
-            wrapper.not_after,
-        );
+        // Validate authoredAt is well-formed so the daemon's lexical high-water
+        // comparison is chronological.
+        parse_rfc3339_utc(&wrapper.authored_at)
+            .context("author wrapper authoredAt is not a valid RFC3339 UTC timestamp")?;
         let sig_der = base64::engine::general_purpose::STANDARD
             .decode(wrapper.author_signature.trim())
             .context("author signature is not base64")?;
@@ -354,9 +373,10 @@ impl Verifier {
             .map_err(|e| anyhow::anyhow!("author signature is not DER ECDSA: {e}"))?;
         key.verify(&wrapper.signing_input(), &sig)
             .map_err(|_| anyhow::anyhow!("author signature verification failed"))?;
-        base64::engine::general_purpose::STANDARD
+        let bytes = base64::engine::general_purpose::STANDARD
             .decode(wrapper.package_b64.trim())
-            .context("wrapper packageB64 is not base64")
+            .context("wrapper packageB64 is not base64")?;
+        Ok((bytes, wrapper.authored_at))
     }
 
     /// Anchors-only path validation: leaf -> (chain certs) -> a pinned
@@ -555,17 +575,22 @@ mod tests {
         let package = br#"{"layers":[]}"#;
         let (wrapper, verifier) = wrapper_for(package, "2099-01-01T00:00:00Z");
         let artifact = serde_json::to_vec(&wrapper).unwrap();
-        assert_eq!(verifier.unwrap_authored(&artifact).unwrap(), package);
+        let (bytes, authored) = verifier.unwrap_authored(&artifact).unwrap();
+        assert_eq!(bytes, package.to_vec());
+        assert_eq!(authored, "2026-09-03T00:00:00Z");
     }
 
     #[test]
-    fn author_wrapper_rejects_expiry_and_tamper() {
+    fn author_wrapper_ignores_expiry_but_rejects_tamper() {
         let package = br#"{"layers":[]}"#;
-        let (expired, verifier) = wrapper_for(package, "2020-01-01T00:00:00Z");
-        let err = verifier
-            .unwrap_authored(&serde_json::to_vec(&expired).unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("expired"), "{err}");
+        // notAfter is no longer enforced: a wrapper whose window is long past
+        // still verifies (authorship doesn't expire; anti-rollback is the epoch
+        // + the daemon's authoredAt high-water).
+        let (old, verifier) = wrapper_for(package, "2020-01-01T00:00:00Z");
+        let (bytes, _) = verifier
+            .unwrap_authored(&serde_json::to_vec(&old).unwrap())
+            .expect("expired notAfter must no longer be rejected");
+        assert_eq!(bytes, package.to_vec());
 
         let (mut tampered, verifier) = wrapper_for(package, "2099-01-01T00:00:00Z");
         use base64::Engine;
