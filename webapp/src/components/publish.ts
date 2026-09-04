@@ -7,6 +7,9 @@
 import { css, html, LitElement, nothing } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { store, type StoreConfig } from "../store.js";
+import type { PublishResult } from "../stores/store.js";
+
+const LAST_VERSION_KEY = "betamacs.lastVersion";
 
 @customElement("bm-store-bar")
 export class BmStoreBar extends LitElement {
@@ -143,13 +146,64 @@ export class BmStoreBar extends LitElement {
       min-height: 1em;
       margin-top: 8px;
     }
+    .errbox {
+      margin-top: 12px;
+      border: 1px solid color-mix(in srgb, #ff3b30 55%, transparent);
+      background: color-mix(in srgb, #ff3b30 12%, transparent);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12.5px;
+    }
+    .errbox .title {
+      font-weight: 600;
+      color: #c00;
+      margin-bottom: 6px;
+    }
+    .errbox pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.45 ui-monospace, monospace;
+      color: var(--text);
+      max-height: 220px;
+      overflow: auto;
+    }
+    .okbox {
+      margin-top: 12px;
+      border: 1px solid color-mix(in srgb, #34c759 55%, transparent);
+      background: color-mix(in srgb, #34c759 12%, transparent);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12.5px;
+    }
+    .okbox .title {
+      font-weight: 600;
+      color: #1a8a3a;
+      margin-bottom: 6px;
+    }
+    .okbox dl {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 2px 12px;
+      margin: 0;
+    }
+    .okbox dt {
+      color: var(--muted);
+    }
+    .okbox dd {
+      margin: 0;
+      font-variant-numeric: tabular-nums;
+      word-break: break-all;
+    }
   `;
 
   @state() private open = false;
   @state() private importing = false;
   @state() private importText = "";
-  @state() private version = suggestedVersion();
+  @state() private version = nextVersion();
   @state() private busy = false;
+  @state() private lastError = "";
+  @state() private lastResult: PublishResult | null = null;
 
   private unsubscribe = () => {};
   connectedCallback() {
@@ -200,20 +254,34 @@ export class BmStoreBar extends LitElement {
   }
 
   private async publish() {
-    if (!confirm(`Publish ${store.storeConfig.app} v${this.version} to channel "${store.storeConfig.channel}"?`))
+    const version = this.version.trim();
+    if (!version) {
+      this.lastResult = null;
+      this.lastError = "Version is required (e.g. 0.1.11). otactl rejects a blank version.";
+      return;
+    }
+    if (!confirm(`Publish ${store.storeConfig.app} v${version} to channel "${store.storeConfig.channel}"?`))
       return;
     this.busy = true;
+    this.lastError = "";
+    this.lastResult = null;
     store.setStatus("publishing (sign + upload)…");
     try {
-      const r = await store.publishToStore(this.version);
-      store.setStatus(
-        `published v${r.version} · sha256 ${r.sha256.slice(0, 12)}…` +
-          (r.epoch !== undefined ? ` · epoch ${r.epoch}` : "") +
-          (r.notAfter ? ` · sig valid until ${r.notAfter}` : ""),
-      );
-      this.version = suggestedVersion();
+      const r = await store.publishToStore(version);
+      this.lastResult = r;
+      store.setStatus("published");
+      // Remember the version so the next suggestion increments past it.
+      try {
+        localStorage.setItem(LAST_VERSION_KEY, version);
+      } catch {
+        /* ignore */
+      }
+      this.version = nextVersion();
     } catch (e) {
-      store.setStatus(`publish failed: ${e}`);
+      // Surface the FULL server error (status + body) prominently — the
+      // backend puts otactl's stderr in the body on a 502.
+      this.lastError = e instanceof Error ? e.message : String(e);
+      store.setStatus("publish failed — see details below");
     } finally {
       this.busy = false;
     }
@@ -223,7 +291,7 @@ export class BmStoreBar extends LitElement {
     const cfg = store.storeConfig;
     const dirty = store.dirty;
     const diff = dirty ? store.diff() : [];
-    const canPublish = !!cfg.publishEndpoint && !this.busy;
+    const canPublish = !!cfg.publishEndpoint && !!this.version.trim() && !this.busy;
 
     return html`
       <div class="panel">
@@ -321,27 +389,71 @@ export class BmStoreBar extends LitElement {
           <label>Version</label>
           <input
             style="width:180px;flex:none"
+            placeholder="0.1.11"
             .value=${this.version}
-            @change=${(e: Event) => (this.version = (e.target as HTMLInputElement).value)}
+            @input=${(e: Event) => (this.version = (e.target as HTMLInputElement).value)}
           />
           <button class="primary" @click=${this.publish} ?disabled=${!canPublish}>
-            Publish to store
+            ${this.busy ? "Publishing…" : "Publish to store"}
           </button>
           ${!cfg.publishEndpoint
             ? html`<span class="target">set a publish endpoint to enable</span>`
-            : nothing}
+            : !this.version.trim()
+              ? html`<span class="target">enter a version to enable</span>`
+              : nothing}
         </div>
 
         <div class="status">${store.status}</div>
+
+        ${this.lastError
+          ? html`
+              <div class="errbox">
+                <div class="title">Publish failed</div>
+                <pre>${this.lastError}</pre>
+              </div>
+            `
+          : nothing}
+        ${this.lastResult
+          ? html`
+              <div class="okbox">
+                <div class="title">Published ✓</div>
+                <dl>
+                  <dt>version</dt><dd>${this.lastResult.version}</dd>
+                  <dt>sha256</dt><dd>${this.lastResult.sha256}</dd>
+                  ${this.lastResult.epoch !== undefined
+                    ? html`<dt>epoch</dt><dd>${this.lastResult.epoch}</dd>`
+                    : nothing}
+                  ${this.lastResult.notAfter
+                    ? html`<dt>sig valid until</dt><dd>${this.lastResult.notAfter}</dd>`
+                    : nothing}
+                  <dt>stored at</dt><dd>${this.lastResult.storedAt}</dd>
+                </dl>
+              </div>
+            `
+          : nothing}
       </div>
     `;
   }
 }
 
-function suggestedVersion(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}.${p(d.getMonth() + 1)}.${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+/** Suggest the next artifact version: increment the last published one, or
+ *  start at 0.1.11 (past the current 0.1.10). User-editable in the UI. */
+function nextVersion(): string {
+  let last = "";
+  try {
+    last = localStorage.getItem(LAST_VERSION_KEY) ?? "";
+  } catch {
+    /* ignore */
+  }
+  return last ? bumpVersion(last) : "0.1.11";
+}
+
+function bumpVersion(v: string): string {
+  const semver = v.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (semver) return `${semver[1]}.${semver[2]}.${Number(semver[3]) + 1}`;
+  const trailing = v.match(/^(.*?)(\d+)$/);
+  if (trailing) return `${trailing[1]}${Number(trailing[2]) + 1}`;
+  return `${v}.1`;
 }
 
 function hostOf(url: string): string {

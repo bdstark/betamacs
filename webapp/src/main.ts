@@ -14,6 +14,8 @@ import "./modules/exposure.js";
 import "./modules/clock.js";
 import "./modules/coverage.js";
 import "./modules/exclusions.js";
+import "./modules/earned.js";
+import "./modules/focus.js";
 
 const TABS = [
   { id: "detection", label: "Detection engine" },
@@ -22,6 +24,8 @@ const TABS = [
   { id: "exposure", label: "Exposure budget" },
   { id: "coverage", label: "Coverage escalation" },
   { id: "exclusions", label: "Capture exclusions" },
+  { id: "earned", label: "Earned time" },
+  { id: "focus", label: "Focus limit" },
   { id: "clock", label: "Clock integrity" },
   { id: "layers", label: "Layers & package" },
   { id: "assignment", label: "Devices" },
@@ -222,6 +226,8 @@ export class BmApp extends LitElement {
       ${this.tab === "exposure" ? html`<bm-exposure-module></bm-exposure-module>` : ""}
       ${this.tab === "coverage" ? html`<bm-coverage-module></bm-coverage-module>` : ""}
       ${this.tab === "exclusions" ? html`<bm-exclusions-module></bm-exclusions-module>` : ""}
+      ${this.tab === "earned" ? html`<bm-earned-module></bm-earned-module>` : ""}
+      ${this.tab === "focus" ? html`<bm-focus-module></bm-focus-module>` : ""}
       ${this.tab === "clock" ? html`<bm-clock-module></bm-clock-module>` : ""}
       ${this.tab === "layers" ? html`<bm-layers></bm-layers>` : ""}
       ${this.tab === "assignment" ? html`<bm-assignment></bm-assignment>` : ""}

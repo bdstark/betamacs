@@ -114,7 +114,11 @@ export class OtactlStore implements Store {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`otactl publish failed: ${res.status} ${await res.text()}`);
+      const body = (await res.text()).trim();
+      throw new Error(
+        `HTTP ${res.status} ${res.statusText} from ${this.cfg.publishEndpoint}\n\n` +
+          (body || "(empty response body)"),
+      );
     }
     const out = (await res.json()) as OtactlPublishResponse;
     return {
