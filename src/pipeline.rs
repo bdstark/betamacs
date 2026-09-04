@@ -27,7 +27,9 @@ use crate::capture_sck::SckCapturer;
 use crate::censor_fx;
 use crate::detect::{Detection, Detector, TileCache};
 use crate::overlay::{CensorRegion, OverlayHandle};
-use crate::settings::{CensorMode, CensorSettings, Effective, ExposureMetric};
+use crate::settings::{
+    CensorMode, CensorSettings, CoverageEscalationSettings, Effective, ExposureMetric,
+};
 
 /// Crop a censor region out of its monitor's frame and process it per the
 /// censor mode. Returns None for modes that don't need source pixels.
@@ -171,6 +173,112 @@ fn region_iou(a: &CensorRegion, b: &CensorRegion) -> f32 {
     if union <= 0.0 { 0.0 } else { inter / union }
 }
 
+/// Frontmost application's bundle id via System Events, or None on failure
+/// (no GUI session, Automation permission denied, etc.). Duplicated
+/// minimally from `earned.rs` on purpose: the capture-exclusion sampler is
+/// on the pipeline's hot path and must not take a cross-module dependency on
+/// the earned-time monitor (which another agent owns and may restructure).
+fn frontmost_bundle_id() -> Option<String> {
+    let script = "tell application \"System Events\" to get bundle identifier \
+                  of first application process whose frontmost is true";
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Inflate a censor rect about its center by `scale` (clamped to >= 1.0),
+/// then clamp the result to the monitor bounds `[ox, ox+mw] x [oy, oy+mh]`
+/// (global logical points). Pure — unit-tested. Used by coverage escalation
+/// so persistent content grows the boxes without letting them hang off the
+/// display or onto a neighbor.
+fn inflate_region_rect(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    scale: f32,
+    ox: f32,
+    oy: f32,
+    mw: f32,
+    mh: f32,
+) -> (f32, f32, f32, f32) {
+    let scale = scale.max(1.0);
+    let cx = x + w / 2.0;
+    let cy = y + h / 2.0;
+    let nw = w * scale;
+    let nh = h * scale;
+    let x1 = (cx - nw / 2.0).max(ox);
+    let y1 = (cy - nh / 2.0).max(oy);
+    let x2 = (cx + nw / 2.0).min(ox + mw);
+    let y2 = (cy + nh / 2.0).min(oy + mh);
+    (x1, y1, (x2 - x1).max(1.0), (y2 - y1).max(1.0))
+}
+
+/// One tick's increment for an exposure/coverage rolling metric, from the
+/// current held boxes and screen area. Shared by the exposure budget and
+/// coverage escalation so both read the metric the same way.
+fn metric_increment(
+    metric: ExposureMetric,
+    dt: f32,
+    new_boxes: u32,
+    held: &HashMap<u32, Vec<HeldBox>>,
+    last_frames: &HashMap<u32, Frame>,
+) -> f32 {
+    let box_count: usize = held.values().map(|v| v.len()).sum();
+    match metric {
+        ExposureMetric::Events => new_boxes as f32,
+        ExposureMetric::ActiveSeconds => {
+            if box_count > 0 {
+                dt
+            } else {
+                0.0
+            }
+        }
+        ExposureMetric::BoxSeconds => box_count as f32 * dt,
+        ExposureMetric::AreaSeconds => {
+            let box_area: f32 = held
+                .values()
+                .flatten()
+                .map(|b| b.region.width * b.region.height)
+                .sum();
+            let screen_area: f32 = last_frames
+                .values()
+                .map(|f| f.logical_size.0 as f32 * f.logical_size.1 as f32)
+                .sum();
+            if screen_area > 0.0 {
+                (box_area / screen_area).min(1.0) * dt
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+/// Advance the coverage-escalation scale by one tick. `sum` is the coverage
+/// metric's rolling-window sum. At/above `threshold` the scale ratchets up
+/// toward `start_scale + over * growth_per_unit` (capped at `max_scale`) and
+/// never shrinks while over-threshold; under the threshold it decays toward
+/// 1.0 at `decay_per_sec`. Pure — unit-tested.
+fn escalation_scale(prev: f32, sum: f32, dt: f32, cfg: &CoverageEscalationSettings) -> f32 {
+    let max = cfg.max_scale.max(1.0);
+    let mut scale = prev.clamp(1.0, max);
+    if cfg.threshold > 0.0 && sum >= cfg.threshold {
+        let over = sum - cfg.threshold;
+        let target = (cfg.start_scale + over * cfg.growth_per_unit).clamp(1.0, max);
+        scale = scale.max(target);
+    } else {
+        scale = (scale - cfg.decay_per_sec.max(0.0) * dt).max(1.0);
+    }
+    scale.clamp(1.0, max)
+}
+
 pub fn run(
     shared: Arc<RwLock<Effective>>,
     overlay: OverlayHandle,
@@ -231,6 +339,16 @@ pub fn run(
 
     let mut was_enabled = true;
     let mut exposure = ExposureTracker::new();
+    // Coverage escalation: its own rolling accumulator (independent metric)
+    // and the current box-inflation scale (1.0 = no inflation). Applied when
+    // building this cycle's boxes, recomputed at the end of each cycle.
+    let mut coverage = ExposureTracker::new();
+    let mut cov_scale = 1.0_f32;
+    // Capture exclusion: cached frontmost sample and pause state, so we poll
+    // osascript at ~1s rather than every frame.
+    let mut last_frontmost_check: Option<Instant> = None;
+    let mut is_excluded = false;
+    let mut was_excluded = false;
     loop {
         let cfg = shared.read().unwrap().clone();
 
@@ -257,6 +375,52 @@ pub fn run(
         if !was_enabled {
             was_enabled = true;
             tracing::info!("censoring re-enabled by policy");
+            menubar_status(&capturer, &loaded_model, &overlay);
+        }
+
+        // Screen-recording whitelist by frontmost app. When a whitelisted
+        // app is frontmost we must never capture or censor it: pause the
+        // capture/detect work and clear any active boxes for as long as it
+        // holds focus, resuming when focus leaves. The frontmost bundle id is
+        // sampled at ~1s (never per frame) to keep osascript cheap.
+        //
+        // A whitelist pause is POLICY, not a failure, so it must not trip the
+        // daemon's health quarantine. We report it exactly like the
+        // `detection.enabled:false` branch above — health.enabled=false with
+        // boxes=0, while streams and capture_ok stay intact — so the daemon
+        // reads "healthy, disabled by policy" rather than a blinded/tampered
+        // censor. (See heartbeat.rs: `enabled` is precisely the flag the
+        // daemon uses to distinguish policy-off from a killed censor.)
+        if cfg.capture_exclusions.enabled && !cfg.capture_exclusions.bundle_ids.is_empty() {
+            if last_frontmost_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                last_frontmost_check = Some(Instant::now());
+                is_excluded = cfg
+                    .capture_exclusions
+                    .is_excluded(frontmost_bundle_id().as_deref());
+            }
+        } else {
+            is_excluded = false;
+        }
+        if is_excluded {
+            if !was_excluded {
+                was_excluded = true;
+                held.clear();
+                highlights.clear();
+                cov_scale = 1.0;
+                health.boxes.store(0, Ordering::Relaxed);
+                overlay.set_regions(Vec::new())?;
+                let _ = overlay.set_status("paused: excluded app in focus".into());
+                tracing::info!("capture paused: an excluded app is frontmost");
+            }
+            // Healthy-by-policy, mirroring the disabled-by-policy branch.
+            health.enabled.store(false, Ordering::Relaxed);
+            while capturer.try_recv().is_some() {}
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if was_excluded {
+            was_excluded = false;
+            tracing::info!("capture resumed: excluded app lost focus");
             menubar_status(&capturer, &loaded_model, &overlay);
         }
 
@@ -533,16 +697,30 @@ pub fn run(
                 .iter()
                 .map(|d| {
                     next_text_seed = next_text_seed.wrapping_add(0x9e3779b97f4a7c15);
-                    (
-                        detection_to_region(
-                            frame,
-                            d,
-                            cfg.censor.x_scale_pct,
-                            cfg.censor.y_scale_pct,
-                            next_text_seed,
-                        ),
-                        d.confidence,
-                    )
+                    let mut region = detection_to_region(
+                        frame,
+                        d,
+                        cfg.censor.x_scale_pct,
+                        cfg.censor.y_scale_pct,
+                        next_text_seed,
+                    );
+                    // Coverage escalation: inflate the box about its center by
+                    // the current escalation scale (clamped to the monitor),
+                    // so sustained content increasingly blankets the screen.
+                    // Additive to the configured x/y scale; a no-op at 1.0.
+                    if cfg.coverage_escalation.enabled && cov_scale > 1.0 {
+                        let (ox, oy) = (frame.origin.0 as f32, frame.origin.1 as f32);
+                        let (mw, mh) = (frame.logical_size.0 as f32, frame.logical_size.1 as f32);
+                        let (x, y, w, h) = inflate_region_rect(
+                            region.x, region.y, region.width, region.height, cov_scale, ox, oy, mw,
+                            mh,
+                        );
+                        region.x = x;
+                        region.y = y;
+                        region.width = w;
+                        region.height = h;
+                    }
+                    (region, d.confidence)
                 })
                 .collect();
 
@@ -720,34 +898,7 @@ pub fn run(
                 .min(Duration::from_secs(5))
                 .as_secs_f32();
             exposure.last_tick = now;
-            let box_count: usize = held.values().map(|v| v.len()).sum();
-            let increment = match ex.metric {
-                ExposureMetric::Events => new_boxes as f32,
-                ExposureMetric::ActiveSeconds => {
-                    if box_count > 0 {
-                        dt
-                    } else {
-                        0.0
-                    }
-                }
-                ExposureMetric::BoxSeconds => box_count as f32 * dt,
-                ExposureMetric::AreaSeconds => {
-                    let box_area: f32 = held
-                        .values()
-                        .flatten()
-                        .map(|b| b.region.width * b.region.height)
-                        .sum();
-                    let screen_area: f32 = last_frames
-                        .values()
-                        .map(|f| f.logical_size.0 as f32 * f.logical_size.1 as f32)
-                        .sum();
-                    if screen_area > 0.0 {
-                        (box_area / screen_area).min(1.0) * dt
-                    } else {
-                        0.0
-                    }
-                }
-            };
+            let increment = metric_increment(ex.metric, dt, new_boxes, &held, &last_frames);
             exposure.record(increment);
             let keep =
                 Duration::from_secs(ex.warn_window_sec.max(ex.block_window_sec) as u64 + 5);
@@ -798,6 +949,32 @@ pub fn run(
             health.exposure_recent.store(0, Ordering::Relaxed);
         }
 
+        // Coverage escalation: accumulate this cycle's metric into its own
+        // rolling window and recompute the box-inflation scale for the NEXT
+        // cycle. The scale grows while the window sum stays over threshold
+        // and decays back toward 1.0 when it falls under. Independent of the
+        // exposure budget above (its own metric/window/threshold); disabled
+        // by default.
+        if cfg.coverage_escalation.enabled {
+            let ce = &cfg.coverage_escalation;
+            let now = Instant::now();
+            let dt = now
+                .saturating_duration_since(coverage.last_tick)
+                .min(Duration::from_secs(5))
+                .as_secs_f32();
+            coverage.last_tick = now;
+            let increment = metric_increment(ce.metric, dt, new_boxes, &held, &last_frames);
+            coverage.record(increment);
+            coverage.prune(Duration::from_secs(ce.window_sec as u64 + 5));
+            let sum = coverage.sum_within(Duration::from_secs(ce.window_sec as u64));
+            cov_scale = escalation_scale(cov_scale, sum, dt, ce);
+        } else {
+            // Disabled: hold the scale at 1.0 and keep the tick current so a
+            // later enable starts from a clean, decayed baseline.
+            cov_scale = 1.0;
+            coverage.last_tick = Instant::now();
+        }
+
         // In censor-in-captures mode the boxes are visible to capture, so
         // our own streams must exclude this app or the detector goes blind
         // under its boxes. The app only becomes excludable once it has an
@@ -814,5 +991,102 @@ pub fn run(
                 Err(e) => tracing::warn!("self-exclusion failed: {e}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inflate_scales_about_center() {
+        // 100x100 box at (100,100), scale 2.0 -> 200x200 centered on
+        // (150,150) => origin (50,50).
+        let r = inflate_region_rect(100.0, 100.0, 100.0, 100.0, 2.0, 0.0, 0.0, 1000.0, 1000.0);
+        assert_eq!(r, (50.0, 50.0, 200.0, 200.0));
+    }
+
+    #[test]
+    fn inflate_clamps_to_monitor() {
+        // center (30,30), 4x -> 160x160; x1 = -50 clamps to 0, x2 = 110.
+        let (x, y, w, h) = inflate_region_rect(10.0, 10.0, 40.0, 40.0, 4.0, 0.0, 0.0, 500.0, 500.0);
+        assert_eq!((x, y, w, h), (0.0, 0.0, 110.0, 110.0));
+    }
+
+    #[test]
+    fn inflate_scale_below_one_is_noop() {
+        let r = inflate_region_rect(100.0, 100.0, 50.0, 50.0, 0.5, 0.0, 0.0, 1000.0, 1000.0);
+        assert_eq!(r, (100.0, 100.0, 50.0, 50.0));
+    }
+
+    #[test]
+    fn inflate_respects_monitor_origin() {
+        // Second display offset at x=1000. center x=1020, 10x width 200 ->
+        // x1 = 920 clamps to 1000, x2 = 1120 -> width 120.
+        let (x, _y, w, _h) =
+            inflate_region_rect(1010.0, 10.0, 20.0, 20.0, 10.0, 1000.0, 0.0, 500.0, 500.0);
+        assert_eq!(x, 1000.0);
+        assert_eq!(w, 120.0);
+    }
+
+    fn ce(threshold: f32, start: f32, growth: f32, max: f32, decay: f32) -> CoverageEscalationSettings {
+        CoverageEscalationSettings {
+            enabled: true,
+            metric: ExposureMetric::Events,
+            threshold,
+            window_sec: 300,
+            start_scale: start,
+            growth_per_unit: growth,
+            max_scale: max,
+            decay_per_sec: decay,
+        }
+    }
+
+    #[test]
+    fn escalation_kicks_in_at_start_scale() {
+        let cfg = ce(20.0, 1.5, 0.05, 3.0, 0.1);
+        // Sum exactly at threshold -> start_scale.
+        assert!((escalation_scale(1.0, 20.0, 1.0, &cfg) - 1.5).abs() < 1e-6);
+        // Below threshold from a resting scale -> stays 1.0.
+        assert!((escalation_scale(1.0, 19.0, 1.0, &cfg) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn escalation_grows_over_threshold() {
+        let cfg = ce(20.0, 1.5, 0.05, 3.0, 0.1);
+        // Over by 10 -> 1.5 + 10*0.05 = 2.0.
+        assert!((escalation_scale(1.0, 30.0, 1.0, &cfg) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn escalation_capped_at_max() {
+        let cfg = ce(20.0, 1.5, 0.05, 3.0, 0.1);
+        assert!((escalation_scale(1.0, 10_000.0, 1.0, &cfg) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn escalation_ratchets_up_not_down_while_over() {
+        let cfg = ce(20.0, 1.5, 0.05, 3.0, 0.1);
+        let s1 = escalation_scale(1.0, 40.0, 1.0, &cfg); // 1.5 + 20*0.05 = 2.5
+        assert!((s1 - 2.5).abs() < 1e-6);
+        // Sum drops but stays over threshold: target 1.75 < 2.5, so hold.
+        let s2 = escalation_scale(s1, 25.0, 1.0, &cfg);
+        assert!((s2 - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn escalation_decays_under_threshold() {
+        let cfg = ce(20.0, 1.5, 0.05, 3.0, 0.1);
+        // From 2.0, under threshold, 0.1/s * 5s = 0.5 -> 1.5.
+        assert!((escalation_scale(2.0, 0.0, 5.0, &cfg) - 1.5).abs() < 1e-6);
+        // Never decays below 1.0.
+        assert!((escalation_scale(1.05, 0.0, 100.0, &cfg) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn escalation_zero_threshold_never_triggers() {
+        // threshold 0 is treated as "off" so a zero-sum never inflates.
+        let cfg = ce(0.0, 1.5, 0.05, 3.0, 0.1);
+        assert!((escalation_scale(1.0, 0.0, 1.0, &cfg) - 1.0).abs() < 1e-6);
     }
 }
