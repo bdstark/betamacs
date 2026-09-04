@@ -48,14 +48,15 @@ case "${1:-}" in
     fi
     python3 - "$FILE" "$TTL" "$KEY" <<'EOF'
 import base64, json, os, subprocess, sys, tempfile, time, urllib.request
-path, ttl, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+path, key = sys.argv[1], sys.argv[3]  # sys.argv[2] (ttl) is ignored: v2 has no expiry
 package = open(path, "rb").read()
 json.loads(package)  # must be valid JSON before it gets signed
 fmt = "%Y-%m-%dT%H:%M:%SZ"
 authored_at = time.strftime(fmt, time.gmtime())
-not_after = time.strftime(fmt, time.gmtime(time.time() + ttl))
 package_b64 = base64.b64encode(package).decode()
-signing_input = f"betamacs-config-author-v1\n{authored_at}\n{not_after}\n{package_b64}"
+# v2 wrapper: no notAfter. Authorship doesn't expire; anti-rollback is the
+# epoch plus the daemon's authoredAt high-water. betamacs >= 0.2.19 verifies it.
+signing_input = f"betamacs-config-author-v2\n{authored_at}\n{package_b64}"
 
 secret = os.environ.get("BETAMACS_AUTHOR_SECRET")
 if secret:
@@ -86,7 +87,7 @@ else:
 
 out = path + ".authored"
 json.dump({"packageB64": package_b64, "authoredAt": authored_at,
-           "notAfter": not_after, "authorSignature": signature},
+           "authorSignature": signature},
           open(out, "w"))
 print(f"authored wrapper: {out} (valid until {not_after})")
 EOF

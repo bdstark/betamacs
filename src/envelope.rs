@@ -169,20 +169,31 @@ pub struct AuthorWrapper {
     pub package_b64: String,
     /// RFC3339 UTC; informational, covered by the signature.
     pub authored_at: String,
-    /// RFC3339 UTC; the wrapper is refused after this instant.
-    pub not_after: String,
+    /// v1 only: RFC3339 UTC expiry, kept in the signed bytes. No longer
+    /// enforced; absent on v2 wrappers, which drop it entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
     /// base64 DER ECDSA P-256/SHA-256 over `signing_input()`.
     pub author_signature: String,
 }
 
 impl AuthorWrapper {
-    /// The signed bytes: three fields joined by newlines — exact strings,
-    /// no canonicalization to agree on.
+    /// The signed bytes: fields joined by newlines — exact strings, no
+    /// canonicalization to agree on. The presence of `not_after` selects the
+    /// format so both are verifiable: v1 (with the expiry field) and v2 (the
+    /// current format, which drops it — authorship doesn't expire, and the
+    /// daemon's authoredAt high-water is the anti-rollback guard).
     pub fn signing_input(&self) -> Vec<u8> {
-        format!(
-            "betamacs-config-author-v1\n{}\n{}\n{}",
-            self.authored_at, self.not_after, self.package_b64
-        )
+        match &self.not_after {
+            Some(not_after) => format!(
+                "betamacs-config-author-v1\n{}\n{}\n{}",
+                self.authored_at, not_after, self.package_b64
+            ),
+            None => format!(
+                "betamacs-config-author-v2\n{}\n{}",
+                self.authored_at, self.package_b64
+            ),
+        }
         .into_bytes()
     }
 }
@@ -543,7 +554,7 @@ mod tests {
         assert!(parse_rfc3339_utc("garbage").is_err());
     }
 
-    fn wrapper_for(package: &[u8], not_after: &str) -> (AuthorWrapper, Verifier) {
+    fn wrapper_for(package: &[u8], not_after: Option<&str>) -> (AuthorWrapper, Verifier) {
         use base64::Engine;
         use p256::ecdsa::signature::Signer;
         use p256::pkcs8::EncodePublicKey;
@@ -551,7 +562,7 @@ mod tests {
         let mut wrapper = AuthorWrapper {
             package_b64: base64::engine::general_purpose::STANDARD.encode(package),
             authored_at: "2026-09-03T00:00:00Z".into(),
-            not_after: not_after.into(),
+            not_after: not_after.map(|s| s.into()),
             author_signature: String::new(),
         };
         let sig: p256::ecdsa::Signature = signing.sign(&wrapper.signing_input());
@@ -573,26 +584,33 @@ mod tests {
     #[test]
     fn author_wrapper_round_trip() {
         let package = br#"{"layers":[]}"#;
-        let (wrapper, verifier) = wrapper_for(package, "2099-01-01T00:00:00Z");
-        let artifact = serde_json::to_vec(&wrapper).unwrap();
-        let (bytes, authored) = verifier.unwrap_authored(&artifact).unwrap();
-        assert_eq!(bytes, package.to_vec());
-        assert_eq!(authored, "2026-09-03T00:00:00Z");
+        // v1 (with notAfter) and v2 (without) both verify.
+        for not_after in [Some("2099-01-01T00:00:00Z"), None] {
+            let (wrapper, verifier) = wrapper_for(package, not_after);
+            let artifact = serde_json::to_vec(&wrapper).unwrap();
+            let (bytes, authored) = verifier.unwrap_authored(&artifact).unwrap();
+            assert_eq!(bytes, package.to_vec());
+            assert_eq!(authored, "2026-09-03T00:00:00Z");
+        }
+        // A v2 wrapper must not serialize a notAfter field at all.
+        let (wrapper, _) = wrapper_for(package, None);
+        let json = serde_json::to_string(&wrapper).unwrap();
+        assert!(!json.contains("notAfter"), "v2 wrapper leaked notAfter: {json}");
     }
 
     #[test]
     fn author_wrapper_ignores_expiry_but_rejects_tamper() {
         let package = br#"{"layers":[]}"#;
-        // notAfter is no longer enforced: a wrapper whose window is long past
+        // notAfter is no longer enforced: a v1 wrapper whose window is long past
         // still verifies (authorship doesn't expire; anti-rollback is the epoch
         // + the daemon's authoredAt high-water).
-        let (old, verifier) = wrapper_for(package, "2020-01-01T00:00:00Z");
+        let (old, verifier) = wrapper_for(package, Some("2020-01-01T00:00:00Z"));
         let (bytes, _) = verifier
             .unwrap_authored(&serde_json::to_vec(&old).unwrap())
             .expect("expired notAfter must no longer be rejected");
         assert_eq!(bytes, package.to_vec());
 
-        let (mut tampered, verifier) = wrapper_for(package, "2099-01-01T00:00:00Z");
+        let (mut tampered, verifier) = wrapper_for(package, Some("2099-01-01T00:00:00Z"));
         use base64::Engine;
         tampered.package_b64 =
             base64::engine::general_purpose::STANDARD.encode(br#"{"layers":["evil"]}"#);
