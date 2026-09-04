@@ -189,7 +189,7 @@ class Store {
 
   /** Read the current published config for the selected store, via the
    *  typeserver read endpoint (the browser cannot reach otactl directly). */
-  async loadFromStore(): Promise<void> {
+  async loadFromStore(): Promise<{ version: string; sha256: string }> {
     if (!this.storeConfig.readEndpoint) {
       throw new Error("no read endpoint configured (Import JSON instead)");
     }
@@ -200,6 +200,7 @@ class Store {
     if (!stored) throw new Error("no published config found for this store");
     this.update((p) => Object.assign(p, emptyPackage(), stored.resolved));
     this.markBaseline();
+    return { version: stored.version, sha256: stored.sha256 };
   }
 
   // ------------------------------------------------------- publish

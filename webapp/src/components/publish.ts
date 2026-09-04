@@ -234,8 +234,11 @@ export class BmStoreBar extends LitElement {
     this.busy = true;
     store.setStatus("loading from store…");
     try {
-      await store.loadFromStore();
-      store.setStatus("loaded current published config (baseline set)");
+      const { version, sha256 } = await store.loadFromStore();
+      const shortSha = sha256 ? sha256.slice(0, 12) : "?";
+      store.setStatus(
+        `loaded published config v${version || "?"} (sha256 ${shortSha}…, baseline set)`,
+      );
     } catch (e) {
       store.setStatus(`load failed: ${e}`);
     } finally {

@@ -215,17 +215,38 @@ secret that typeserver/otactl don't already hold.
 same-site, `credentials:"include"`. Lets the app load the currently published
 config for a store instead of pasting JSON.
 
-**Response 200:** `{ version, sha256, epoch?, package }` where `package` is the
-`ResolvedPackage` (the backend fetches the otactl artifact and unwraps the
-author signature, returning the raw bytes). **404** when no config is
-published. **501** while unimplemented.
+**Response 200:** `{ version, sha256, epoch?, notAfter?, storedAt?, package }`
+where `package` is the raw `ResolvedPackage` JSON — the backend fetches the
+otactl artifact (the author-signed wrapper), unwraps it
+(`base64decode(wrapper.packageB64)`), and returns the inner package the editor
+edits. `version`/`sha256`/`epoch` are the artifact's release metadata;
+`notAfter`/`storedAt` come from the wrapper. **404** when no config is
+published for that app/channel/arch (a clean empty; the app then offers Import
+JSON).
 
-> **STUBBED (Phase 2).** Returns `501`: otactl authenticates resolve/download
-> by *device* mTLS and exposes no operator download API to proxy yet. The app
-> falls back to **Import JSON** (paste an exported `package.json` or an
-> author-signed wrapper — both accepted; the wrapper is unwrapped
-> automatically). Wiring this needs an otactl operator resolve/download
-> endpoint (follow-up).
+> **IMPLEMENTED.** `handleBetamacsConfigRead` (typeserver
+> `cmd/server/betamacs.go`) downloads over the **same betamacs-config publisher
+> mTLS identity** it publishes with — no new credential — by calling otactl's
+> new `publisher.Download` against `GET /firmware/artifacts/download`. See
+> "Read-back auth model" below. The app's **Load from store** button
+> (`OtactlStore.fetchLatest`) populates the editor from the returned package and
+> shows the loaded version + sha256; Import JSON remains as a manual fallback.
+
+#### Read-back auth model (why the publisher cert)
+
+otactl's device artifact route (`/firmware/artifacts/current`) is device-mTLS
+gated and the operator download (`/admin/firmware/download`) needs a human web
+session (`withRole(RoleViewer)`) — typeserver has neither toward otactl; it
+authenticates purely as the **betamacs-config publisher**. So otactl gained an
+additive `GET /firmware/artifacts/download` that authorizes exactly like
+`/firmware/upload`: an operator session **or** a scoped publisher client
+certificate. A publisher that may *upload* runtime for an app may now *read*
+that same app's current artifact back — read is strictly less privileged than
+the write the cert already holds, and the cert's app/arch/channel scope is
+enforced, so it can never read another app. This reuses the cert typeserver
+already mounts at `/pki/publisher-betamacs-config.*`; no new PKI, scope field,
+or service identity. otactld listens with `tls.VerifyClientCertIfGiven`, so the
+client cert is verified on this GET just as on the upload POST.
 
 ### Device assignment endpoints
 
@@ -233,9 +254,17 @@ published. **501** while unimplemented.
 `POST {origin}/api/betamacs/assign` `{ deviceId, channel }`. The app derives
 the origin from the publish endpoint.
 
-> **STUBBED (Phase 2).** Both return `501`. Setting a device channel needs
-> otactl operator credentials + the assignment API; the UI (Devices tab) loads
-> against these and degrades gracefully. See the single-channel caveat below.
+> **STILL STUBBED — 501, by design (not yet signed off).** Unlike read-back,
+> device assignment is a **fleet-admin mutation**, not something the
+> betamacs-config *publisher* identity should be able to do: a publisher cert is
+> scoped to publishing one app's artifacts, and letting it re-point devices
+> would be a privilege escalation. otactl's device routes (`GET /admin/devices`,
+> `PUT /admin/devices/{id}/policy`) are already gated by an operator **web
+> session** (`withRole`), which typeserver does **not** hold toward otactl — so
+> even read-only device *listing* is **not** trivially available over the
+> publisher cert and stays 501 for now. Wiring it needs the operator/service
+> auth decided in "Config → device assignment" below. The UI (Devices tab) loads
+> against these and degrades gracefully.
 
 ### Deploying / testing the typeserver backend
 
@@ -435,16 +464,85 @@ bank too. Two workable models:
   be published to every kid channel too (or otactl must fall back, which it does
   not). This is the friction point.
 
-### Proposed otactl change (follow-up)
+### Recommendation: Model B+ — per-app channel override (`AppChannels`)
 
-To make per-config assignment clean, propose a **per-app channel override** in
-otactl: `resolveChannel(app, arch, deviceID)` already takes `app` — extend the
-device record with an optional `AppChannels map[string]string` consulted before
-the single `device.Channel`, falling back to `device.Channel` then
-`defaultChannel`. That lets `betamacs-config` follow `kid-alex` while
-`betamacs`/`betamacs-tasks` stay on `stable`, with no cross-app coupling. This
-is the recommended target for the assignment UI; until then, Model A + shared
-channel is the pragmatic path and Model B is available with the noted caveat.
+**Recommended target.** Add a per-app channel override to otactl so
+`betamacs-config` can follow a per-kid channel while a device's `betamacs` /
+`betamacs-tasks` lanes stay on `stable`, with no cross-app coupling. The hook is
+already in place: `resolveChannel(ctx, app, arch, deviceID)`
+(`internal/firmware/service.go`) **already takes `app`** but ignores it. The
+change:
+
+- Extend the device record with an optional `AppChannels map[string]string`
+  (persisted as a JSON column / side table keyed by device id).
+- In `resolveChannel`, consult in order: `AppChannels[app]` →
+  `device.Channel` → server `defaultChannel`. This is a pure read-path change;
+  uploads and the manifest signature are untouched.
+
+This keeps Model A (shared lane + `ext:betamacs-tasks` entitlement) working
+unchanged for fleets where kids share policy, and makes true per-kid *config*
+assignment a single-field write that does not disturb the app/tasks lanes —
+resolving the Model B friction point (channel-wide pinning) described above.
+
+If the `AppChannels` change is not wanted, the fallback is **Model B as-is**:
+assignment writes `device.Channel` and every app for that device must publish to
+the per-kid channel. The endpoints below are written to work for either model —
+they set an (app, channel) pair per device; with `AppChannels` that lands in the
+map, without it the `app=betamacs-config` write degrades to setting
+`device.Channel` (and the UI warns about cross-app pinning).
+
+### otactl operator endpoints (proposed — needs sign-off before writes)
+
+Assignment is a **fleet-admin** action, so these are **operator/web-session**
+gated (`withRole`), NOT publisher-cert gated. Two of the three already exist and
+can be reused as-is; only the setter is new.
+
+| Method / path | Auth | Status | Purpose |
+|---|---|---|---|
+| `GET /admin/devices` | `withRole(RoleViewer)` | **exists** | list devices (id, app, arch, channel, description, lastSeen) |
+| `GET /admin/devices/{id}` | `withRole(RoleViewer)` | **exists** | one device's record |
+| `PUT /admin/devices/{id}/app-channel` | `withRole(RoleAdmin)` | **NEW** | body `{ app, channel }`; sets `AppChannels[app]=channel` (or, without the map change, sets `device.Channel` only when `app` is the device's own app) — audited |
+
+The new setter mirrors the existing `PUT /admin/devices/{id}/policy` handler and
+writes through a new `store.SetDeviceAppChannel(ctx, deviceID, app, channel)`
+(or `SetDeviceChannel` in the fallback model), appending an audit event.
+
+**Auth decision to confirm:** these must be reached with an otactl **operator
+identity**, which typeserver does not currently have. Two options for the
+typeserver→otactl hop, pick one:
+
+1. **Issue typeserver a service/operator identity** (a `CN=typeserver` client
+   cert mapped to an operator role, or a service bearer token otactl accepts on
+   `/admin/*`). typeserver then calls `/admin/devices*` on the operator's behalf,
+   still gated behind the human `ts_session` at typeserver's own edge. **This is
+   the recommended path** — it keeps the fleet-mutating credential (operator)
+   distinct from the publishing credential (publisher cert), so a compromised
+   publisher cert cannot re-point devices.
+2. **Forward the operator's own session** — only viable if typeserver and otactl
+   share the same operator SSO and otactl will accept a forwarded/introspected
+   token. More coupling; not recommended.
+
+Until one is chosen and provisioned, `/api/betamacs/devices` and
+`/api/betamacs/assign` stay **501** (device listing included — it rides the same
+operator gate). **Do not implement the assignment writes without this sign-off.**
+
+### typeserver contracts
+
+- `GET {origin}/api/betamacs/devices?app=&arch=` → `200 [{ deviceId, app, arch,
+  channel, appChannel?, description?, lastSeen? }]`. Session-gated; proxies
+  otactl `GET /admin/devices` over the chosen operator identity.
+- `POST {origin}/api/betamacs/assign` `{ deviceId, app, channel }` → `200 { ok:
+  true, deviceId, app, channel }`. Session-gated; the fleet-mutating call,
+  proxies otactl `PUT /admin/devices/{id}/app-channel`. `app` defaults to
+  `betamacs-config`. **This is the write that requires sign-off.**
+
+### UI (Devices tab)
+
+A read-only list first: device id, description, current channel, and (with
+`AppChannels`) the effective `betamacs-config` channel. Each row gets a channel
+picker whose "Assign" action calls `/api/betamacs/assign` — disabled/behind a
+confirm until the write path is signed off, matching the loud-error publish
+style. With the fallback model, the picker shows a cross-app-pinning warning.
 
 Users-as-targets are future (a user → device(s) mapping layer above this).
 
