@@ -349,6 +349,12 @@ pub fn run(
     let mut last_frontmost_check: Option<Instant> = None;
     let mut is_excluded = false;
     let mut was_excluded = false;
+    // The frontmost bundle id from the last sample (for the pause log), and
+    // the last id we logged, so we surface what betamacs actually sees
+    // exactly once per change — a wrong/unknown id (or None, a permission
+    // problem) is then visible in the log to explain a non-firing exclusion.
+    let mut excluded_id: Option<String> = None;
+    let mut last_logged_frontmost: Option<String> = None;
     loop {
         let cfg = shared.read().unwrap().clone();
 
@@ -394,9 +400,19 @@ pub fn run(
         if cfg.capture_exclusions.enabled && !cfg.capture_exclusions.bundle_ids.is_empty() {
             if last_frontmost_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 last_frontmost_check = Some(Instant::now());
-                is_excluded = cfg
-                    .capture_exclusions
-                    .is_excluded(frontmost_bundle_id().as_deref());
+                let fm = frontmost_bundle_id();
+                if fm != last_logged_frontmost {
+                    match &fm {
+                        Some(id) => tracing::info!("frontmost app: {id}"),
+                        None => tracing::warn!(
+                            "frontmost app unreadable (grant betamacs Automation for System \
+                             Events) — capture exclusions can't match"
+                        ),
+                    }
+                    last_logged_frontmost = fm.clone();
+                }
+                excluded_id = fm.clone();
+                is_excluded = cfg.capture_exclusions.is_excluded(fm.as_deref());
             }
         } else {
             is_excluded = false;
@@ -409,19 +425,44 @@ pub fn run(
                 cov_scale = 1.0;
                 health.boxes.store(0, Ordering::Relaxed);
                 overlay.set_regions(Vec::new())?;
+                // Actually STOP recording (not just skip censoring) so the
+                // whitelisted app is never captured and macOS drops the
+                // screen-recording indicator. Rebuilt on resume below.
+                capturer.stop_streams();
+                health.streams.store(0, Ordering::Relaxed);
                 let _ = overlay.set_status("paused: excluded app in focus".into());
-                tracing::info!("capture paused: an excluded app is frontmost");
+                tracing::info!(
+                    "capture STOPPED (screen recording off): excluded app frontmost ({})",
+                    excluded_id.as_deref().unwrap_or("?")
+                );
             }
-            // Healthy-by-policy, mirroring the disabled-by-policy branch.
+            // Healthy-by-policy, mirroring the disabled-by-policy branch: the
+            // daemon reads `enabled:false` as off-by-policy, not a blinded
+            // censor, so a stopped stream here never trips the quarantine.
             health.enabled.store(false, Ordering::Relaxed);
-            while capturer.try_recv().is_some() {}
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(300));
             continue;
         }
         if was_excluded {
-            was_excluded = false;
-            tracing::info!("capture resumed: excluded app lost focus");
-            menubar_status(&capturer, &loaded_model, &overlay);
+            // Excluded app lost focus: rebuild the streams (start recording
+            // again). Mirror the display-wake rebuild; only clear the paused
+            // state on success so a failed restart is retried next loop.
+            match SckCapturer::new(cfg.detection.capture_fps) {
+                Ok(new_capturer) => {
+                    capturer = new_capturer;
+                    last_frame_at.clear();
+                    probe_hashes.clear();
+                    streams_started = Instant::now();
+                    last_exclusion_attempt = None;
+                    was_excluded = false;
+                    menubar_status(&capturer, &loaded_model, &overlay);
+                    tracing::info!("capture resumed: excluded app lost focus");
+                }
+                Err(e) => {
+                    health.capture_ok.store(false, Ordering::Relaxed);
+                    tracing::error!("capture resume (stream restart) failed: {e}");
+                }
+            }
         }
 
         // Hot-swap the detector on model change.

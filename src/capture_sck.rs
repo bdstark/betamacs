@@ -276,6 +276,21 @@ impl SckCapturer {
             .iter()
             .any(|(id, _)| objc2_core_graphics::CGDisplayIsAsleep(*id))
     }
+
+    /// Stop and release every capture stream so macOS drops the
+    /// screen-recording indicator and no frames of the screen are produced.
+    /// The capturer is inert afterward (no displays, no frames); build a
+    /// fresh `SckCapturer` to resume. Used by the capture-exclusion pause so
+    /// a whitelisted app in focus is genuinely not recorded, not merely
+    /// un-censored.
+    pub fn stop_streams(&mut self) {
+        for (_, stream) in self.streams.drain(..) {
+            unsafe { stream.stopCaptureWithCompletionHandler(None) };
+        }
+        self.displays.clear();
+        self._outputs.clear();
+        self.self_excluded = false;
+    }
 }
 
 impl Drop for SckCapturer {
