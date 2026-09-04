@@ -1,17 +1,16 @@
-// Device assignment (STUB in this pass).
+// Device assignment.
 //
-// A strongly-typed layer over otactl's device API: list devices and point a
-// device at a config by setting its otactl channel. The heavy caveat
-// (surfaced in the UI): otactl resolves ONE channel per device for ALL apps
-// (resolveChannel reads a single device.Channel), so assigning a config
-// channel also moves that device's app + task-bank lanes. See
-// docs/config-app.md "Config -> device assignment".
+// A strongly-typed layer over otactl's device API (via typeserver): list
+// devices and point one at a betamacs-config channel. otactl now supports a
+// per-app channel override (AppChannels), so setting the config channel here
+// moves ONLY the device's betamacs-config lane — its betamacs app build and
+// betamacs-tasks bank stay on the device-wide channel. See docs/config-app.md
+// "Config -> device assignment".
 //
 // Endpoints are derived from the configured publish endpoint's origin:
-//   GET  {origin}/api/betamacs/devices          -> DeviceRow[]
-//   POST {origin}/api/betamacs/assign {deviceId, channel}
-// Both are documented stubs on the typeserver side in this pass; the UI
-// degrades gracefully when they are absent (501 / unconfigured).
+//   GET  {origin}/api/betamacs/devices          -> { devices: DeviceRow[] }
+//   POST {origin}/api/betamacs/assign {deviceId, channel}   (empty clears)
+// Session-gated on typeserver (the ts_session cookie rides along).
 
 import { css, html, LitElement, nothing } from "lit";
 import { customElement, state } from "lit/decorators.js";
@@ -19,8 +18,13 @@ import { store } from "../store.js";
 
 interface DeviceRow {
   deviceId: string;
-  label?: string;
+  description?: string;
+  arch?: string;
+  /** Device-wide channel (governs the app + tasks lanes). */
   channel?: string;
+  /** Per-app betamacs-config channel override; empty = follows `channel`. */
+  appChannel?: string;
+  lastSeen?: string;
 }
 
 @customElement("bm-assignment")
@@ -33,9 +37,9 @@ export class BmAssignment extends LitElement {
       color: var(--muted);
       font-size: 12.5px;
     }
-    .caveat {
-      background: color-mix(in srgb, #ff9f0a 14%, transparent);
-      border: 1px solid color-mix(in srgb, #ff9f0a 40%, transparent);
+    .note {
+      background: color-mix(in srgb, var(--accent, #0a84ff) 10%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent, #0a84ff) 32%, transparent);
       border-radius: 10px;
       padding: 10px 12px;
       font-size: 12.5px;
@@ -51,10 +55,25 @@ export class BmAssignment extends LitElement {
       text-align: left;
       padding: 8px 6px;
       border-bottom: 1px solid var(--border);
+      vertical-align: middle;
     }
     th {
       color: var(--muted);
       font-weight: 500;
+    }
+    code {
+      font: 12px/1.4 ui-monospace, monospace;
+    }
+    .pill {
+      display: inline-block;
+      font-size: 12px;
+      padding: 1px 8px;
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--muted) 16%, transparent);
+      color: var(--text);
+    }
+    .pill.override {
+      background: color-mix(in srgb, var(--accent, #0a84ff) 22%, transparent);
     }
     input {
       background: var(--bg);
@@ -64,7 +83,7 @@ export class BmAssignment extends LitElement {
       padding: 4px 8px;
       font: inherit;
       font-size: 13px;
-      width: 120px;
+      width: 130px;
     }
     button {
       border: 1px solid var(--border);
@@ -76,33 +95,67 @@ export class BmAssignment extends LitElement {
       font: inherit;
       font-size: 13px;
     }
-    .stub {
-      display: inline-block;
-      font-size: 11px;
-      padding: 1px 7px;
-      border-radius: 8px;
-      background: color-mix(in srgb, var(--muted) 18%, transparent);
-      color: var(--muted);
-      margin-left: 8px;
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .rowbtns {
+      display: flex;
+      gap: 6px;
     }
     .status {
       color: var(--muted);
       font-size: 12.5px;
       min-height: 1em;
-      margin-top: 10px;
+      margin-top: 12px;
+    }
+    .status.ok {
+      color: var(--ok, #34c759);
+      font-weight: 500;
+    }
+    .errbox {
+      margin-top: 12px;
+      border: 1px solid color-mix(in srgb, #ff3b30 55%, transparent);
+      background: color-mix(in srgb, #ff3b30 12%, transparent);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12.5px;
+    }
+    .errbox .title {
+      font-weight: 600;
+      color: #c00;
+      margin-bottom: 6px;
+    }
+    .errbox pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.45 ui-monospace, monospace;
+      color: var(--text);
+      max-height: 220px;
+      overflow: auto;
     }
   `;
 
   @state() private devices: DeviceRow[] = [];
   @state() private edits: Record<string, string> = {};
   @state() private status = "";
+  @state() private ok = false;
+  @state() private error = "";
   @state() private loaded = false;
+  @state() private busy = false;
+
+  connectedCallback(): void {
+    super.connectedCallback();
+    // Load on open; degrade to a clear message if the endpoint is unset.
+    void this.loadDevices();
+  }
 
   private base(): string | null {
     const ep = store.storeConfig.publishEndpoint;
     if (!ep) return null;
     try {
-      return new URL(ep).origin;
+      return new URL(ep, location.origin).origin;
     } catch {
       return null;
     }
@@ -112,38 +165,48 @@ export class BmAssignment extends LitElement {
     const base = this.base();
     if (!base) {
       this.status = "configure a publish endpoint first (its origin serves the device API)";
+      this.ok = false;
       return;
     }
+    this.busy = true;
+    this.error = "";
     this.status = "loading devices…";
+    this.ok = false;
     try {
       const res = await fetch(`${base}/api/betamacs/devices`, { credentials: "include" });
-      if (res.status === 501) {
-        this.status = "device API not wired yet (stub) — assignment is non-functional in this pass";
-        this.loaded = true;
-        return;
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}\n${(await res.text()).trim()}`);
       }
-      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-      this.devices = (await res.json()) as DeviceRow[];
+      const body = (await res.json()) as { devices?: DeviceRow[] };
+      this.devices = body.devices ?? [];
       this.loaded = true;
       this.status = `${this.devices.length} device(s)`;
+      this.ok = false;
     } catch (e) {
-      this.status = `load failed: ${e}`;
+      this.error = String(e instanceof Error ? e.message : e);
+      this.status = "load failed";
+      this.ok = false;
+    } finally {
+      this.busy = false;
     }
   }
 
-  private async assign(deviceId: string) {
+  private currentConfigChannel(d: DeviceRow): string {
+    return (d.appChannel ?? "").trim();
+  }
+
+  private editValue(d: DeviceRow): string {
+    return this.edits[d.deviceId] ?? this.currentConfigChannel(d);
+  }
+
+  private async assign(deviceId: string, channel: string) {
     const base = this.base();
-    const channel = this.edits[deviceId] ?? "";
-    if (!base || !channel) return;
-    if (
-      !confirm(
-        `Set device ${deviceId} to channel "${channel}"?\n\n` +
-          `This moves ALL apps on that device (app, config, tasks) to this channel — ` +
-          `otactl has one channel per device.`,
-      )
-    )
-      return;
-    this.status = "assigning…";
+    if (!base) return;
+    const verb = channel ? `set to config channel "${channel}"` : "cleared (falls back to device channel)";
+    this.busy = true;
+    this.error = "";
+    this.status = channel ? "assigning…" : "clearing…";
+    this.ok = false;
     try {
       const res = await fetch(`${base}/api/betamacs/assign`, {
         method: "POST",
@@ -151,35 +214,39 @@ export class BmAssignment extends LitElement {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ deviceId, channel }),
       });
-      if (res.status === 501) {
-        this.status = "assign not wired yet (stub)";
-        return;
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}\n${(await res.text()).trim()}`);
       }
-      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-      this.status = `assigned ${deviceId} -> ${channel}`;
+      this.status = `${deviceId} ${verb}`;
+      this.ok = true;
+      // Drop the local edit so the refreshed server value shows through.
+      const { [deviceId]: _drop, ...rest } = this.edits;
+      this.edits = rest;
       await this.loadDevices();
+      this.ok = true;
     } catch (e) {
-      this.status = `assign failed: ${e}`;
+      this.error = String(e instanceof Error ? e.message : e);
+      this.status = "assignment failed";
+      this.ok = false;
+    } finally {
+      this.busy = false;
     }
   }
 
   render() {
     return html`
       <bm-section heading="Device assignment">
-        <div class="caveat">
-          <b>Single channel per device.</b> otactl resolves one
-          <code>device.Channel</code> for every app. Assigning a config channel
-          here also moves that device's betamacs app build and task bank to the
-          same channel. Per-app channels are a proposed otactl change
-          (docs/config-app.md); until then prefer a shared channel +
-          per-kid entitlements, or accept the coupling.
+        <div class="note">
+          <b>Per-app config channel.</b> Setting a device's
+          <code>betamacs-config</code> channel here moves only its config lane —
+          the device's betamacs app build and betamacs-tasks bank stay on its
+          device-wide channel. Leave the field empty and Clear to remove the
+          override so config follows the device channel again.
         </div>
-        <p class="muted">
-          List devices from otactl (via the typeserver device API) and point one
-          at a channel. <span class="stub">stub — may be non-functional</span>
-        </p>
-        <div style="margin:8px 0">
-          <button @click=${this.loadDevices}>Load devices</button>
+        <div style="margin:8px 0; display:flex; gap:8px; align-items:center;">
+          <button @click=${this.loadDevices} ?disabled=${this.busy}>
+            ${this.busy ? "…" : "Refresh"}
+          </button>
         </div>
         ${this.loaded && this.devices.length
           ? html`
@@ -187,36 +254,77 @@ export class BmAssignment extends LitElement {
                 <thead>
                   <tr>
                     <th>Device</th>
-                    <th>Current channel</th>
-                    <th>New channel</th>
+                    <th>Device channel</th>
+                    <th>Config channel</th>
+                    <th>Set config channel</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  ${this.devices.map(
-                    (d) => html`
+                  ${this.devices.map((d) => {
+                    const cur = this.currentConfigChannel(d);
+                    const edit = this.editValue(d);
+                    const changed = edit.trim() !== cur;
+                    return html`
                       <tr>
-                        <td>${d.label ?? d.deviceId}</td>
-                        <td>${d.channel ?? "—"}</td>
+                        <td>
+                          <div>${d.description || d.deviceId}</div>
+                          ${d.description
+                            ? html`<div class="muted"><code>${d.deviceId}</code></div>`
+                            : nothing}
+                        </td>
+                        <td>${d.channel ? html`<span class="pill">${d.channel}</span>` : "—"}</td>
+                        <td>
+                          ${cur
+                            ? html`<span class="pill override">${cur}</span>`
+                            : html`<span class="muted">follows device</span>`}
+                        </td>
                         <td>
                           <input
-                            .value=${this.edits[d.deviceId] ?? d.channel ?? ""}
-                            @change=${(e: Event) =>
+                            .value=${edit}
+                            placeholder=${d.channel ?? "channel"}
+                            ?disabled=${this.busy}
+                            @input=${(e: Event) =>
                               (this.edits = {
                                 ...this.edits,
                                 [d.deviceId]: (e.target as HTMLInputElement).value,
                               })}
                           />
                         </td>
-                        <td><button @click=${() => this.assign(d.deviceId)}>Assign</button></td>
+                        <td>
+                          <div class="rowbtns">
+                            <button
+                              ?disabled=${this.busy || !changed}
+                              @click=${() => this.assign(d.deviceId, edit.trim())}
+                            >
+                              ${edit.trim() ? "Assign" : "Clear"}
+                            </button>
+                            ${cur
+                              ? html`<button
+                                  ?disabled=${this.busy}
+                                  @click=${() => this.assign(d.deviceId, "")}
+                                >
+                                  Clear
+                                </button>`
+                              : nothing}
+                          </div>
+                        </td>
                       </tr>
-                    `,
-                  )}
+                    `;
+                  })}
                 </tbody>
               </table>
             `
+          : this.loaded
+            ? html`<p class="muted">No devices returned.</p>`
+            : nothing}
+        <div class="status ${this.ok ? "ok" : ""}">${this.status}</div>
+        ${this.error
+          ? html`<div class="errbox">
+              <div class="title">Error</div>
+              <pre>${this.error}</pre>
+            </div>`
           : nothing}
-        <div class="status">${this.status}</div>
       </bm-section>
     `;
   }
