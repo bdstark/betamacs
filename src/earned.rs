@@ -218,23 +218,17 @@ struct FocusState {
 /// Whitelisted hosts are exempt; a non-empty blacklist restricts monitoring
 /// to listed hosts.
 ///
-/// DESIGN NOTE — "active" here means *any* recent input (idle timer), which
-/// is a proxy for scrolling, not scrolling itself. So legitimate focused
-/// work on one page — reading while highlighting text, or writing an email —
-/// keeps input alive and would count toward the limit. Two mitigations:
-///   1. (in use) Scope with `blacklist_hosts` to feed/time-sink sites, so
-///      reading/writing on unlisted sites is never monitored. On a feed,
-///      "active" ≈ scrolling anyway.
-///   2. (future) Count real scroll events with a `CGEventTap` on
-///      `scrollWheel`, so only actual scrolling accrues (reading/typing with
-///      little scroll is exempt everywhere). More precise and site-list-free,
-///      but requires the heavier Accessibility/input-monitoring TCC grant, so
-///      it is deliberately not used yet. Add it if whole-web doomscroll
-///      detection (independent of a blacklist) is wanted.
+/// "Active" comes from `active_scroll`: when the scroll event tap is running
+/// (Accessibility granted, see `scroll.rs`), only REAL scrolling counts, so
+/// reading-while-highlighting or writing an email (little scroll) is exempt
+/// everywhere. Without the grant `active_scroll` is None and we fall back to
+/// "not idle" (any recent input), which over-counts focused work — mitigate
+/// that fallback by scoping to feeds via `blacklist_hosts`.
 fn track_focus(
     fl: &FocusLimitSettings,
     health: &Health,
     idle: f64,
+    active_scroll: Option<bool>,
     url: Option<&str>,
     host: Option<&str>,
     elapsed: Duration,
@@ -262,8 +256,11 @@ fn track_focus(
         st.active_secs = 0.0;
         return;
     }
-    // Same tab: count only active time (idle = passive, e.g. video).
-    if idle <= fl.idle_reset_sec as f64 {
+    // Same tab: count only ACTIVE time. Prefer real scroll activity (from
+    // the event tap); when that isn't available (no Accessibility grant),
+    // fall back to "not idle" (any recent input).
+    let active = active_scroll.unwrap_or(idle <= fl.idle_reset_sec as f64);
+    if active {
         st.active_secs += elapsed.as_secs_f64();
     }
     if st.active_secs >= fl.same_tab_limit_min.max(1) as f64 * 60.0 {
@@ -341,9 +338,14 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
                 report_earn(0, false, et);
             }
 
-            // Same-tab focus limit.
+            // Same-tab focus limit. Drain the scroll counter every tick so
+            // it reflects only this interval (and stays bounded when off).
+            let scrolled = crate::scroll::take_scrolled();
             if fl.enabled {
-                track_focus(fl, &health, idle, url.as_deref(), host.as_deref(), elapsed, &mut focus);
+                track_focus(
+                    fl, &health, idle, scrolled, url.as_deref(), host.as_deref(), elapsed,
+                    &mut focus,
+                );
             } else {
                 focus = FocusState::default();
             }
@@ -378,7 +380,27 @@ mod tests {
         let (u, host) = (Some("https://reddit.com/r/x"), Some("reddit.com"));
         // sample 1 sets the tab; 2 and 3 accrue 30s each -> 60s -> trip.
         for _ in 0..3 {
-            track_focus(&cfg, &h, 0.0, u, host, Duration::from_secs(30), &mut st);
+            track_focus(&cfg, &h, 0.0, None, u, host, Duration::from_secs(30), &mut st);
+        }
+        assert!(tripped(&h));
+    }
+
+    #[test]
+    fn focus_scroll_gates_activity() {
+        // With the event tap active (Some(...)): only scrolling accrues, so
+        // a static page with input-but-no-scroll never trips.
+        let h = Health::new();
+        let cfg = fl(1, &[], &[]);
+        let (u, host) = (Some("https://blog.example/post"), Some("blog.example"));
+        let mut st = FocusState::default();
+        for _ in 0..20 {
+            // active input, but no scroll -> Some(false) -> no accrual.
+            track_focus(&cfg, &h, 0.0, Some(false), u, host, Duration::from_secs(30), &mut st);
+        }
+        assert!(!tripped(&h), "reading/highlighting (no scroll) must not trip");
+        // Now actually scrolling -> Some(true) -> accrues and trips.
+        for _ in 0..3 {
+            track_focus(&cfg, &h, 0.0, Some(true), u, host, Duration::from_secs(30), &mut st);
         }
         assert!(tripped(&h));
     }
@@ -391,7 +413,7 @@ mod tests {
         let (u, host) = (Some("https://youtube.com/watch?v=x"), Some("youtube.com"));
         for _ in 0..20 {
             // idle 120s > idle_reset_sec: passive, no accrual.
-            track_focus(&cfg, &h, 120.0, u, host, Duration::from_secs(30), &mut st);
+            track_focus(&cfg, &h, 120.0, None, u, host, Duration::from_secs(30), &mut st);
         }
         assert!(!tripped(&h));
     }
@@ -403,7 +425,7 @@ mod tests {
         let mut st = FocusState::default();
         for _ in 0..20 {
             track_focus(
-                &cfg, &h, 0.0,
+                &cfg, &h, 0.0, None,
                 Some("https://khanacademy.org/math"), Some("khanacademy.org"),
                 Duration::from_secs(30), &mut st,
             );
@@ -418,13 +440,13 @@ mod tests {
         let mut st = FocusState::default();
         // Non-blacklisted host is ignored.
         for _ in 0..20 {
-            track_focus(&cfg, &h, 0.0, Some("https://news.example/a"), Some("news.example"),
+            track_focus(&cfg, &h, 0.0, None, Some("https://news.example/a"), Some("news.example"),
                 Duration::from_secs(30), &mut st);
         }
         assert!(!tripped(&h));
         // Blacklisted host is monitored and trips.
         for _ in 0..3 {
-            track_focus(&cfg, &h, 0.0, Some("https://tiktok.com/@x"), Some("tiktok.com"),
+            track_focus(&cfg, &h, 0.0, None, Some("https://tiktok.com/@x"), Some("tiktok.com"),
                 Duration::from_secs(30), &mut st);
         }
         assert!(tripped(&h));
@@ -436,10 +458,10 @@ mod tests {
         let cfg = fl(1, &[], &[]);
         let mut st = FocusState::default();
         // Almost trips on tab A (30s accrued), then navigates: timer resets.
-        track_focus(&cfg, &h, 0.0, Some("https://a.example/1"), Some("a.example"), Duration::from_secs(30), &mut st);
-        track_focus(&cfg, &h, 0.0, Some("https://a.example/1"), Some("a.example"), Duration::from_secs(30), &mut st);
-        track_focus(&cfg, &h, 0.0, Some("https://b.example/2"), Some("b.example"), Duration::from_secs(30), &mut st);
-        track_focus(&cfg, &h, 0.0, Some("https://b.example/2"), Some("b.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, None, Some("https://a.example/1"), Some("a.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, None, Some("https://a.example/1"), Some("a.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, None, Some("https://b.example/2"), Some("b.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, None, Some("https://b.example/2"), Some("b.example"), Duration::from_secs(30), &mut st);
         assert!(!tripped(&h), "navigation should reset the dwell timer");
     }
 

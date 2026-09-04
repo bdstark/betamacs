@@ -11,6 +11,7 @@ mod overlay;
 mod prompt;
 mod smappservice;
 mod pipeline;
+mod scroll;
 mod server;
 mod settings;
 mod statusframe;
@@ -423,6 +424,9 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     // Live status HUD feed (composes stats each second; the window is shown
     // on demand from the menu bar). Display-only.
     statusframe::spawn(health.clone(), handle.clone());
+    // Scroll-activity monitor for the focus limit (needs Accessibility; the
+    // focus limit falls back to idle-based activity without it).
+    scroll::spawn();
 
     std::thread::spawn(move || {
         if let Err(e) = pipeline::run(shared, handle, health) {
