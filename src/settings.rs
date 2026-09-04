@@ -73,6 +73,10 @@ pub struct ModulePatches {
     pub focus_limit: Option<FocusLimitPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_integrity: Option<ClockIntegrityPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_escalation: Option<CoverageEscalationPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_exclusions: Option<CaptureExclusionPatch>,
 }
 
 // ---------------------------------------------------------------- detection
@@ -763,6 +767,149 @@ fn default_weight() -> f32 {
     1.0
 }
 
+// -------------------------------------------------------- coverage escalation
+//
+// Escalating coverage: the more sustained detection/exposure there is, the
+// LARGER the censor boxes grow, so persistent bad content increasingly
+// blankets the screen and there is no value in trying to peek around a box.
+// It reuses the same rolling-window accumulator the exposure budget uses
+// (see `ExposureTracker` in pipeline.rs): its own metric is summed over
+// `window_sec`, and when that sum crosses `threshold` the box inflation
+// "kicks in" at `start_scale` and grows by `growth_per_unit` per unit of
+// continued over-threshold exposure, capped at `max_scale`. When the sum
+// falls back under the threshold the scale decays toward 1.0 at
+// `decay_per_sec`. Purely additive to the configured x/y box scale, and a
+// no-op unless enabled. Policy only; disabled by default.
+
+/// Coverage-escalation policy (lives in `betamacs-config`). Disabled by
+/// default; when off, box sizes are exactly the configured x/y scale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageEscalationSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which rolling metric drives escalation (same choices as the exposure
+    /// budget). Tracked independently of the exposure budget's own metric.
+    pub metric: ExposureMetric,
+    /// Rolling-window sum of `metric` at/above which inflation kicks in.
+    pub threshold: f32,
+    /// Rolling window the metric is summed over.
+    pub window_sec: u32,
+    /// Box scale the instant the threshold is crossed (1.5 = 50% larger).
+    pub start_scale: f32,
+    /// Extra scale added per unit of over-threshold exposure (sum above the
+    /// threshold), so persistent content keeps growing the boxes.
+    pub growth_per_unit: f32,
+    /// Hard cap on the escalation scale.
+    pub max_scale: f32,
+    /// How fast the scale decays back toward 1.0 (per second) once the sum
+    /// is back under the threshold.
+    pub decay_per_sec: f32,
+}
+
+impl Default for CoverageEscalationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            metric: ExposureMetric::Events,
+            threshold: 20.0,
+            window_sec: 300,
+            start_scale: 1.5,
+            growth_per_unit: 0.05,
+            max_scale: 3.0,
+            decay_per_sec: 0.1,
+        }
+    }
+}
+
+/// Partial coverage-escalation policy for layering.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageEscalationPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<ExposureMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub growth_per_unit: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decay_per_sec: Option<f32>,
+}
+
+impl CoverageEscalationSettings {
+    pub fn apply(&mut self, p: &CoverageEscalationPatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, metric, threshold, window_sec, start_scale, growth_per_unit,
+            max_scale, decay_per_sec
+        );
+    }
+}
+
+// -------------------------------------------------------- capture exclusions
+//
+// Screen-recording whitelist by frontmost app: certain apps must never be
+// captured or censored. When a whitelisted app is frontmost, the pipeline
+// pauses capture/detection and clears any active censor boxes for as long as
+// that app has focus, resuming the moment focus leaves. The pause is
+// policy-driven, so the daemon must treat it as healthy-by-policy (exactly
+// like `detection.enabled: false`), never as a blinded/tampered censor — see
+// pipeline.rs. Policy only; disabled and empty by default.
+
+/// Capture-exclusion policy (lives in `betamacs-config`). Disabled by
+/// default; an empty `bundle_ids` also makes it a no-op.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureExclusionSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact frontmost bundle-id matches that pause capture while frontmost,
+    /// e.g. "com.apple.FaceTime", "us.zoom.xos".
+    #[serde(default)]
+    pub bundle_ids: Vec<String>,
+}
+
+/// Partial capture-exclusion policy for layering.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureExclusionPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_ids: Option<Vec<String>>,
+}
+
+impl CaptureExclusionSettings {
+    pub fn apply(&mut self, p: &CaptureExclusionPatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(enabled, bundle_ids);
+    }
+
+    /// True when `frontmost` (the frontmost app's bundle id) is on the
+    /// whitelist and the policy is active. Pure — unit-tested.
+    pub fn is_excluded(&self, frontmost: Option<&str>) -> bool {
+        if !self.enabled || self.bundle_ids.is_empty() {
+            return false;
+        }
+        match frontmost {
+            Some(id) => self.bundle_ids.iter().any(|b| b == id),
+            None => false,
+        }
+    }
+}
+
 // -------------------------------------------------------------- earned time
 //
 // A gate (not a punishment or liveness check): during a scheduled window the
@@ -1068,6 +1215,10 @@ pub struct Effective {
     pub focus_limit: FocusLimitSettings,
     #[serde(default)]
     pub clock_integrity: ClockIntegritySettings,
+    #[serde(default)]
+    pub coverage_escalation: CoverageEscalationSettings,
+    #[serde(default)]
+    pub capture_exclusions: CaptureExclusionSettings,
 }
 
 impl Package {
@@ -1100,6 +1251,12 @@ impl Package {
             }
             if let Some(p) = &patches.clock_integrity {
                 effective.clock_integrity.apply(p);
+            }
+            if let Some(p) = &patches.coverage_escalation {
+                effective.coverage_escalation.apply(p);
+            }
+            if let Some(p) = &patches.capture_exclusions {
+                effective.capture_exclusions.apply(p);
             }
         }
         // Pool the lines of the referenced text sets, in reference order.
@@ -1270,5 +1427,75 @@ pub fn parse_color(s: &str) -> Option<(f64, f64, f64, f64)> {
             parse(6)? as f64 / 255.0,
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_exclusion_matching() {
+        let mut cfg = CaptureExclusionSettings::default();
+        assert!(
+            !cfg.is_excluded(Some("com.apple.FaceTime")),
+            "disabled by default"
+        );
+        cfg.enabled = true;
+        assert!(
+            !cfg.is_excluded(Some("com.apple.FaceTime")),
+            "empty list = no match"
+        );
+        cfg.bundle_ids = vec!["com.apple.FaceTime".into(), "us.zoom.xos".into()];
+        assert!(cfg.is_excluded(Some("com.apple.FaceTime")));
+        assert!(cfg.is_excluded(Some("us.zoom.xos")));
+        assert!(!cfg.is_excluded(Some("com.apple.Safari")));
+        assert!(
+            !cfg.is_excluded(None),
+            "unknown frontmost fails open to censoring"
+        );
+    }
+
+    #[test]
+    fn capture_exclusion_disabled_ignores_list() {
+        let cfg = CaptureExclusionSettings {
+            enabled: false,
+            bundle_ids: vec!["com.apple.FaceTime".into()],
+        };
+        assert!(!cfg.is_excluded(Some("com.apple.FaceTime")));
+    }
+
+    #[test]
+    fn new_policies_off_by_default() {
+        assert!(!CoverageEscalationSettings::default().enabled);
+        assert!(!CaptureExclusionSettings::default().enabled);
+        assert!(CaptureExclusionSettings::default().bundle_ids.is_empty());
+    }
+
+    #[test]
+    fn coverage_escalation_patch_layers() {
+        let mut s = CoverageEscalationSettings::default();
+        s.apply(&CoverageEscalationPatch {
+            enabled: Some(true),
+            start_scale: Some(2.0),
+            max_scale: Some(4.0),
+            ..Default::default()
+        });
+        assert!(s.enabled);
+        assert_eq!(s.start_scale, 2.0);
+        assert_eq!(s.max_scale, 4.0);
+        // Untouched fields keep their defaults.
+        assert_eq!(s.threshold, 20.0);
+    }
+
+    #[test]
+    fn capture_exclusion_patch_layers() {
+        let mut s = CaptureExclusionSettings::default();
+        s.apply(&CaptureExclusionPatch {
+            enabled: Some(true),
+            bundle_ids: Some(vec!["com.apple.FaceTime".into()]),
+        });
+        assert!(s.enabled);
+        assert_eq!(s.bundle_ids, vec!["com.apple.FaceTime".to_string()]);
     }
 }
