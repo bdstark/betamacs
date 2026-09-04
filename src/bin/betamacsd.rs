@@ -773,8 +773,11 @@ fn handle_client(
                     let e = earned.lock().unwrap();
                     (e.ledger.balance_min, e.gate_active, e.ledger.earned_today_min)
                 };
+                let assigned_tz = std::fs::read_to_string(managed_dir.join("assigned-timezone"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
@@ -782,6 +785,8 @@ fn handle_client(
                     read_epoch(&managed_dir.join("epoch-tasks")),
                     a.enabled,
                     a.challenge_overdue,
+                    a.clock_tamper,
+                    assigned_tz,
                     quarantine_secs,
                     earned_balance_min,
                     earned_gate_active,

@@ -40,6 +40,12 @@ fn compose(health: &Health) -> String {
     let f = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_f64());
     let i = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_i64());
     let b = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_bool());
+    let s_of = |k: &str| {
+        d.as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    };
 
     let enabled = health.enabled.load(Ordering::Relaxed);
     let capture = health.capture_ok.load(Ordering::Relaxed);
@@ -53,10 +59,14 @@ fn compose(health: &Health) -> String {
     let today = f("earnedTodayMin").unwrap_or(0.0);
     let lockout = i("exposureLockoutSecs").unwrap_or(0);
     let challenge_overdue = b("challengeOverdue").unwrap_or(false);
+    let clock_tamper = b("clockTamper").unwrap_or(false);
+    let assigned_tz = s_of("assignedTimezone").filter(|t| !t.is_empty());
     let heartbeat = i("heartbeatAgeSecs");
     let tasks_epoch = i("tasksEpoch").unwrap_or(0);
 
-    let lockdown = if lockout > 0 {
+    let lockdown = if clock_tamper {
+        "LOCKED — clock tampered".to_string()
+    } else if lockout > 0 {
         format!("LOCKED — timed penalty, {lockout}s left")
     } else if challenge_overdue {
         "LOCKED — unanswered challenge".to_string()
@@ -92,6 +102,11 @@ fn compose(health: &Health) -> String {
         None => s += "Earned time: (daemon unreachable)\n",
     }
     s += &format!("Challenge: {}\n", if challenge_overdue { "OVERDUE" } else { "none" });
+    match (&assigned_tz, clock_tamper) {
+        (_, true) => s += "Clock: TAMPER — changed while running\n",
+        (Some(tz), false) => s += &format!("Clock: ok · tz {tz}\n"),
+        (None, false) => s += "Clock: not configured\n",
+    }
     s += &format!("config epoch {cfg_epoch}");
     if tasks_epoch > 0 {
         s += &format!(" · tasks epoch {tasks_epoch}");
