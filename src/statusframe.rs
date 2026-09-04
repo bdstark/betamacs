@@ -57,7 +57,7 @@ fn compose(health: &Health) -> String {
     let tasks_epoch = i("tasksEpoch").unwrap_or(0);
 
     let lockdown = if lockout > 0 {
-        format!("LOCKED — exposure penalty, {lockout}s left")
+        format!("LOCKED — timed penalty, {lockout}s left")
     } else if challenge_overdue {
         "LOCKED — unanswered challenge".to_string()
     } else if gate && balance.is_some_and(|b| b <= 0.0) {

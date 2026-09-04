@@ -600,6 +600,23 @@ fn handle_client(
                         tracing::warn!("agent reports exposure over budget — network lockout for {secs}s");
                     }
                 }
+                // Same-tab focus limit tripped: another timed full-block,
+                // held on the same deadline (whichever is longer wins).
+                if msg
+                    .get("focusOverLimit")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let secs = msg.get("focusPenaltySec").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if secs > 0 {
+                        let until = Instant::now() + Duration::from_secs(secs);
+                        a.exposure_penalty_until = Some(match a.exposure_penalty_until {
+                            Some(prev) if prev > until => prev,
+                            _ => until,
+                        });
+                        tracing::warn!("agent reports same-tab focus limit — network lockout for {secs}s");
+                    }
+                }
                 if !a.capture_ok {
                     tracing::warn!("agent reports capture unhealthy (Screen Recording revoked?)");
                 }

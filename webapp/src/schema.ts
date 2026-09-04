@@ -246,12 +246,26 @@ export interface EarnedTimeSettings {
 }
 export type EarnedTimePatch = Partial<EarnedTimeSettings>;
 
+// -------------------------------------------------------------- focus limit
+// Auto-lockout for staying actively on one browser tab too long (active
+// scrolling; idle/video is exempt). Policy only; kids-only via the task bank.
+export interface FocusLimitSettings {
+  enabled: boolean;
+  sameTabLimitMin: number;
+  lockoutMin: number;
+  idleResetSec: number;
+  whitelistHosts: string[]; // exempt (never trigger)
+  blacklistHosts: string[]; // if non-empty, only these are monitored
+}
+export type FocusLimitPatch = Partial<FocusLimitSettings>;
+
 export interface ModulePatches {
   detection?: DetectionPatch;
   censor?: CensorPatch;
   challenge?: ChallengePatch;
   exposure?: ExposurePatch;
   earnedTime?: EarnedTimePatch;
+  focusLimit?: FocusLimitPatch;
 }
 
 export interface NamedConfig {
@@ -274,6 +288,7 @@ export interface Effective {
   challenge: ChallengeSettings;
   exposure: ExposureSettings;
   earnedTime: EarnedTimeSettings;
+  focusLimit: FocusLimitSettings;
 }
 
 export function defaultDetection(): DetectionSettings {
@@ -407,6 +422,17 @@ export function defaultEarnedTime(): EarnedTimeSettings {
   };
 }
 
+export function defaultFocusLimit(): FocusLimitSettings {
+  return {
+    enabled: false,
+    sameTabLimitMin: 10,
+    lockoutMin: 10,
+    idleResetSec: 60,
+    whitelistHosts: [],
+    blacklistHosts: [],
+  };
+}
+
 export function resolve(pkg: Package): Effective {
   const effective: Effective = {
     detection: defaultDetection(),
@@ -414,6 +440,7 @@ export function resolve(pkg: Package): Effective {
     challenge: defaultChallenge(),
     exposure: defaultExposure(),
     earnedTime: defaultEarnedTime(),
+    focusLimit: defaultFocusLimit(),
   };
   const layerPatches = pkg.layers
     .map((name) => pkg.namedConfigs.find((c) => c.name === name)?.settings)
@@ -424,6 +451,7 @@ export function resolve(pkg: Package): Effective {
     if (patches.challenge) Object.assign(effective.challenge, patches.challenge);
     if (patches.exposure) Object.assign(effective.exposure, patches.exposure);
     if (patches.earnedTime) Object.assign(effective.earnedTime, patches.earnedTime);
+    if (patches.focusLimit) Object.assign(effective.focusLimit, patches.focusLimit);
   }
   effective.censor.textOverlay.lines = resolveTextLines(pkg, effective.censor.textOverlay);
   return effective;

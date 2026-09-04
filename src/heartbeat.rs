@@ -45,6 +45,11 @@ pub struct Health {
     /// threshold, for the status HUD (rounded; 0 when exposure disabled).
     pub exposure_recent: AtomicU32,
     pub exposure_block: AtomicU32,
+    /// Edge flag: the same-tab focus limit was just exceeded. Consumed by
+    /// the heartbeat (swap) so one trip = one timed lockout, held by the
+    /// daemon for `focus_penalty_secs`.
+    pub focus_over_limit: AtomicBool,
+    pub focus_penalty_secs: AtomicU32,
 }
 
 impl Health {
@@ -60,10 +65,11 @@ impl Health {
 /// install's daemon notices missing heartbeats on its own clock.
 pub fn spawn(health: Arc<Health>) {
     std::thread::spawn(move || loop {
-        // Consume the exposure edge so a single trip = a single lockout.
+        // Consume the timed-lockout edges so a single trip = a single lockout.
         let over_budget = health.exposure_over_budget.swap(false, Ordering::Relaxed);
+        let focus_over = health.focus_over_limit.swap(false, Ordering::Relaxed);
         let line = format!(
-            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureOverBudget\":{},\"exposurePenaltySec\":{}}}\n",
+            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureOverBudget\":{},\"exposurePenaltySec\":{},\"focusOverLimit\":{},\"focusPenaltySec\":{}}}\n",
             std::process::id(),
             health.streams.load(Ordering::Relaxed),
             health.boxes.load(Ordering::Relaxed),
@@ -73,6 +79,8 @@ pub fn spawn(health: Arc<Health>) {
             health.challenge_overdue.load(Ordering::Relaxed),
             over_budget,
             health.exposure_penalty_secs.load(Ordering::Relaxed),
+            focus_over,
+            health.focus_penalty_secs.load(Ordering::Relaxed),
         );
         match UnixStream::connect(DAEMON_SOCKET) {
             Ok(mut stream) => {

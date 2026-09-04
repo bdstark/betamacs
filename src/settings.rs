@@ -69,6 +69,8 @@ pub struct ModulePatches {
     pub exposure: Option<ExposurePatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earned_time: Option<EarnedTimePatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_limit: Option<FocusLimitPatch>,
 }
 
 // ---------------------------------------------------------------- detection
@@ -879,6 +881,79 @@ impl EarnedTimeSettings {
     }
 }
 
+// ------------------------------------------------------------- focus limit
+//
+// Auto-lockout when the user stays ACTIVELY on one browser tab too long
+// (active scrolling — passive video watching registers as idle and does
+// not count). "Same tab" is detected as the frontmost browser's
+// current-tab URL staying unchanged while the browser is frontmost and the
+// user is not idle. Kids-only for free via the same task-bank gate as
+// earned-time. Policy only; disabled by default.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct FocusLimitSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Active minutes on a single URL before the lockout trips.
+    pub same_tab_limit_min: u32,
+    /// How long the network lockout lasts.
+    pub lockout_min: u32,
+    /// No input for this long counts as passive (video): dwell pauses.
+    pub idle_reset_sec: u32,
+    /// Host suffixes that are exempt — dwell never accrues on these.
+    #[serde(default)]
+    pub whitelist_hosts: Vec<String>,
+    /// If non-empty, ONLY these host suffixes are monitored; everything
+    /// else is ignored. Empty = monitor all (minus the whitelist).
+    #[serde(default)]
+    pub blacklist_hosts: Vec<String>,
+}
+
+impl Default for FocusLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            same_tab_limit_min: 10,
+            lockout_min: 10,
+            idle_reset_sec: 60,
+            whitelist_hosts: Vec::new(),
+            blacklist_hosts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct FocusLimitPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_tab_limit_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockout_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reset_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whitelist_hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blacklist_hosts: Option<Vec<String>>,
+}
+
+impl FocusLimitSettings {
+    pub fn apply(&mut self, p: &FocusLimitPatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, same_tab_limit_min, lockout_min, idle_reset_sec,
+            whitelist_hosts, blacklist_hosts
+        );
+    }
+}
+
 // ---------------------------------------------------------------- resolution
 
 /// Fully resolved settings for all modules.
@@ -893,6 +968,8 @@ pub struct Effective {
     pub exposure: ExposureSettings,
     #[serde(default)]
     pub earned_time: EarnedTimeSettings,
+    #[serde(default)]
+    pub focus_limit: FocusLimitSettings,
 }
 
 impl Package {
@@ -919,6 +996,9 @@ impl Package {
             }
             if let Some(p) = &patches.earned_time {
                 effective.earned_time.apply(p);
+            }
+            if let Some(p) = &patches.focus_limit {
+                effective.focus_limit.apply(p);
             }
         }
         // Pool the lines of the referenced text sets, in reference order.

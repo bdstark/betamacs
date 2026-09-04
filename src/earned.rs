@@ -17,11 +17,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::heartbeat::{Health, DAEMON_SOCKET};
-use crate::settings::{EarnSource, EarnedTimeSettings, Effective};
+use crate::settings::{EarnSource, EarnedTimeSettings, Effective, FocusLimitSettings};
 
 /// Is the earned-time gate active right now? Enabled, and the local day/time
 /// falls inside a schedule window. Uses `/bin/date` to avoid a timezone
@@ -93,10 +94,10 @@ fn frontmost_bundle_id() -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// The current-tab host of `bundle_id` if it is a browser we know how to ask.
-/// Wrapped in an AppleScript `try` so a missing window or a denied Automation
-/// grant yields None instead of an error.
-fn browser_url_host(bundle_id: &str) -> Option<String> {
+/// The frontmost browser's current-tab URL, if `bundle_id` is a browser we
+/// know how to ask. Wrapped in an AppleScript `try` so a missing window or a
+/// denied Automation grant yields None instead of an error.
+fn browser_url(bundle_id: &str) -> Option<String> {
     let app = match bundle_id {
         "com.apple.Safari" => "Safari",
         "com.apple.SafariTechnologyPreview" => "Safari Technology Preview",
@@ -125,7 +126,17 @@ fn browser_url_host(bundle_id: &str) -> Option<String> {
         return None;
     }
     let url = String::from_utf8_lossy(&out.stdout);
-    host_of(url.trim())
+    let url = url.trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
+/// Does `host` match any suffix in `list` ("youtube.com" matches
+/// "youtube.com" and "*.youtube.com")?
+fn host_matches_any(host: &str, list: &[String]) -> bool {
+    list.iter().any(|s| {
+        let s = s.trim_start_matches('.').to_lowercase();
+        !s.is_empty() && (host == s || host.ends_with(&format!(".{s}")))
+    })
 }
 
 /// Extract the lowercased host from a URL, without pulling in a URL crate.
@@ -190,66 +201,138 @@ fn source_matches(
     false
 }
 
-/// Spawn the activity monitor. Idles while the gate is disabled; while
-/// enabled, samples every `TICK` and accrues active minutes per source.
+/// Mutable dwell state for the same-tab focus limit.
+#[derive(Default)]
+struct FocusState {
+    /// The URL currently being timed (None = not tracking).
+    url: Option<String>,
+    /// Active (non-idle) seconds accrued on `url`.
+    active_secs: f64,
+    /// Suppress re-triggering until this passes (the lockout window).
+    locked_until: Option<Instant>,
+}
+
+/// Advance the same-tab focus timer for one sample and trip a timed lockout
+/// when the active dwell on one URL exceeds the limit. Dwell accrues only
+/// while the user is NOT idle (active scrolling); passive video watching is
+/// idle and pauses it. Whitelisted hosts are exempt; a non-empty blacklist
+/// restricts monitoring to listed hosts.
+fn track_focus(
+    fl: &FocusLimitSettings,
+    health: &Health,
+    idle: f64,
+    url: Option<&str>,
+    host: Option<&str>,
+    elapsed: Duration,
+    st: &mut FocusState,
+) {
+    // Hold off while a lockout it triggered is still in effect.
+    if st.locked_until.is_some_and(|t| t > Instant::now()) {
+        st.url = None;
+        st.active_secs = 0.0;
+        return;
+    }
+    let host = host.unwrap_or("");
+    let monitored = url.is_some()
+        && !host_matches_any(host, &fl.whitelist_hosts)
+        && (fl.blacklist_hosts.is_empty() || host_matches_any(host, &fl.blacklist_hosts));
+    if !monitored {
+        st.url = None;
+        st.active_secs = 0.0;
+        return;
+    }
+    let url = url.unwrap();
+    if st.url.as_deref() != Some(url) {
+        // Navigated (or first sight): restart the timer for this tab.
+        st.url = Some(url.to_string());
+        st.active_secs = 0.0;
+        return;
+    }
+    // Same tab: count only active time (idle = passive, e.g. video).
+    if idle <= fl.idle_reset_sec as f64 {
+        st.active_secs += elapsed.as_secs_f64();
+    }
+    if st.active_secs >= fl.same_tab_limit_min.max(1) as f64 * 60.0 {
+        let secs = fl.lockout_min.max(1) * 60;
+        health.focus_penalty_secs.store(secs, Ordering::Relaxed);
+        health.focus_over_limit.store(true, Ordering::Relaxed);
+        st.locked_until = Some(Instant::now() + Duration::from_secs(secs as u64));
+        st.url = None;
+        st.active_secs = 0.0;
+        tracing::warn!("focus: active same-tab limit reached on {host} — {secs}s lockout");
+    }
+}
+
+/// Spawn the activity monitor. Idles while both earned-time and the focus
+/// limit are disabled; otherwise samples every `TICK` and drives each.
 pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
-    // The daemon ledger doesn't exist yet, so `health` is unused for now; it
-    // stays in the signature so wiring the report path later needs no change
-    // at the call site.
-    let _ = &health; // reserved; earned-time reports over the daemon socket
     std::thread::spawn(move || {
         // Running per-source earned minutes for this process's lifetime (for
         // the log); the authoritative persisted balance is betamacsd's.
         let mut earned: HashMap<String, f64> = HashMap::new();
-        // Fractional seconds not yet reported (reports are whole seconds).
+        // Fractional earned seconds not yet reported (reports are whole).
         let mut carry = 0.0_f64;
+        let mut focus = FocusState::default();
         let mut last = Instant::now();
         loop {
             std::thread::sleep(TICK);
-            let cfg = shared.read().unwrap().earned_time.clone();
+            let eff = shared.read().unwrap().clone();
+            let (et, fl) = (&eff.earned_time, &eff.focus_limit);
             let now = Instant::now();
-            let elapsed_min = now.duration_since(last).as_secs_f64() / 60.0;
+            let elapsed = now.duration_since(last);
+            let elapsed_min = elapsed.as_secs_f64() / 60.0;
             last = now;
 
-            if !cfg.enabled {
-                report_earn(0, false, &cfg); // clear any stale gate state
+            if !et.enabled && !fl.enabled {
+                report_earn(0, false, et); // clear any stale earned gate
+                focus = FocusState::default();
                 continue;
             }
-            let gate = gate_active(&cfg);
 
-            // Credit only while the user is present (not idle).
-            let mut credited_min = 0.0_f64;
-            if idle_seconds().unwrap_or(0.0) <= cfg.idle_timeout_sec as f64 {
-                let frontmost = frontmost_bundle_id();
-                // Only pay the osascript URL cost when a source keys off a
-                // host and the frontmost app is a browser.
-                let need_host = cfg
-                    .sources
-                    .iter()
-                    .any(|s| s.matcher.browser_host_suffix.is_some());
-                let browser_host = if need_host {
-                    frontmost.as_deref().and_then(browser_url_host)
-                } else {
-                    None
-                };
-                for src in &cfg.sources {
-                    if source_matches(src, frontmost.as_deref(), browser_host.as_deref()) {
-                        let delta = elapsed_min * src.earn_ratio as f64;
-                        credited_min += delta;
-                        let total = earned.entry(src.name.clone()).or_insert(0.0);
-                        *total += delta;
-                        tracing::info!(
-                            "earned: +{delta:.2} min on \"{}\" (session total {:.1} min)",
-                            src.name,
-                            *total
-                        );
+            // One foreground sample shared by both features.
+            let idle = idle_seconds().unwrap_or(0.0);
+            let frontmost = frontmost_bundle_id();
+            let need_url = fl.enabled
+                || et.sources.iter().any(|s| s.matcher.browser_host_suffix.is_some());
+            let url = if need_url {
+                frontmost.as_deref().and_then(browser_url)
+            } else {
+                None
+            };
+            let host = url.as_deref().and_then(host_of);
+
+            // Earned-time accrual.
+            if et.enabled {
+                let mut credited_min = 0.0_f64;
+                if idle <= et.idle_timeout_sec as f64 {
+                    for src in &et.sources {
+                        if source_matches(src, frontmost.as_deref(), host.as_deref()) {
+                            let delta = elapsed_min * src.earn_ratio as f64;
+                            credited_min += delta;
+                            let total = earned.entry(src.name.clone()).or_insert(0.0);
+                            *total += delta;
+                            tracing::info!(
+                                "earned: +{delta:.2} min on \"{}\" (session total {:.1} min)",
+                                src.name,
+                                *total
+                            );
+                        }
                     }
                 }
+                carry += credited_min * 60.0;
+                let whole = carry.floor().max(0.0) as u32;
+                carry -= whole as f64;
+                report_earn(whole, gate_active(et), et);
+            } else {
+                report_earn(0, false, et);
             }
-            carry += credited_min * 60.0;
-            let whole = carry.floor().max(0.0) as u32;
-            carry -= whole as f64;
-            report_earn(whole, gate, &cfg);
+
+            // Same-tab focus limit.
+            if fl.enabled {
+                track_focus(fl, &health, idle, url.as_deref(), host.as_deref(), elapsed, &mut focus);
+            } else {
+                focus = FocusState::default();
+            }
         }
     });
 }
@@ -258,6 +341,93 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
 mod tests {
     use super::*;
     use crate::settings::SourceMatch;
+
+    fn fl(same_tab_min: u32, white: &[&str], black: &[&str]) -> FocusLimitSettings {
+        FocusLimitSettings {
+            enabled: true,
+            same_tab_limit_min: same_tab_min,
+            lockout_min: 10,
+            idle_reset_sec: 60,
+            whitelist_hosts: white.iter().map(|s| s.to_string()).collect(),
+            blacklist_hosts: black.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn tripped(h: &Health) -> bool {
+        h.focus_over_limit.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn focus_active_trips_after_limit() {
+        let h = Health::new();
+        let cfg = fl(1, &[], &[]); // 1 minute of active dwell
+        let mut st = FocusState::default();
+        let (u, host) = (Some("https://reddit.com/r/x"), Some("reddit.com"));
+        // sample 1 sets the tab; 2 and 3 accrue 30s each -> 60s -> trip.
+        for _ in 0..3 {
+            track_focus(&cfg, &h, 0.0, u, host, Duration::from_secs(30), &mut st);
+        }
+        assert!(tripped(&h));
+    }
+
+    #[test]
+    fn focus_idle_video_does_not_trip() {
+        let h = Health::new();
+        let cfg = fl(1, &[], &[]);
+        let mut st = FocusState::default();
+        let (u, host) = (Some("https://youtube.com/watch?v=x"), Some("youtube.com"));
+        for _ in 0..20 {
+            // idle 120s > idle_reset_sec: passive, no accrual.
+            track_focus(&cfg, &h, 120.0, u, host, Duration::from_secs(30), &mut st);
+        }
+        assert!(!tripped(&h));
+    }
+
+    #[test]
+    fn focus_whitelist_is_exempt() {
+        let h = Health::new();
+        let cfg = fl(1, &["khanacademy.org"], &[]);
+        let mut st = FocusState::default();
+        for _ in 0..20 {
+            track_focus(
+                &cfg, &h, 0.0,
+                Some("https://khanacademy.org/math"), Some("khanacademy.org"),
+                Duration::from_secs(30), &mut st,
+            );
+        }
+        assert!(!tripped(&h));
+    }
+
+    #[test]
+    fn focus_blacklist_restricts_monitoring() {
+        let h = Health::new();
+        let cfg = fl(1, &[], &["tiktok.com"]);
+        let mut st = FocusState::default();
+        // Non-blacklisted host is ignored.
+        for _ in 0..20 {
+            track_focus(&cfg, &h, 0.0, Some("https://news.example/a"), Some("news.example"),
+                Duration::from_secs(30), &mut st);
+        }
+        assert!(!tripped(&h));
+        // Blacklisted host is monitored and trips.
+        for _ in 0..3 {
+            track_focus(&cfg, &h, 0.0, Some("https://tiktok.com/@x"), Some("tiktok.com"),
+                Duration::from_secs(30), &mut st);
+        }
+        assert!(tripped(&h));
+    }
+
+    #[test]
+    fn focus_url_change_resets() {
+        let h = Health::new();
+        let cfg = fl(1, &[], &[]);
+        let mut st = FocusState::default();
+        // Almost trips on tab A (30s accrued), then navigates: timer resets.
+        track_focus(&cfg, &h, 0.0, Some("https://a.example/1"), Some("a.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, Some("https://a.example/1"), Some("a.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, Some("https://b.example/2"), Some("b.example"), Duration::from_secs(30), &mut st);
+        track_focus(&cfg, &h, 0.0, Some("https://b.example/2"), Some("b.example"), Duration::from_secs(30), &mut st);
+        assert!(!tripped(&h), "navigation should reset the dwell timer");
+    }
 
     fn src(bundle: Option<&str>, host: Option<&str>) -> EarnSource {
         EarnSource {
