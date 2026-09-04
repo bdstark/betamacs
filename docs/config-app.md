@@ -521,32 +521,51 @@ make docker-deploy             # docker compose up -d on the compose host
 
 ### Environment checklist (publish endpoint)
 
-The publish endpoint runs inside the typeserver process; give it:
+The publish endpoint uploads **in-process** via the
+`bitbucket.org/newtonhaus/otactl/publisher` Go package — **no `otactl` binary
+in the image**. It author-signs with the oracle, then does the publisher-mTLS
+firmware upload itself, reading the client cert/key/CA from mounted PEM files.
+Give it:
 
 | Var | Value / purpose |
 |---|---|
-| `BETAMACS_AUTHOR_SECRET` | `"betamacs author"` — typeserver secret holding the author signing key (the oracle signs with it; a `LOCK_SECRET` timelock on it closes the config channel) |
+| `BETAMACS_AUTHOR_SECRET` | `betamacs author` — typeserver secret holding the author signing key. **In docker-compose list syntax, do NOT quote it** (`- BETAMACS_AUTHOR_SECRET=betamacs author`); `="betamacs author"` passes the quotes literally and the secret name won't match. |
 | `BETAMACS_AUTHOR_TTL` | author-signature validity window, seconds (default 3600) |
 | `BETAMACS_AUTHOR_PASSPHRASE` | only if that secret is passphrase-protected |
-| `OTACTL_BIN` | path to the `otactl` CLI in the image (default `otactl`; must be on PATH) |
-| `OTACTL_PUBLISHER_ID` | `betamacs-config` — publisher identity for upload + otactl authz |
-| `OTACTL_BACKEND_URL` | `https://otactl-device.docker.newton.haus` — otactl device origin the upload targets |
-| publisher mTLS cert/key | the `publisher-betamacs-config` client cert + key the `otactl boot-usb upload` mТLS presents |
+| `OTACTL_BACKEND_URL` | `https://otactl-device.docker.newton.haus` — otactl device origin the upload targets (per-call `backendUrl` overrides; endpoint 400s if neither is set) |
+| `BETAMACS_PUBLISHER_CERT` | publisher mTLS cert PEM (default `/pki/publisher-betamacs-config.crt`) |
+| `BETAMACS_PUBLISHER_KEY` | publisher mTLS key PEM (default `/pki/publisher-betamacs-config.key`) |
+| `BETAMACS_PUBLISHER_CA` | backend CA PEM the device origin's server cert chains to (default `/pki/publisher-betamacs-config-ca.crt`; optional but the private otactl PKI needs it — absent → system trust store → x509 error) |
 
-**Where otactl looks for the publisher cert/key:** the `otactl boot-usb`
-bridge/publisher identity lives in its app config dir —
-`${XDG_CONFIG_HOME:-$HOME/.config}/otactl-boot-usb/<instance>.crt` and
-`.key` (plus `-ca.crt`). Point at an explicit file set with `OTACTL_CONFIG`
-(a config whose `bridgeIdentity.certPath`/`keyPath` are set) or select a named
-identity with `OTACTL_INSTANCE_NAME`; for the very first upload before the
-enrollment CA is cached, `OTACTL_BACKEND_CA` supplies the backend's CA. In the
-scratch container, set `HOME`/`XDG_CONFIG_HOME` and mount the cert/key (e.g. a
-compose volume + secret), or bake them into the image. The browser needs none
-of this — it only ever talks to `/api/betamacs/publish` on the same origin.
+`OTACTL_BIN` / `OTACTL_PUBLISHER_ID` are no longer used by the endpoint
+(`publisherId` is carried in the request; `OTACTL_PUBLISHER_ID` may still be set
+and is used only as a fallback for the request field).
 
-The whole endpoint does, server-side, exactly what
-`OTACTL_PUBLISHER_ID=betamacs-config OTACTL_BACKEND_URL=… scripts/publish.sh
-config <version>` does at the CLI on a host that already has the publisher cert.
+**Mount the three PEMs** — they live on the publishing Mac at
+`~/Library/Application Support/otactl-boot-usb/publisher-betamacs-config.crt`,
+`.key`, and `publisher-betamacs-config-ca.crt`. Drop them into the container's
+existing `/pki` mount (or any dir) so the default paths above resolve; no
+`$HOME`/`XDG_CONFIG_HOME` gymnastics needed since the endpoint reads explicit
+files. The browser needs none of this — it only talks to `/api/betamacs/publish`
+on the same origin.
+
+Docker build: typeserver now requires the `bitbucket.org/newtonhaus/otactl`
+module; the existing `--mount=type=ssh` in the Dockerfile fetches it (it's a
+private bitbucket repo, covered by `GOPRIVATE`).
+
+Example compose delta (server `docker-compose.yaml`):
+
+```yaml
+    environment:
+      - BETAMACS_AUTHOR_SECRET=betamacs author        # no quotes!
+      - OTACTL_BACKEND_URL=https://otactl-device.docker.newton.haus
+      - BETAMACS_PUBLISHER_CERT=/pki/publisher-betamacs-config.crt
+      - BETAMACS_PUBLISHER_KEY=/pki/publisher-betamacs-config.key
+      - BETAMACS_PUBLISHER_CA=/pki/publisher-betamacs-config-ca.crt
+      # (remove OTACTL_BIN)
+    volumes:
+      - /path/to/pki:/pki:ro   # must now also contain the 3 publisher-betamacs-config PEMs
+```
 
 ### Author-key rotation caveat
 
