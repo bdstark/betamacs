@@ -2,6 +2,7 @@ mod capture;
 mod capture_sck;
 mod censor_fx;
 mod challenge;
+mod clock;
 mod detect;
 mod earned;
 mod envelope;
@@ -427,6 +428,15 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
     // Scroll-activity monitor for the focus limit (needs Accessibility; the
     // focus limit falls back to idle-based activity without it).
     scroll::spawn();
+    // Clock-integrity monitor: assigned-timezone/trusted-epoch schedule
+    // evaluation, and quarantine when the clock is changed under a running
+    // instance. No-op until policy enables it. Corroborates NTP against the
+    // pinned otactl root when a time URL is configured.
+    let clock_ca = bundle_resources()
+        .map(|r| r.join("otactl-root.pem"))
+        .filter(|p| p.exists())
+        .or_else(|| Some(PathBuf::from("otactl-root.pem")).filter(|p| p.exists()));
+    clock::spawn(shared.clone(), health.clone(), clock_ca);
 
     std::thread::spawn(move || {
         if let Err(e) = pipeline::run(shared, handle, health) {

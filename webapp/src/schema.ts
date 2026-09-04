@@ -259,6 +259,22 @@ export interface FocusLimitSettings {
 }
 export type FocusLimitPatch = Partial<FocusLimitSettings>;
 
+// Trust the clock behind all time-of-day policy: evaluate schedule windows
+// against an ASSIGNED timezone applied to a trusted epoch (never the OS
+// timezone/clock), and quarantine when the clock is changed under a running
+// instance. A machine merely booted with the wrong time is resynced, not
+// punished. Disabled by default; enable per-config once verified.
+export interface ClockIntegritySettings {
+  enabled: boolean;
+  timezone?: string; // IANA, e.g. "America/Chicago"; empty = OS timezone
+  skewToleranceSec: number;
+  checkIntervalSec: number;
+  anchorIntervalSec: number;
+  ntpServers: string[];
+  timeUrl?: string; // pinned-backend URL corroborating NTP; empty = NTP only
+}
+export type ClockIntegrityPatch = Partial<ClockIntegritySettings>;
+
 export interface ModulePatches {
   detection?: DetectionPatch;
   censor?: CensorPatch;
@@ -266,6 +282,7 @@ export interface ModulePatches {
   exposure?: ExposurePatch;
   earnedTime?: EarnedTimePatch;
   focusLimit?: FocusLimitPatch;
+  clockIntegrity?: ClockIntegrityPatch;
 }
 
 export interface NamedConfig {
@@ -289,6 +306,7 @@ export interface Effective {
   exposure: ExposureSettings;
   earnedTime: EarnedTimeSettings;
   focusLimit: FocusLimitSettings;
+  clockIntegrity: ClockIntegritySettings;
 }
 
 export function defaultDetection(): DetectionSettings {
@@ -433,6 +451,16 @@ export function defaultFocusLimit(): FocusLimitSettings {
   };
 }
 
+export function defaultClockIntegrity(): ClockIntegritySettings {
+  return {
+    enabled: false,
+    skewToleranceSec: 300,
+    checkIntervalSec: 15,
+    anchorIntervalSec: 900,
+    ntpServers: ["time.apple.com", "pool.ntp.org"],
+  };
+}
+
 export function resolve(pkg: Package): Effective {
   const effective: Effective = {
     detection: defaultDetection(),
@@ -441,6 +469,7 @@ export function resolve(pkg: Package): Effective {
     exposure: defaultExposure(),
     earnedTime: defaultEarnedTime(),
     focusLimit: defaultFocusLimit(),
+    clockIntegrity: defaultClockIntegrity(),
   };
   const layerPatches = pkg.layers
     .map((name) => pkg.namedConfigs.find((c) => c.name === name)?.settings)
@@ -452,6 +481,7 @@ export function resolve(pkg: Package): Effective {
     if (patches.exposure) Object.assign(effective.exposure, patches.exposure);
     if (patches.earnedTime) Object.assign(effective.earnedTime, patches.earnedTime);
     if (patches.focusLimit) Object.assign(effective.focusLimit, patches.focusLimit);
+    if (patches.clockIntegrity) Object.assign(effective.clockIntegrity, patches.clockIntegrity);
   }
   effective.censor.textOverlay.lines = resolveTextLines(pkg, effective.censor.textOverlay);
   return effective;

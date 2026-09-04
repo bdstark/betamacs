@@ -107,6 +107,28 @@ Small, dependency-light second binary in this repo. Root LaunchDaemon,
      Disabled-by-policy (the signed config's `detection.enabled:
      false`) is reported in the heartbeat and treated as healthy — a
      sanctioned off-switch never quarantines.
+   - **Clock integrity — IMPLEMENTED (default-off).** Time-of-day policy
+     (the earned-time schedule today; time-layers later) is only as
+     trustworthy as the clock it reads, and a kid quickly learns that
+     changing the system clock or timezone shifts a restriction window.
+     With `clockIntegrity.enabled`, the agent (`src/clock.rs`): (a)
+     evaluates every schedule window against an **assigned IANA
+     timezone** applied to a **trusted epoch**, never the OS
+     timezone/clock; and (b) watches the wall clock for being **changed
+     under a running instance** — a jump relative to
+     `mach_continuous_time` (a monotonic clock that keeps counting
+     across sleep) beyond `skewToleranceSec`. A running-instance change
+     is tamper: the heartbeat's `clockTamper` latches and betamacsd
+     quarantines exactly like a shut-down censor, until the clock is put
+     back. The trusted epoch comes from SNTP (`ntpServers`),
+     corroborated by a pinned-backend TLS `Date` (`timeUrl`, validated
+     against the bundle's otactl root) when configured — so a kid
+     spoofing NTP on the LAN is caught by the disagreement. A machine
+     that merely **booted with the wrong time** shows no running-instance
+     jump: it is announced to the user and the root daemon best-effort
+     resyncs it (`systemsetup -setusingnetworktime on` + an SNTP step),
+     **not** quarantined. Enable per-config once verified on a device;
+     set `clockIntegrity.timezone` to the device's assigned zone.
    - **UniFi backstop (off-device)** — hausmeister reports betamacs
      health to otactl; network policy keys the device's internet access
      to it (nh-parentalcontrol VLAN infrastructure). Covers what local

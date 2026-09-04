@@ -50,6 +50,14 @@ pub struct Health {
     /// daemon for `focus_penalty_secs`.
     pub focus_over_limit: AtomicBool,
     pub focus_penalty_secs: AtomicU32,
+    /// True while the wall clock has been CHANGED under this running instance
+    /// (a jump vs. the sleep-inclusive monotonic clock). The daemon
+    /// quarantines until it clears — the same as the censor being shut down.
+    pub clock_tamper: AtomicBool,
+    /// Edge flag: the machine looks like it BOOTED with the wrong time (no
+    /// running-instance jump). Consumed by the heartbeat (swap); the daemon
+    /// resyncs the clock once rather than punishing.
+    pub clock_boot_wrong: AtomicBool,
 }
 
 impl Health {
@@ -68,8 +76,9 @@ pub fn spawn(health: Arc<Health>) {
         // Consume the timed-lockout edges so a single trip = a single lockout.
         let over_budget = health.exposure_over_budget.swap(false, Ordering::Relaxed);
         let focus_over = health.focus_over_limit.swap(false, Ordering::Relaxed);
+        let boot_wrong = health.clock_boot_wrong.swap(false, Ordering::Relaxed);
         let line = format!(
-            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureOverBudget\":{},\"exposurePenaltySec\":{},\"focusOverLimit\":{},\"focusPenaltySec\":{}}}\n",
+            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureOverBudget\":{},\"exposurePenaltySec\":{},\"focusOverLimit\":{},\"focusPenaltySec\":{},\"clockTamper\":{},\"clockBootWrong\":{}}}\n",
             std::process::id(),
             health.streams.load(Ordering::Relaxed),
             health.boxes.load(Ordering::Relaxed),
@@ -81,6 +90,8 @@ pub fn spawn(health: Arc<Health>) {
             health.exposure_penalty_secs.load(Ordering::Relaxed),
             focus_over,
             health.focus_penalty_secs.load(Ordering::Relaxed),
+            health.clock_tamper.load(Ordering::Relaxed),
+            boot_wrong,
         );
         match UnixStream::connect(DAEMON_SOCKET) {
             Ok(mut stream) => {

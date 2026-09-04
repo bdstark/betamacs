@@ -22,16 +22,37 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::heartbeat::{Health, DAEMON_SOCKET};
-use crate::settings::{EarnSource, EarnedTimeSettings, Effective, FocusLimitSettings};
+use crate::settings::{
+    ClockIntegritySettings, EarnSource, EarnedTimeSettings, Effective, FocusLimitSettings,
+};
 
-/// Is the earned-time gate active right now? Enabled, and the local day/time
-/// falls inside a schedule window. Uses `/bin/date` to avoid a timezone
-/// dependency. Empty schedule = never gated.
-fn gate_active(cfg: &EarnedTimeSettings) -> bool {
+/// Is the earned-time gate active right now? Enabled, and the day/time falls
+/// inside a schedule window. When clock integrity is on, the window is
+/// evaluated against the ASSIGNED timezone applied to the TRUSTED epoch, so a
+/// kid can't shift it by changing the OS clock or timezone; otherwise it
+/// falls back to the OS local time. Empty schedule = never gated.
+fn gate_active(cfg: &EarnedTimeSettings, ci: &ClockIntegritySettings) -> bool {
     if !cfg.enabled || cfg.schedule.is_empty() {
         return false;
     }
-    let Ok(out) = Command::new("/bin/date").args(["+%u %H%M"]).output() else {
+    let (tz, epoch) = if ci.enabled {
+        (ci.timezone.as_deref(), crate::clock::trusted_epoch())
+    } else {
+        (None, None)
+    };
+    let mut cmd = Command::new("/bin/date");
+    if let Some(tz) = tz {
+        cmd.env("TZ", tz);
+    }
+    match epoch {
+        Some(e) => {
+            cmd.args(["-r", &e.to_string(), "+%u %H%M"]);
+        }
+        None => {
+            cmd.args(["+%u %H%M"]);
+        }
+    }
+    let Ok(out) = cmd.output() else {
         return false;
     };
     let s = String::from_utf8_lossy(&out.stdout);
@@ -333,7 +354,7 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
                 carry += credited_min * 60.0;
                 let whole = carry.floor().max(0.0) as u32;
                 carry -= whole as f64;
-                report_earn(whole, gate_active(et), et);
+                report_earn(whole, gate_active(et, &eff.clock_integrity), et);
             } else {
                 report_earn(0, false, et);
             }

@@ -75,6 +75,13 @@ struct AgentState {
     /// Computed here from the heartbeat's requested penalty so the lockout
     /// survives the agent being killed.
     exposure_penalty_until: Option<Instant>,
+    /// The agent detected the wall clock being CHANGED under a running
+    /// instance — treated as tamper (quarantine), the same as a shut-down
+    /// censor, until it clears.
+    clock_tamper: bool,
+    /// Debounce for the best-effort clock resync triggered by a boot-wrong
+    /// report, so a persistent discrepancy doesn't resync every heartbeat.
+    last_clock_resync: Option<Instant>,
 }
 
 impl Default for AgentState {
@@ -87,8 +94,34 @@ impl Default for AgentState {
             enabled: true,
             challenge_overdue: false,
             exposure_penalty_until: None,
+            clock_tamper: false,
+            last_clock_resync: None,
         }
     }
+}
+
+/// Best-effort clock resync when the agent reports the machine booted with
+/// the wrong time. Root-only (this daemon is root): enabling macOS network
+/// time both corrects it now and keeps it corrected, then a direct SNTP step
+/// nudges an immediate correction. Never fatal — a wrong boot time is
+/// announced and fixed, not punished (a mid-run change is what quarantines).
+fn resync_clock() {
+    match std::process::Command::new("/usr/sbin/systemsetup")
+        .args(["-setusingnetworktime", "on"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            tracing::warn!("clock resync: enabled network time after boot-wrong report")
+        }
+        Ok(o) => tracing::warn!(
+            "clock resync: systemsetup failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("clock resync: systemsetup spawn failed: {e}"),
+    }
+    let _ = std::process::Command::new("/usr/bin/sntp")
+        .args(["-sS", "time.apple.com"])
+        .output();
 }
 
 /// Root-owned earned-time balance (docs/earned-time.md part B). The child
@@ -330,7 +363,8 @@ impl Quarantine {
                 .last_seen
                 .is_some_and(|t| t.elapsed() < HEARTBEAT_FRESH)
                 && agent.capture_ok))
-            && !agent.challenge_overdue;
+            && !agent.challenge_overdue
+            && !agent.clock_tamper;
         if healthy {
             self.unhealthy_since = None;
             return false;
@@ -616,6 +650,27 @@ fn handle_client(
                         });
                         tracing::warn!("agent reports same-tab focus limit — network lockout for {secs}s");
                     }
+                }
+                // Clock changed under a running instance: latch tamper so the
+                // quarantine holds (like challengeOverdue) until it clears.
+                a.clock_tamper = msg
+                    .get("clockTamper")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if a.clock_tamper {
+                    tracing::warn!("agent reports the clock was changed under a running instance — quarantining");
+                }
+                // Booted with the wrong time (no running-instance jump): a
+                // one-shot, debounced best-effort resync — not a punishment.
+                if msg
+                    .get("clockBootWrong")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                    && a.last_clock_resync
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(600))
+                {
+                    a.last_clock_resync = Some(Instant::now());
+                    resync_clock();
                 }
                 if !a.capture_ok {
                     tracing::warn!("agent reports capture unhealthy (Screen Recording revoked?)");

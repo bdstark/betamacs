@@ -71,6 +71,8 @@ pub struct ModulePatches {
     pub earned_time: Option<EarnedTimePatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_limit: Option<FocusLimitPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_integrity: Option<ClockIntegrityPatch>,
 }
 
 // ---------------------------------------------------------------- detection
@@ -957,6 +959,100 @@ impl FocusLimitSettings {
 // ---------------------------------------------------------------- resolution
 
 /// Fully resolved settings for all modules.
+// ------------------------------------------------------- clock integrity
+//
+// Time-of-day policy (earned-time windows, and future time-layers) is only
+// as trustworthy as the clock it reads. A kid who can change the system
+// clock or timezone could otherwise shift a schedule. So schedule windows
+// are evaluated against an ASSIGNED timezone applied to a TRUSTED epoch,
+// never the OS timezone; and the wall clock is watched for being CHANGED
+// under a running instance — a jump relative to a sleep-inclusive monotonic
+// clock (`mach_continuous_time`). A running-instance change is tamper: the
+// daemon quarantines, the same as the censor being shut down. A machine that
+// merely BOOTED with the wrong time (no running-instance jump) is announced
+// and resynced, not punished. Disabled by default; enable per-config once
+// verified on a device. See src/clock.rs.
+
+/// Clock-integrity policy (lives in `betamacs-config`). Disabled by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockIntegritySettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Assigned IANA timezone (e.g. "America/Chicago") used to interpret all
+    /// schedule windows. None falls back to the OS timezone (only safe when
+    /// the OS timezone is itself locked down).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// How far the wall clock may diverge (from monotonic, or from network
+    /// time) before it counts as changed/wrong, in seconds.
+    pub skew_tolerance_sec: u32,
+    /// How often the monitor samples the clock for a running-instance jump.
+    pub check_interval_sec: u32,
+    /// How often to re-confirm the absolute time over the network.
+    pub anchor_interval_sec: u32,
+    /// NTP servers queried for the absolute time (SNTP).
+    #[serde(default)]
+    pub ntp_servers: Vec<String>,
+    /// Optional pinned-backend URL whose TLS `Date` corroborates NTP, read
+    /// with the bundle's pinned otactl root. None = NTP only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_url: Option<String>,
+}
+
+impl Default for ClockIntegritySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timezone: None,
+            skew_tolerance_sec: 300,
+            check_interval_sec: 15,
+            anchor_interval_sec: 900,
+            ntp_servers: vec!["time.apple.com".into(), "pool.ntp.org".into()],
+            time_url: None,
+        }
+    }
+}
+
+/// Partial clock-integrity policy for layering.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockIntegrityPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skew_tolerance_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_interval_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_interval_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntp_servers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_url: Option<String>,
+}
+
+impl ClockIntegritySettings {
+    pub fn apply(&mut self, p: &ClockIntegrityPatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, skew_tolerance_sec, check_interval_sec, anchor_interval_sec,
+            ntp_servers
+        );
+        // Option-valued fields: a present patch value sets it (layers only add).
+        if p.timezone.is_some() {
+            self.timezone = p.timezone.clone();
+        }
+        if p.time_url.is_some() {
+            self.time_url = p.time_url.clone();
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Effective {
@@ -970,6 +1066,8 @@ pub struct Effective {
     pub earned_time: EarnedTimeSettings,
     #[serde(default)]
     pub focus_limit: FocusLimitSettings,
+    #[serde(default)]
+    pub clock_integrity: ClockIntegritySettings,
 }
 
 impl Package {
@@ -999,6 +1097,9 @@ impl Package {
             }
             if let Some(p) = &patches.focus_limit {
                 effective.focus_limit.apply(p);
+            }
+            if let Some(p) = &patches.clock_integrity {
+                effective.clock_integrity.apply(p);
             }
         }
         // Pool the lines of the referenced text sets, in reference order.
