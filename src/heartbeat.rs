@@ -77,8 +77,11 @@ pub fn spawn(health: Arc<Health>) {
         let over_budget = health.exposure_over_budget.swap(false, Ordering::Relaxed);
         let focus_over = health.focus_over_limit.swap(false, Ordering::Relaxed);
         let boot_wrong = health.clock_boot_wrong.swap(false, Ordering::Relaxed);
+        // The device's current OS timezone, so the daemon can pin it at device
+        // init (IANA names are JSON-safe: alnum, '/', '_', '-', '+').
+        let os_tz = crate::clock::os_timezone().unwrap_or_default();
         let line = format!(
-            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureOverBudget\":{},\"exposurePenaltySec\":{},\"focusOverLimit\":{},\"focusPenaltySec\":{},\"clockTamper\":{},\"clockBootWrong\":{}}}\n",
+            "{{\"type\":\"heartbeat\",\"pid\":{},\"streams\":{},\"boxes\":{},\"captureOk\":{},\"configEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"exposureOverBudget\":{},\"exposurePenaltySec\":{},\"focusOverLimit\":{},\"focusPenaltySec\":{},\"clockTamper\":{},\"clockBootWrong\":{},\"osTimezone\":\"{os_tz}\"}}\n",
             std::process::id(),
             health.streams.load(Ordering::Relaxed),
             health.boxes.load(Ordering::Relaxed),

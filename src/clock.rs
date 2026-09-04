@@ -55,6 +55,39 @@ fn continuous_nanos() -> u128 {
     ticks * tb.numer as u128 / tb.denom as u128
 }
 
+/// Root-owned pin betamacsd writes at first heartbeat (device init). The
+/// agent reads it so a later OS-timezone change has no effect on schedule
+/// evaluation — a kid can't shift a window by switching timezone. A standard
+/// user can't modify it (root owns it).
+const ASSIGNED_TZ_FILE: &str = "/Library/Application Support/betamacs/assigned-timezone";
+
+/// The device's current OS timezone as an IANA name (from /etc/localtime).
+pub fn os_timezone() -> Option<String> {
+    let target = std::fs::read_link("/etc/localtime").ok()?;
+    let s = target.to_string_lossy();
+    s.rsplit_once("zoneinfo/")
+        .map(|(_, tz)| tz.trim_matches('/').to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Timezone to interpret schedule windows in: an explicit config assignment
+/// wins; otherwise the device-init pin betamacsd captured; otherwise the OS
+/// timezone (weakest — only until something pins one).
+pub fn assigned_timezone(cfg: &ClockIntegritySettings) -> Option<String> {
+    if let Some(tz) = &cfg.timezone {
+        if !tz.is_empty() {
+            return Some(tz.clone());
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string(ASSIGNED_TZ_FILE) {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    os_timezone()
+}
+
 fn os_wall_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

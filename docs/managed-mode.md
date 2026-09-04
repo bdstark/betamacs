@@ -127,8 +127,12 @@ Small, dependency-light second binary in this repo. Root LaunchDaemon,
      that merely **booted with the wrong time** shows no running-instance
      jump: it is announced to the user and the root daemon best-effort
      resyncs it (`systemsetup -setusingnetworktime on` + an SNTP step),
-     **not** quarantined. Enable per-config once verified on a device;
-     set `clockIntegrity.timezone` to the device's assigned zone.
+     **not** quarantined. The assigned timezone is **pinned at device init**
+     — betamacsd writes the first heartbeat's OS timezone root-owned to
+     `assigned-timezone`, and the agent reads it, so a later timezone change
+     is ignored (a standard user can't rewrite it). A config
+     `clockIntegrity.timezone` overrides the pin (a future parent UI /
+     enrollment sets it). Enable per-config once verified on a device.
    - **UniFi backstop (off-device)** — hausmeister reports betamacs
      health to otactl; network policy keys the device's internet access
      to it (nh-parentalcontrol VLAN infrastructure). Covers what local

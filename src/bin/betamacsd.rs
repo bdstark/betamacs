@@ -672,6 +672,21 @@ fn handle_client(
                     a.last_clock_resync = Some(Instant::now());
                     resync_clock();
                 }
+                // Pin the assigned timezone at device init: the first
+                // heartbeat's OS timezone is written root-owned so a later
+                // (kid-initiated) timezone change is ignored by schedule
+                // evaluation. A config `timezone` still overrides it agent-side.
+                if let Some(tz) = msg.get("osTimezone").and_then(|v| v.as_str()) {
+                    if !tz.is_empty() {
+                        let pin = managed_dir.join("assigned-timezone");
+                        if !pin.exists() {
+                            match std::fs::write(&pin, tz) {
+                                Ok(()) => tracing::info!("pinned assigned timezone at device init: {tz}"),
+                                Err(e) => tracing::warn!("could not pin assigned timezone: {e}"),
+                            }
+                        }
+                    }
+                }
                 if !a.capture_ok {
                     tracing::warn!("agent reports capture unhealthy (Screen Recording revoked?)");
                 }

@@ -36,7 +36,7 @@ fn gate_active(cfg: &EarnedTimeSettings, ci: &ClockIntegritySettings) -> bool {
         return false;
     }
     let (tz, epoch) = if ci.enabled {
-        (ci.timezone.as_deref(), crate::clock::trusted_epoch())
+        (crate::clock::assigned_timezone(ci), crate::clock::trusted_epoch())
     } else {
         (None, None)
     };
