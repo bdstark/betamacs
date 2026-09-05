@@ -58,7 +58,7 @@ export class BmStoreBar extends LitElement {
     button.primary {
       background: var(--accent);
       border-color: var(--accent);
-      color: #fff;
+      color: var(--nh-accent-ink);
       font-weight: 600;
     }
     button:disabled {
@@ -76,8 +76,8 @@ export class BmStoreBar extends LitElement {
       color: var(--muted);
     }
     .badge.dirty {
-      background: color-mix(in srgb, #ff9f0a 22%, transparent);
-      color: #c77700;
+      background: color-mix(in srgb, var(--nh-warn) 22%, transparent);
+      color: var(--nh-warn);
     }
     .grid {
       display: grid;
@@ -148,15 +148,15 @@ export class BmStoreBar extends LitElement {
     }
     .errbox {
       margin-top: 12px;
-      border: 1px solid color-mix(in srgb, #ff3b30 55%, transparent);
-      background: color-mix(in srgb, #ff3b30 12%, transparent);
+      border: 1px solid color-mix(in srgb, var(--nh-danger) 55%, transparent);
+      background: color-mix(in srgb, var(--nh-danger) 12%, transparent);
       border-radius: 10px;
       padding: 10px 12px;
       font-size: 12.5px;
     }
     .errbox .title {
       font-weight: 600;
-      color: #c00;
+      color: var(--nh-danger);
       margin-bottom: 6px;
     }
     .errbox pre {
@@ -170,15 +170,15 @@ export class BmStoreBar extends LitElement {
     }
     .okbox {
       margin-top: 12px;
-      border: 1px solid color-mix(in srgb, #34c759 55%, transparent);
-      background: color-mix(in srgb, #34c759 12%, transparent);
+      border: 1px solid color-mix(in srgb, var(--nh-good) 55%, transparent);
+      background: color-mix(in srgb, var(--nh-good) 12%, transparent);
       border-radius: 10px;
       padding: 10px 12px;
       font-size: 12.5px;
     }
     .okbox .title {
       font-weight: 600;
-      color: #1a8a3a;
+      color: var(--nh-good);
       margin-bottom: 6px;
     }
     .okbox dl {

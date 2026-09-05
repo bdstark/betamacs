@@ -1,0 +1,11 @@
+/* The settings app's components read these short names inside their shadow
+   styles; they resolve to the shared ui-kit tokens so every module follows
+   the kit's light and dark palettes without per-component edits. */
+:root {
+  --bg: var(--nh-bg);
+  --panel: var(--nh-panel);
+  --text: var(--nh-text);
+  --muted: var(--nh-muted);
+  --accent: var(--nh-accent);
+  --border: var(--nh-line);
+}
