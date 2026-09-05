@@ -556,6 +556,22 @@ page's `fetch` calls use `credentials:"include"`, so the `ts_session` cookie
 that authorizes the page also authorizes its publish/read calls — no CORS, no
 second login, and the browser never handles the publisher cert or backend URL.
 
+### Design system
+
+The settings app is built on `@newtonhaus/ui-kit`, the design system shared
+with otactl and typeserver, pinned to a tag in `webapp/package.json`. The kit
+supplies the sidebar shell, page header, badges, theme toggle, tokens, and
+fonts; `webapp/src/main.ts` is the shell, and the open section is the URL
+hash (`#focus`, `#layers`, …). The modules keep reading six short names
+(`--bg`, `--panel`, `--text`, `--muted`, `--accent`, `--border`); they resolve
+to kit tokens in `webapp/src/styles/kit.css`, so a module never needs to know
+the kit's names. A literal colour in a module is a bug; use a token.
+
+To change the shared look, change the kit first and follow its
+`docs/workflow.md` (github.com/bdstark/ui-kit): bump the tag here, `npm
+install`, rebuild both bundles, and refresh the copy committed in typeserver
+as described under **Build the static bundle** below.
+
 ### Route
 
 `GET /betamacs` (→ redirects to `/betamacs/`) serves the app. Unauthenticated
