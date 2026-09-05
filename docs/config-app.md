@@ -620,7 +620,7 @@ make docker-deploy             # docker compose up -d on the compose host
 ### Environment checklist (publish endpoint)
 
 The publish endpoint uploads **in-process** via the
-`bitbucket.org/newtonhaus/otactl/publisher` Go package — **no `otactl` binary
+`github.com/bdstark/otactl/publisher` Go package — **no `otactl` binary
 in the image**. It author-signs with the oracle, then does the publisher-mTLS
 firmware upload itself, reading the client cert/key/CA from mounted PEM files.
 Give it:
@@ -647,9 +647,9 @@ existing `/pki` mount (or any dir) so the default paths above resolve; no
 files. The browser needs none of this — it only talks to `/api/betamacs/publish`
 on the same origin.
 
-Docker build: typeserver now requires the `bitbucket.org/newtonhaus/otactl`
+Docker build: typeserver now requires the `github.com/bdstark/otactl`
 module; the existing `--mount=type=ssh` in the Dockerfile fetches it (it's a
-private bitbucket repo, covered by `GOPRIVATE`).
+private GitHub repo, covered by `GOPRIVATE`).
 
 Example compose delta (server `docker-compose.yaml`):
 
