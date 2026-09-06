@@ -101,7 +101,11 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     var items: [UpdateItem] = []
     do {
       let found = try await checkApp()
-      items.append(UpdateItem(.application, "betamacs", installed: found.installed, available: found.release.manifest.version,
+      let m = found.release.manifest
+      // The release's commit is the installed one once the release is
+      // what is installed; before that it is not on record.
+      items.append(UpdateItem(.application, "betamacs", installed: found.installed, available: m.version,
+                              commit: found.installed == m.version ? m.gitHash ?? "" : "",
                               install: found.newer ? { [weak self] in try await self?.fromTable { try await self?.installApp(found) } } : nil))
     } catch {
       items.append(.note(.application, "betamacs", installed: installedAppVersion(), status: "Check failed", detail: "\(error)"))
@@ -129,8 +133,9 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     do {
       let found = try await checkEnvelope(app: app, daemonEpoch: daemonEpoch)
       let m = found.response.manifest
-      let installed = daemonEpoch != 0 && m.epoch == daemonEpoch ? m.version : recorded
-      return UpdateItem(.configuration, name, installed: installed, available: m.version,
+      let current = daemonEpoch != 0 && m.epoch == daemonEpoch
+      return UpdateItem(.configuration, name, installed: current ? m.version : recorded, available: m.version,
+                        commit: current ? m.gitHash ?? "" : "",
                         install: found.newer ? { [weak self] in try await self?.fromTable { try await push(found) } } : nil)
     } catch {
       return .note(.configuration, name, installed: recorded, status: "Check failed", detail: "\(error)")
