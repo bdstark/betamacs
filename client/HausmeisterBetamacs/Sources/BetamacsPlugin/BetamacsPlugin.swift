@@ -81,55 +81,72 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     }
   }
 
-  /// The host's Check for Updates… table: a row each for the settings
-  /// envelope, the task bank (when granted), and the app, with what the
+  /// The host's Check for Updates… table: a row each for the app, the
+  /// settings envelope, and the task bank (when granted), with what the
   /// daemon holds beside what otactl offers. Nothing is delivered here; a
   /// row that is behind carries the push for its Update button.
   public func updateItems() async -> [UpdateItem] {
     guard entitled else {
-      return host.entitlements == nil ? [] : [.note("Betamacs", status: "Not authorized", detail: "Betamacs is not authorized for this Mac.")]
+      return host.entitlements == nil ? [] : [.note(.application, "betamacs", status: "Not authorized", detail: "Betamacs is not authorized for this Mac.")]
     }
     guard DaemonSocket.available else {
-      return [.note("Betamacs", installed: installedAppVersion(), status: "Not installed",
+      return [.note(.application, "betamacs", installed: installedAppVersion(), status: "Not installed",
                     detail: "betamacsd is not installed — run the managed installer once.")]
     }
     guard !checking else {
-      return [.note("Betamacs", status: "Busy", detail: "A background check is running; refresh in a moment.")]
+      return [.note(.application, "betamacs", status: "Busy", detail: "A background check is running; refresh in a moment.")]
     }
     checking = true
     defer { checking = false }
     var items: [UpdateItem] = []
-    items.append(await envelopeItem(name: "Betamacs settings", app: BetamacsPlugin.configApp, daemonEpoch: daemonConfigEpoch()) { [weak self] found in
+    do {
+      let found = try await checkApp()
+      items.append(UpdateItem(.application, "betamacs", installed: found.installed, available: found.release.manifest.version,
+                              install: found.newer ? { [weak self] in try await self?.fromTable { try await self?.installApp(found) } } : nil))
+    } catch {
+      items.append(.note(.application, "betamacs", installed: installedAppVersion(), status: "Check failed", detail: "\(error)"))
+    }
+    items.append(await envelopeItem(name: "betamacs settings", app: BetamacsPlugin.configApp, daemonEpoch: daemonConfigEpoch()) { [weak self] found in
       try await self?.pushConfig(found)
     })
     if tasksEntitled {
-      items.append(await envelopeItem(name: "Betamacs tasks", app: BetamacsPlugin.tasksApp, daemonEpoch: daemonTasksEpoch()) { [weak self] found in
+      items.append(await envelopeItem(name: "betamacs task bank", app: BetamacsPlugin.tasksApp, daemonEpoch: daemonTasksEpoch()) { [weak self] found in
         try await self?.pushTasks(found)
       })
-    }
-    do {
-      let found = try await checkApp()
-      items.append(UpdateItem(name: "Betamacs app", installed: found.installed, available: found.release.manifest.version,
-                              install: found.newer ? { [weak self] in try await self?.fromTable { try await self?.installApp(found) } } : nil))
-    } catch {
-      items.append(.note("Betamacs app", installed: installedAppVersion(), status: "Check failed", detail: "\(error)"))
     }
     return items
   }
 
-  /// One envelope row: epochs side by side, and the push when otactl's is
-  /// ahead of the daemon's.
+  /// One envelope row, versions side by side, and the push when otactl's
+  /// epoch is ahead of the daemon's. The daemon reports only an epoch, so
+  /// the installed version is the manifest's when the epochs agree, else
+  /// the version this plugin pushed for that epoch (see recordPushed),
+  /// else unknown. Epochs are otactl's anti-rollback counter, opaque to
+  /// the user, and stay out of the table.
   private func envelopeItem(name: String, app: String, daemonEpoch: UInt64,
                             push: @escaping (EnvelopeCheck) async throws -> Void) async -> UpdateItem {
-    let installed = daemonEpoch == 0 ? "" : "epoch \(daemonEpoch)"
+    let recorded = pushedVersion(app: app, epoch: daemonEpoch)
     do {
       let found = try await checkEnvelope(app: app, daemonEpoch: daemonEpoch)
       let m = found.response.manifest
-      return UpdateItem(name: name, installed: installed, available: "\(m.version) (epoch \(m.epoch ?? 0))",
+      let installed = daemonEpoch != 0 && m.epoch == daemonEpoch ? m.version : recorded
+      return UpdateItem(.configuration, name, installed: installed, available: m.version,
                         install: found.newer ? { [weak self] in try await self?.fromTable { try await push(found) } } : nil)
     } catch {
-      return .note(name, installed: installed, status: "Check failed", detail: "\(error)")
+      return .note(.configuration, name, installed: recorded, status: "Check failed", detail: "\(error)")
     }
+  }
+
+  /// The version last delivered for an app, if the daemon still holds
+  /// that epoch.
+  private func pushedVersion(app: String, epoch: UInt64) -> String {
+    guard epoch != 0, UInt64(host.settings.int("\(app).pushedEpoch")) == epoch else { return "" }
+    return host.settings.string("\(app).pushedVersion") ?? ""
+  }
+
+  private func recordPushed(app: String, manifest m: ReleaseManifest) {
+    host.settings.set(m.version, for: "\(app).pushedVersion")
+    host.settings.set(Int(m.epoch ?? 0), for: "\(app).pushedEpoch")
   }
 
   /// An Update button's work, guarded against the hourly check that may
@@ -237,6 +254,7 @@ public final class BetamacsPlugin: HausmeisterPlugin {
   private func pushTasks(_ found: EnvelopeCheck) async throws {
     try await pushEnvelope(type: "tasks", app: BetamacsPlugin.tasksApp, found)
     let m = found.response.manifest
+    recordPushed(app: BetamacsPlugin.tasksApp, manifest: m)
     host.log.notice("betamacs: pushed task bank \(m.version) (epoch \(m.epoch ?? 0))")
   }
 
@@ -251,6 +269,7 @@ public final class BetamacsPlugin: HausmeisterPlugin {
   private func pushConfig(_ found: EnvelopeCheck) async throws {
     try await pushEnvelope(type: "envelope", app: BetamacsPlugin.configApp, found)
     let m = found.response.manifest
+    recordPushed(app: BetamacsPlugin.configApp, manifest: m)
     host.log.notice("betamacs: pushed config \(m.version) (epoch \(m.epoch ?? 0))")
     await MainActor.run {
       host.notify(title: "Betamacs settings updated",
