@@ -215,6 +215,82 @@ struct BankChores {
     chores: Vec<ChoreDef>,
 }
 
+/// The `betamacs-grants` artifact (docs/chores.md "Server-side chores"):
+/// every kid's definitions and current-period approvals, published by the
+/// kids web app on each approval. Delivered like the bank; the daemon picks
+/// its own kid by hostname.
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GrantsFile {
+    #[serde(default)]
+    kids: std::collections::BTreeMap<String, GrantsKid>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GrantsKid {
+    #[serde(default)]
+    name: String,
+    /// Hostnames (LocalHostName / ComputerName / HostName, case-insensitive)
+    /// of the Macs this kid uses.
+    #[serde(default)]
+    hosts: Vec<String>,
+    #[serde(default)]
+    chores: Vec<ChoreDef>,
+    /// Parent approvals. `period` uses the same keys as the ledger (local
+    /// date / ISO week / "once"); the daemon only honours entries for the
+    /// period it is currently in, so a re-delivered artifact after a
+    /// rollover can never credit yesterday's chore twice.
+    #[serde(default)]
+    verified: Vec<GrantEntry>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GrantEntry {
+    id: String,
+    period: String,
+    #[serde(default)]
+    minutes: f64,
+    #[serde(default)]
+    at: u64,
+}
+
+/// Where the bank's chore definitions came from, for the status reply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChoreSource {
+    None,
+    Bank,
+    Server,
+}
+
+/// The names this Mac answers to, lowercased: scutil's three and the
+/// kernel hostname's short form. A standard user cannot change any of them
+/// (System Settings requires admin), which is enough for the threat model.
+fn local_hostnames() -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["LocalHostName", "ComputerName", "HostName"] {
+        if let Ok(o) = std::process::Command::new("/usr/sbin/scutil")
+            .args(["--get", key])
+            .output()
+        {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+            if !v.is_empty() {
+                out.push(v);
+            }
+        }
+    }
+    if let Ok(o) = std::process::Command::new("/bin/hostname").arg("-s").output() {
+        let v = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+        if !v.is_empty() {
+            out.push(v);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The `chores` policy module as relayed by the agent (docs/chores.md).
 #[derive(Clone, Debug, PartialEq, Default)]
 struct ChorePolicy {
@@ -442,6 +518,14 @@ struct EarnedGate {
     pin_path: PathBuf,
     /// Tests pin local time; production reads /bin/date.
     now_override: Option<LocalNow>,
+    /// The delivered `betamacs-grants` artifact (root-only) and its mtime.
+    grants_path: PathBuf,
+    grants_mtime: Option<std::time::SystemTime>,
+    /// Which kid this Mac is (from the grants file, by hostname).
+    kid: Option<String>,
+    chore_source: ChoreSource,
+    /// Tests pin the hostnames; production asks scutil.
+    hosts_override: Option<Vec<String>>,
 }
 
 impl EarnedGate {
@@ -468,7 +552,16 @@ impl EarnedGate {
             chore_defs_mtime: None,
             pin_path: paths.managed_dir.join("chore-pin"),
             now_override: None,
+            grants_path: paths.managed_dir.join("grants.json"),
+            grants_mtime: None,
+            kid: None,
+            chore_source: ChoreSource::None,
+            hosts_override: None,
         }
+    }
+
+    fn hostnames(&self) -> Vec<String> {
+        self.hosts_override.clone().unwrap_or_else(local_hostnames)
     }
 
     fn local_now(&self) -> LocalNow {
@@ -514,26 +607,115 @@ impl EarnedGate {
         add
     }
 
-    /// (Re)load the chore definitions when the bank changed on disk.
+    /// (Re)load the chore definitions when their source changed on disk.
+    /// The server's grants file wins when it names this Mac's kid; the bank
+    /// is the offline fallback (and the source when no server is in play).
+    /// A newly delivered grants file also merges the parent's approvals.
     fn reload_chores(&mut self) {
-        let mtime = std::fs::metadata(&self.tasks_path)
-            .and_then(|m| m.modified())
-            .ok();
-        if mtime.is_none() {
-            self.chore_defs.clear();
-            self.chore_defs_mtime = None;
+        let mtime_of = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let grants_mtime = mtime_of(&self.grants_path);
+        let bank_mtime = mtime_of(&self.tasks_path);
+        if grants_mtime == self.grants_mtime && bank_mtime == self.chore_defs_mtime {
             return;
         }
-        if mtime == self.chore_defs_mtime {
-            return;
+        let grants_changed = grants_mtime != self.grants_mtime;
+        self.grants_mtime = grants_mtime;
+        self.chore_defs_mtime = bank_mtime;
+
+        // Server-side definitions for this kid?
+        let mut kid_entry: Option<(String, GrantsKid)> = None;
+        if grants_mtime.is_some()
+            && let Ok(text) = std::fs::read_to_string(&self.grants_path)
+            && let Ok(file) = serde_json::from_str::<GrantsFile>(&text)
+        {
+            let hosts = self.hostnames();
+            kid_entry = file
+                .kids
+                .into_iter()
+                .find(|(_, k)| k.hosts.iter().any(|h| hosts.contains(&h.to_lowercase())));
+            if kid_entry.is_none() {
+                tracing::warn!("chores: grants file names no kid for hosts {hosts:?}; using the bank");
+            }
         }
-        self.chore_defs_mtime = mtime;
-        self.chore_defs = std::fs::read_to_string(&self.tasks_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<BankChores>(&s).ok())
-            .map(|b| b.chores)
-            .unwrap_or_default();
-        tracing::info!("chores: loaded {} definition(s) from the bank", self.chore_defs.len());
+        match kid_entry {
+            Some((slug, kid)) => {
+                self.chore_defs = kid.chores.clone();
+                self.kid = Some(slug.clone());
+                self.chore_source = ChoreSource::Server;
+                tracing::info!(
+                    "chores: {} definition(s) for kid \"{slug}\" from the server",
+                    self.chore_defs.len()
+                );
+                if grants_changed {
+                    self.merge_grants(&kid.verified);
+                }
+            }
+            None => {
+                self.kid = None;
+                self.chore_defs = bank_mtime
+                    .and_then(|_| std::fs::read_to_string(&self.tasks_path).ok())
+                    .and_then(|s| serde_json::from_str::<BankChores>(&s).ok())
+                    .map(|b| b.chores)
+                    .unwrap_or_default();
+                self.chore_source = if bank_mtime.is_some() {
+                    ChoreSource::Bank
+                } else {
+                    ChoreSource::None
+                };
+                if bank_mtime.is_some() {
+                    tracing::info!("chores: loaded {} definition(s) from the bank", self.chore_defs.len());
+                }
+            }
+        }
+    }
+
+    /// Record the parent's server-side approvals that are new to the
+    /// ledger: current-period (by THIS Mac's clock) or once-only entries not
+    /// yet verified. Bonus minutes go through the same caps as a PIN
+    /// verification. Idempotent, so a re-delivered artifact is harmless.
+    fn merge_grants(&mut self, entries: &[GrantEntry]) {
+        let now = self.local_now();
+        self.rollover(&now);
+        let mut changed = false;
+        for e in entries {
+            let Some(def) = self.chore(&e.id).cloned() else { continue };
+            if def.period(&now) != e.period {
+                continue; // stale (or early) by this Mac's calendar
+            }
+            if self.is_verified(&e.id, &e.period) {
+                continue;
+            }
+            let credited = self.record_verified(&def, &e.period);
+            self.ledger.chores.claims.retain(|c| c.id != e.id);
+            tracing::info!("chores: \"{}\" approved by a parent (+{credited:.0} min)", e.id);
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+    }
+
+    /// Mark `def` verified for `period` and credit its bonus minutes under
+    /// the chore cap and the earned-time caps. Returns the minutes credited.
+    /// Shared by the PIN path and server approvals. Does not persist.
+    fn record_verified(&mut self, def: &ChoreDef, period: &str) -> f64 {
+        let mut minutes = 0.0;
+        if !def.required() && def.minutes > 0 {
+            let mut want = def.minutes as f64;
+            if self.chores.bonus_daily_cap_min > 0.0 {
+                want = want
+                    .min((self.chores.bonus_daily_cap_min - self.ledger.chores.bonus_today_min).max(0.0));
+            }
+            minutes = self.bank(want);
+            self.ledger.chores.bonus_today_min += minutes;
+        }
+        self.ledger.chores.verified.push(ChoreDone {
+            id: def.id.clone(),
+            period: period.to_string(),
+            at: unix_now(),
+            minutes,
+        });
+        minutes
     }
 
     fn chore(&self, id: &str) -> Option<&ChoreDef> {
@@ -676,22 +858,7 @@ impl EarnedGate {
         self.ledger.chores.pin_failures = 0;
         self.ledger.chores.pin_locked_until = None;
         self.ledger.chores.claims.retain(|c| c.id != id);
-        let mut minutes = 0.0;
-        if !def.required() && def.minutes > 0 {
-            let mut want = def.minutes as f64;
-            if self.chores.bonus_daily_cap_min > 0.0 {
-                want = want
-                    .min((self.chores.bonus_daily_cap_min - self.ledger.chores.bonus_today_min).max(0.0));
-            }
-            minutes = self.bank(want);
-            self.ledger.chores.bonus_today_min += minutes;
-        }
-        self.ledger.chores.verified.push(ChoreDone {
-            id: id.to_string(),
-            period,
-            at: unix_now(),
-            minutes,
-        });
+        let minutes = self.record_verified(&def, &period);
         self.persist();
         tracing::info!("chores: \"{id}\" verified (+{minutes:.0} min)");
         ChoreVerify::Ok { minutes }
@@ -721,8 +888,15 @@ impl EarnedGate {
                 })
             })
             .collect();
+        let source = match self.chore_source {
+            ChoreSource::None => "none",
+            ChoreSource::Bank => "bank",
+            ChoreSource::Server => "server",
+        };
         serde_json::json!({
             "enabled": self.chores.enabled && self.tasks_path.exists(),
+            "source": source,
+            "kid": self.kid,
             "pinSet": self.pin_path.exists(),
             "outstanding": self.required_outstanding(&now),
             "pending": self.pending(&now),
@@ -1676,6 +1850,24 @@ fn handle_client(
                 let _ = stream.write_all(reply.as_bytes());
                 return;
             }
+            Some("grants") => {
+                let reply = match apply_grants_envelope(&line, managed_dir, verifier) {
+                    Ok(epoch) => {
+                        tracing::info!("accepted grants envelope, epoch {epoch}");
+                        // Pick up the new definitions/approvals right away
+                        // rather than on the next watchdog tick.
+                        earned.lock().unwrap().reload_chores();
+                        "{\"ok\":true}\n".to_string()
+                    }
+                    Err(e) => {
+                        tracing::warn!("grants envelope refused: {e:#}");
+                        format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::json!(e.to_string()))
+                    }
+                };
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
             Some("app") => {
                 let reply = match apply_app_envelope(&line, managed_dir, verifier) {
                     Ok(version) => {
@@ -1730,12 +1922,13 @@ fn handle_client(
                     (f.0.clone(), denied, forwarded)
                 };
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}},\"siteFilter\":{{\"mode\":{},\"deniedRecent\":{},\"forwardedRecent\":{}}},\"chores\":{}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"grantsEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}},\"siteFilter\":{{\"mode\":{},\"deniedRecent\":{},\"forwardedRecent\":{}}},\"chores\":{}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
                     a.config_epoch,
                     read_epoch(&managed_dir.join("epoch-tasks")),
+                    read_epoch(&managed_dir.join("epoch-grants")),
                     a.enabled,
                     a.challenge_overdue,
                     a.clock_tamper,
@@ -1838,6 +2031,45 @@ fn apply_tasks_envelope(
         std::fs::write(&authored_path, format!("{authored}\n"))?;
     }
     Ok(verified.epoch)
+}
+
+/// Verify and persist a `betamacs-grants` envelope (docs/chores.md): own
+/// epoch + generation high-waters like the bank; the artifact is written
+/// root-only (it holds every kid's chores) and picked up by `EarnedGate`.
+fn apply_grants_envelope(
+    raw: &str,
+    managed_dir: &Path,
+    verifier: Option<&envelope::Verifier>,
+) -> Result<u64> {
+    let verifier = verifier.context("no pinned otactl root installed")?;
+    let env: envelope::Envelope = serde_json::from_str(raw).context("malformed envelope")?;
+    let epoch_path = managed_dir.join("epoch-grants");
+    let authored_path = managed_dir.join("authored-grants");
+    let verified = verifier.verify(&env, read_epoch(&epoch_path), envelope::GRANTS_APP)?;
+    check_generation(&authored_path, &verified.authored_at)?;
+    serde_json::from_slice::<GrantsFile>(&verified.artifact).context("grants artifact is not a grants file")?;
+    install_grants(managed_dir, &verified.artifact)?;
+    std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
+    if let Some(authored) = &verified.authored_at {
+        std::fs::write(&authored_path, format!("{authored}\n"))?;
+    }
+    Ok(verified.epoch)
+}
+
+/// Write the grants file root-only (0600) via a temp file + rename.
+fn install_grants(managed_dir: &Path, artifact: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = managed_dir.join("grants.json.tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(artifact)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, managed_dir.join("grants.json"))?;
+    Ok(())
 }
 
 fn read_epoch(path: &Path) -> u64 {
@@ -2214,6 +2446,11 @@ mod earned_tests {
                 day: "mon".into(),
                 hhmm: 1000,
             }),
+            grants_path: PathBuf::from(format!("{path}.grants")),
+            grants_mtime: None,
+            kid: None,
+            chore_source: ChoreSource::None,
+            hosts_override: Some(vec!["bdsmbpm101".into()]),
         }
     }
 
@@ -2375,6 +2612,117 @@ mod earned_tests {
         let _ = std::fs::remove_file(&g.ledger_path);
         let _ = std::fs::remove_file(&g.tasks_path);
         let _ = std::fs::remove_file(&g.pin_path);
+        let _ = std::fs::remove_file(&g.grants_path);
+    }
+
+    /// A server grants file: Anna on this Mac (bed required, piano bonus
+    /// 20, trash weekly 30), Ben elsewhere. `verified` is filled per test.
+    fn write_grants(g: &EarnedGate, verified: &str) {
+        std::fs::write(
+            &g.grants_path,
+            format!(
+                r#"{{"version":1,"kids":{{
+                  "anna":{{"name":"Anna","hosts":["BDSMBPM101"],
+                    "chores":[
+                      {{"id":"bed","name":"Bed","kind":"required","repeat":"daily"}},
+                      {{"id":"piano","name":"Piano","kind":"bonus","repeat":"daily","minutes":20}},
+                      {{"id":"trash","name":"Trash","kind":"bonus","repeat":"weekly","minutes":30}}],
+                    "verified":[{verified}]}},
+                  "ben":{{"name":"Ben","hosts":["other-mac"],
+                    "chores":[{{"id":"dog","name":"Dog","kind":"required"}}],"verified":[]}}
+                }}}}"#
+            ),
+        )
+        .unwrap();
+        // Force a reload even when the mtime granularity would hide the write.
+        // (grants_mtime is compared to the file's; a rewrite within the same
+        // second is invisible, so tests reset the cached value.)
+    }
+
+    fn force_reload(g: &mut EarnedGate) {
+        g.grants_mtime = Some(std::time::UNIX_EPOCH);
+        g.chore_defs_mtime = Some(std::time::UNIX_EPOCH);
+        g.reload_chores();
+    }
+
+    #[test]
+    fn grants_pick_this_kid_and_merge_once() {
+        let mut g = chore_gate("/tmp/bm-chore-t5.json");
+        g.daily_cap_min = 100.0;
+        write_grants(
+            &g,
+            r#"{"id":"piano","period":"2026-09-07","minutes":20,"at":1},
+               {"id":"bed","period":"2026-09-07","minutes":0,"at":1},
+               {"id":"trash","period":"2026-W37","minutes":30,"at":1},
+               {"id":"dog","period":"2026-09-07","minutes":0,"at":1}"#,
+        );
+        force_reload(&mut g);
+        assert_eq!(g.kid.as_deref(), Some("anna"));
+        assert_eq!(g.chore_source, ChoreSource::Server);
+        assert_eq!(g.chore_defs.len(), 3, "the bank's list is replaced by the server's");
+        assert!(g.is_verified("bed", "2026-09-07"));
+        assert!(g.is_verified("trash", "2026-W37"));
+        assert!(!g.is_verified("dog", "2026-09-07"), "Ben's chore is not ours");
+        // piano 20 + trash 30 → chore cap 45 leaves 20 + 25.
+        assert!((g.ledger.balance_min - 45.0).abs() < 1e-9);
+        assert!(g.required_outstanding(&g.local_now()).is_empty());
+        // Re-delivering the same artifact credits nothing more.
+        force_reload(&mut g);
+        assert!((g.ledger.balance_min - 45.0).abs() < 1e-9);
+        assert_eq!(g.ledger.chores.verified.len(), 3);
+        // The PIN path still refuses a double verification of a server-approved chore.
+        assert_eq!(g.chore_verify("piano", "4821"), ChoreVerify::Refused("already verified"));
+        cleanup(&g);
+    }
+
+    #[test]
+    fn grants_ignore_stale_periods_and_clear_claims() {
+        let mut g = chore_gate("/tmp/bm-chore-t6.json");
+        g.daily_cap_min = 100.0;
+        // Yesterday's approvals (by this Mac's calendar) must not credit.
+        write_grants(&g, r#"{"id":"piano","period":"2026-09-06","minutes":20,"at":1}"#);
+        force_reload(&mut g);
+        assert!((g.ledger.balance_min).abs() < 1e-9);
+        assert!(!g.is_verified("piano", "2026-09-06"));
+        // A pending claim is consumed by the approval.
+        assert_eq!(g.chore_claim("bed"), Ok(()));
+        assert_eq!(g.pending(&g.local_now()), vec!["bed".to_string()]);
+        write_grants(&g, r#"{"id":"bed","period":"2026-09-07","minutes":0,"at":2}"#);
+        force_reload(&mut g);
+        assert!(g.pending(&g.local_now()).is_empty());
+        assert!(g.is_verified("bed", "2026-09-07"));
+        cleanup(&g);
+    }
+
+    #[test]
+    fn grants_without_this_host_fall_back_to_bank() {
+        let mut g = chore_gate("/tmp/bm-chore-t7.json");
+        g.hosts_override = Some(vec!["some-other-mac".into()]);
+        write_grants(&g, "");
+        force_reload(&mut g);
+        assert_eq!(g.kid, None);
+        assert_eq!(g.chore_source, ChoreSource::Bank);
+        assert_eq!(g.chore_defs.len(), 5, "bank definitions");
+        // Removing the grants file keeps the bank; removing both → none.
+        std::fs::remove_file(&g.grants_path).unwrap();
+        g.reload_chores();
+        assert_eq!(g.chore_source, ChoreSource::Bank);
+        std::fs::remove_file(&g.tasks_path).unwrap();
+        g.reload_chores();
+        assert_eq!(g.chore_source, ChoreSource::None);
+        assert!(g.chore_defs.is_empty());
+        cleanup(&g);
+    }
+
+    #[test]
+    fn install_grants_is_root_only() {
+        let dir = PathBuf::from("/tmp/bm-chore-grants");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        install_grants(&dir, br#"{"version":1,"kids":{}}"#).unwrap();
+        let mode = std::fs::metadata(dir.join("grants.json")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

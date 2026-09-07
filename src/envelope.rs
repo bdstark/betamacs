@@ -30,6 +30,10 @@ pub const APP_APP: &str = "betamacs";
 /// Author-signed like config (a bad bank can lock a kid out).
 #[allow(dead_code)] // used by betamacsd, dead in the betamacs bin
 pub const TASKS_APP: &str = "betamacs-tasks";
+/// The per-family chores state (definitions + parent approvals) the kids
+/// web app publishes (docs/chores.md). One artifact for every kid; the
+/// daemon picks its kid by hostname. Author-signed like config and tasks.
+pub const GRANTS_APP: &str = "betamacs-grants";
 
 const ALG_ECDSA_P256_SHA256: &str = "ecdsa-p256-sha256";
 /// ecdsa-with-SHA256 (certificate signature algorithm).
@@ -341,7 +345,8 @@ impl Verifier {
         // author — a key otactl never holds, so no server-side path can
         // mint policy or the challenges that gate the network.
         let (artifact, authored_at) = if (expected_app == CONFIG_APP
-            || expected_app == TASKS_APP)
+            || expected_app == TASKS_APP
+            || expected_app == GRANTS_APP)
             && self.author_key.is_some()
         {
             let (bytes, at) = self.unwrap_authored(&artifact)?;

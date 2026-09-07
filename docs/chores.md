@@ -148,19 +148,49 @@ it reads the plaintext `chorePin`, emits `chorePinHash` as
 `sha256$<hex salt>$<hex digest>` with a fresh random salt, and deletes
 the plaintext before signing.
 
-## Phase 2: remote approval
+## Server-side chores (the kids web app)
 
-The in-person PIN has one real cost: if no parent is home, the child waits.
-The fix is asynchronous approval — pending claims flow up in the
-hausmeister heartbeat, the parent approves from the config app or a phone,
-and a signed grant comes back down and is applied by the daemon like any
-other envelope. That needs device-to-server claim reporting and a small
-signed grant artifact, so it is deliberately after phase 1: ship the PIN
-path, see how much the in-person requirement chafes, then decide.
+The in-person PIN is the offline fallback. The normal path is the kids web
+app on typeserver (`/kids/`, typeserver `docs/kids.md`): a kid signs in with
+a passkey on any device and taps "I did it"; a parent signs in from a phone
+and taps Approve. The server is then the source of truth for definitions,
+claims and approvals, and the Mac becomes a consumer of signed approvals.
 
-The schema is already shaped for it — a grant is just
-`{choreId, period, minutes, issuedAt}` applied to the same ledger entry the
-PIN path writes.
+**Delivery.** On every approval the server author-signs and publishes ONE
+`betamacs-grants` artifact (format `betamacs-grants-json`) carrying every
+kid's state:
+
+```jsonc
+{ "version": 1, "generatedAt": "…",
+  "kids": { "anna": { "name": "Anna", "hosts": ["bdsmbpm101"],
+                      "chores":   [ /* same shape as the bank's chores */ ],
+                      "verified": [ { "id": "piano", "period": "2026-09-07", "minutes": 20, "at": 1788755843 } ] } } }
+```
+
+hausmeister fetches it like the bank (own `ext:betamacs-grants` grant) and
+hands it to betamacsd as a `grants` envelope. The daemon verifies it (own
+`epoch-grants` / `authored-grants` high-waters), writes it root-only as
+`grants.json`, and `EarnedGate` picks **its own kid by hostname** (scutil's
+LocalHostName / ComputerName / HostName, case-insensitive — a standard user
+cannot change them). One artifact for all kids avoids per-kid otactl apps
+or channels, which would each need their own publisher cert scope.
+
+**Merging.** Definitions from the grants file replace the bank's for that
+kid (`status.chores.source` = `server`; the bank is the fallback when the
+file names no kid on this Mac, or is absent). Each `verified` entry that is
+for the period this Mac is currently in (or `once`) and not already in the
+ledger is recorded through the same `record_verified` path as a PIN
+verification — same chore cap, same earned-time caps — and consumes any
+pending local claim. Entries for other periods are ignored, so a
+re-delivered artifact after midnight can never credit yesterday twice, and
+a re-delivered identical artifact credits nothing (idempotent by
+`(id, period)`).
+
+**Agent.** With `chores.kidsUrl` set in the config, the menu bar's
+"Chores…" opens the web app; empty, it runs the local dialogs (PIN
+fallback). The HUD and menu lines are unchanged.
+
+**Latency.** Approval → next hausmeister poll → betamacsd → gate. Minutes.
 
 ## Wire protocol (daemon socket)
 
@@ -192,41 +222,33 @@ entries are kept forever).
 
 **Built and unit-tested:**
 
-- Schema on both sides (`settings.rs`, `webapp/src/schema.ts`),
-  `publish.sh tasks` hashing/validation, examples.
-- **Daemon (`betamacsd`)**: `install_bank` splits `chorePinHash` into the
-  root-only `chore-pin` (0600) on every bank delivery and strips it from
-  `tasks.json` (a bank without a PIN removes a stale one); ledger `chores`
-  section; `chores` / `chore-claim` / `chore-reject` / `chore-verify` socket
-  ops with the PIN check, attempt counter and lockout in the daemon; bonus
-  credit through the same cap path as observed earn credit plus the chore
-  cap; required-chore hold in the earned-time gate (earning mode, no
-  balance spent while held, nothing due before `requiredHoldFrom`);
-  `QReason::Chores` and the `status` summary. Eight daemon tests plus a
-  socket smoke run in prefix mode.
-- Agent relay: `earned.rs` sends the `chores` policy in the earn report;
-  the HUD maps the `chores` lockdown reason to plain language.
-- **Agent UI (`src/chores.rs`)**: a "Chores…" menu-bar item opens a native
-  list picker (osascript `choose from list`) of the bank's chores with
-  their state — `☐ Make your bed — required today`, `☐ Piano — +20 min`,
-  `⏳ … — waiting for a parent`, `✓ … — done`. Choosing one claims it and
-  opens a masked-entry dialog ("Ask a parent to check …", buttons *Not
-  yet* / *Verify*, `with hidden answer`, 5-minute give-up). *Verify* relays
-  the PIN; a wrong PIN re-asks with the attempts left; *Not yet*, a
-  give-up, a lockout, or a refusal withdraws the claim. After a result the
-  picker returns until *Close*. One flow at a time; all blocking dialogs
-  run on their own thread. The menu also carries a live `Chores:` line and
-  the HUD a `Chores:` row (`N required to do (ids) · N waiting for a parent
-  · N done today`, `nothing to do`, or `not configured`). The dialog
-  scripts are syntax-checked with `osacompile` in unit tests; the dialogs
-  themselves need an Aqua session and have not been clicked through yet.
+- Schema on both sides (`settings.rs`, `webapp/src/schema.ts`; `chores`
+  module incl. `kidsUrl`), `publish.sh tasks` hashing/validation, examples.
+- **Daemon**: PIN split (`install_bank`), ledger `chores` section, the four
+  chore socket ops with the PIN check/lockout in the daemon, bonus credit
+  through the shared cap path, required-chore hold in the earned-time gate
+  (`QReason::Chores`), `status.chores`; **grants**: `apply_grants_envelope`
+  (`grants` socket message, root-only `grants.json`, `grantsEpoch` in
+  status), kid selection by hostname, definitions from the server with the
+  bank as fallback, idempotent period-checked approval merge. 12 daemon
+  tests plus a socket smoke run.
+- **Agent**: chores policy relay in the earn report; "Chores…" opens
+  `kidsUrl` or the local list + PIN dialogs; menu/HUD `Chores:` lines.
+- **hausmeister plugin**: fetches/delivers `betamacs-grants` when the Mac
+  holds `ext:betamacs-grants` (row in Check for Updates too).
+- **typeserver**: `/kids/` page (kid and parent views, chore editor),
+  `/api/kids/*`, restricted kid sessions, grants publishing via the config
+  app's sign+upload core. See typeserver `docs/kids.md`.
 
-**Not built yet (in order):**
+**Not done (in order):**
 
-1. Config app: `chores` editor tab; chore list + PIN in the tasks editor.
-2. Ship: betamacs release, then a bank with chores + a PIN, then a config
-   enabling `chores`. Then click through the dialogs on the kid Mac.
-3. Phase 2 remote approval.
+1. Rollout: publisher cert `betamacs-grants`, `ext:betamacs-grants` per kid
+   Mac, betamacs + hausmeister releases, typeserver deploy, config with
+   `chores.enabled` + `kidsUrl` — see typeserver `docs/kids.md` "Rollout".
+2. Live click-through on a kid Mac (and the local PIN dialogs, which have
+   only been syntax-checked).
+3. Config-app `chores` editor tab (today the module is edited as JSON).
+4. Device → server state (balance, gate) for the kid page — optional.
 
 ## Open questions
 

@@ -1186,6 +1186,11 @@ pub struct ChoreSettings {
     pub verify_max_attempts: u32,
     /// Length of that refusal.
     pub verify_lockout_sec: u32,
+    /// The kids web app (typeserver `/kids/`, docs/chores.md). When set, the
+    /// menu bar's "Chores…" opens it in the browser; when empty the agent
+    /// falls back to the local list + PIN dialogs.
+    #[serde(default)]
+    pub kids_url: String,
 }
 
 impl Default for ChoreSettings {
@@ -1197,6 +1202,7 @@ impl Default for ChoreSettings {
             required_hold_from: "00:00".into(),
             verify_max_attempts: 5,
             verify_lockout_sec: 600,
+            kids_url: String::new(),
         }
     }
 }
@@ -1217,6 +1223,8 @@ pub struct ChorePatch {
     pub verify_max_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_lockout_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kids_url: Option<String>,
 }
 
 impl ChoreSettings {
@@ -1226,7 +1234,7 @@ impl ChoreSettings {
         }
         set!(
             enabled, bonus_daily_cap_min, claim_ttl_min, required_hold_from,
-            verify_max_attempts, verify_lockout_sec
+            verify_max_attempts, verify_lockout_sec, kids_url
         );
     }
 }

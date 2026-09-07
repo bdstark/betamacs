@@ -20,6 +20,10 @@ public final class BetamacsPlugin: HausmeisterPlugin {
   static let appName = "betamacs"
   static let configApp = "betamacs-config"
   static let tasksApp = "betamacs-tasks"
+  /// The kids chores state (definitions + parent approvals) the typeserver
+  /// kids app publishes; one artifact for every kid, the daemon picks its
+  /// own by hostname (betamacs docs/chores.md). Own ext: grant.
+  static let grantsApp = "betamacs-grants"
   static let arch = "arm64"
   static let appFormat = "macos-app-zip"
 
@@ -75,6 +79,11 @@ public final class BetamacsPlugin: HausmeisterPlugin {
           self.host.log.error("betamacs: tasks: \(error)")
         }
       }
+      if self.grantsEntitled {
+        do { _ = try await self.checkAndPushGrants() } catch {
+          self.host.log.error("betamacs: grants: \(error)")
+        }
+      }
       do { _ = try await self.checkAndInstallApp() } catch {
         self.host.log.error("betamacs: app: \(error)")
       }
@@ -118,6 +127,11 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     if tasksEntitled {
       items.append(await envelopeItem(name: "betamacs task bank", app: BetamacsPlugin.tasksApp, daemonEpoch: daemonTasksEpoch()) { [weak self] found in
         try await self?.pushTasks(found)
+      })
+    }
+    if grantsEntitled {
+      items.append(await envelopeItem(name: "betamacs chores", app: BetamacsPlugin.grantsApp, daemonEpoch: daemonGrantsEpoch()) { [weak self] found in
+        try await self?.pushGrants(found)
       })
     }
     return items
@@ -184,6 +198,11 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     host.entitlements?.extensions.contains { $0.app == BetamacsPlugin.tasksApp } ?? false
   }
 
+  /// The chores state is another cross-app fetch with its own ext: grant.
+  private var grantsEntitled: Bool {
+    host.entitlements?.extensions.contains { $0.app == BetamacsPlugin.grantsApp } ?? false
+  }
+
   /// Asks the daemon (off the main actor — the socket call blocks, for up
   /// to `DaemonSocket.statusTimeout`) and publishes the menu line on it.
   private func refreshStatus() async {
@@ -216,6 +235,11 @@ public final class BetamacsPlugin: HausmeisterPlugin {
 
   private func daemonTasksEpoch() -> UInt64 {
     guard let epoch = DaemonSocket.status()?["tasksEpoch"] as? Int, epoch >= 0 else { return 0 }
+    return UInt64(epoch)
+  }
+
+  private func daemonGrantsEpoch() -> UInt64 {
+    guard let epoch = DaemonSocket.status()?["grantsEpoch"] as? Int, epoch >= 0 else { return 0 }
     return UInt64(epoch)
   }
 
@@ -262,6 +286,25 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     let m = found.response.manifest
     recordPushed(app: BetamacsPlugin.tasksApp, manifest: m)
     host.log.notice("betamacs: pushed task bank \(m.version) (epoch \(m.epoch ?? 0))")
+  }
+
+  /// Fetch and deliver the kids chores state (`betamacs-grants`) when a
+  /// newer epoch is available. Published on every parent approval, so this
+  /// is the hop that turns an approval into an unlocked Mac; the poll
+  /// interval is the latency a parent sees.
+  private func checkAndPushGrants() async throws -> String {
+    let found = try await checkEnvelope(app: BetamacsPlugin.grantsApp, daemonEpoch: daemonGrantsEpoch())
+    guard found.newer else { return "up to date (epoch \(found.daemonEpoch))" }
+    try await pushGrants(found)
+    let m = found.response.manifest
+    return "pushed \(m.version) (epoch \(m.epoch ?? 0))"
+  }
+
+  private func pushGrants(_ found: EnvelopeCheck) async throws {
+    try await pushEnvelope(type: "grants", app: BetamacsPlugin.grantsApp, found)
+    let m = found.response.manifest
+    recordPushed(app: BetamacsPlugin.grantsApp, manifest: m)
+    host.log.notice("betamacs: pushed chores state \(m.version) (epoch \(m.epoch ?? 0))")
   }
 
   private func checkAndPushConfig() async throws -> String {

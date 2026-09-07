@@ -376,6 +376,7 @@ fn run(model_override: Option<String>, censor_in_captures: bool) -> Result<()> {
 
     // Menu bar status item; the settings link carries the token in the
     // URL fragment so the web UI connects without a manual paste.
+    chores::init(shared.clone());
     match menubar::MenuBar::new(
         format!("http://127.0.0.1:{port}/#token={token}"),
         std::env::current_dir()?.join("betamacs.log"),

@@ -308,6 +308,7 @@ export interface ChoreSettings {
   requiredHoldFrom: string; // HH:MM local; required chores hold the gate from here
   verifyMaxAttempts: number; // wrong PINs before a lockout
   verifyLockoutSec: number;
+  kidsUrl: string; // typeserver /kids/ app; empty = local PIN dialogs
 }
 export type ChorePatch = Partial<ChoreSettings>;
 
@@ -554,6 +555,7 @@ export function defaultChores(): ChoreSettings {
     requiredHoldFrom: "00:00",
     verifyMaxAttempts: 5,
     verifyLockoutSec: 600,
+    kidsUrl: "",
   };
 }
 

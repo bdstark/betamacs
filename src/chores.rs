@@ -7,12 +7,30 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::heartbeat::DAEMON_SOCKET;
 use crate::prompt;
+use crate::settings::Effective;
+
+/// The resolved settings, for `chores.kidsUrl` (set once from main).
+static EFFECTIVE: OnceLock<Arc<RwLock<Effective>>> = OnceLock::new();
+
+pub fn init(shared: Arc<RwLock<Effective>>) {
+    let _ = EFFECTIVE.set(shared);
+}
+
+/// The kids web app URL from policy, if configured.
+fn kids_url() -> Option<String> {
+    let url = EFFECTIVE
+        .get()
+        .and_then(|e| e.read().ok())
+        .map(|e| e.chores.kids_url.trim().to_string())?;
+    (!url.is_empty()).then_some(url)
+}
 
 /// One chore flow at a time (the menu item can be clicked repeatedly).
 static FLOW_OPEN: AtomicBool = AtomicBool::new(false);
@@ -136,8 +154,14 @@ pub fn summary(chores: Option<&Value>) -> Option<String> {
     })
 }
 
-/// Menu-bar entry point: run the picker/verify flow on a background thread.
+/// Menu-bar entry point. With a kids web app configured (`chores.kidsUrl`)
+/// open it in the browser; otherwise run the local picker/verify flow (the
+/// offline PIN fallback) on a background thread.
 pub fn open() {
+    if let Some(url) = kids_url() {
+        let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+        return;
+    }
     if FLOW_OPEN.swap(true, Ordering::SeqCst) {
         return; // already showing
     }
