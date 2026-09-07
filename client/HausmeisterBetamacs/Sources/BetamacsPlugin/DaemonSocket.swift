@@ -13,14 +13,31 @@ enum DaemonSocket {
 
   static var available: Bool { FileManager.default.fileExists(atPath: path) }
 
+  /// An app-install envelope carries the whole zip and the daemon unpacks,
+  /// code-checks, and swaps before replying.
+  static let installTimeout: TimeInterval = 120
+  /// A status query is answered from memory. If it takes longer than this
+  /// the daemon is wedged, and the caller must report that rather than
+  /// wait — every caller of `status()` is on a path the menu depends on.
+  static let statusTimeout: TimeInterval = 5
+
+  /// The daemon's status reply, or nil when there is no daemon, it is
+  /// unreachable, or it does not answer within `statusTimeout`. Blocking:
+  /// never call on the main thread.
+  static func status() -> [String: Any]? {
+    guard available, let reply = try? roundTrip(["type": "status"], timeout: statusTimeout),
+          reply["ok"] as? Bool == true else { return nil }
+    return reply
+  }
+
   /// Send one JSON object (newline-terminated), read one JSON reply.
-  /// Generous timeouts: an app-install envelope carries the whole zip and
-  /// the daemon unpacks, code-checks, and swaps before replying.
-  static func roundTrip(_ message: [String: Any]) throws -> [String: Any] {
+  /// Blocking, with `timeout` on both the send and the receive; the
+  /// default suits an install envelope, status callers pass their own.
+  static func roundTrip(_ message: [String: Any], timeout seconds: TimeInterval = installTimeout) throws -> [String: Any] {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { throw DaemonError(description: "socket: \(errnoText)") }
     defer { close(fd) }
-    var timeout = timeval(tv_sec: 120, tv_usec: 0)
+    var timeout = timeval(tv_sec: Int(seconds), tv_usec: Int32((seconds - seconds.rounded(.down)) * 1_000_000))
     _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 

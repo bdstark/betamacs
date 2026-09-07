@@ -52,8 +52,12 @@ public final class BetamacsPlugin: HausmeisterPlugin {
   /// deliberate operator action on the Mac, not a side effect.
   public func deactivate() {}
 
+  /// Called on the main thread. Nothing here may block on the daemon: the
+  /// status refresh and every check run in tasks off the main actor, so a
+  /// wedged betamacsd shows up as "daemon unreachable" in the menu instead
+  /// of freezing the app (no menu, no Quit) for a socket timeout.
   public func tick() {
-    refreshStatus()
+    Task { [weak self] in await self?.refreshStatus() }
     guard entitled else { return }
     guard DaemonSocket.available else {
       bootstrapIfNeeded()
@@ -74,10 +78,8 @@ public final class BetamacsPlugin: HausmeisterPlugin {
       do { _ = try await self.checkAndInstallApp() } catch {
         self.host.log.error("betamacs: app: \(error)")
       }
-      await MainActor.run {
-        self.checking = false
-        self.refreshStatus()
-      }
+      await self.refreshStatus()
+      await MainActor.run { self.checking = false }
     }
   }
 
@@ -161,7 +163,7 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     checking = true
     defer { checking = false }
     try await work()
-    await MainActor.run { refreshStatus() }
+    await refreshStatus()
   }
 
   struct Busy: Error, CustomStringConvertible {
@@ -182,39 +184,38 @@ public final class BetamacsPlugin: HausmeisterPlugin {
     host.entitlements?.extensions.contains { $0.app == BetamacsPlugin.tasksApp } ?? false
   }
 
-  private func refreshStatus() {
-    guard DaemonSocket.available else {
-      statusLine = "daemon not installed"
-      return
-    }
-    guard let reply = try? DaemonSocket.roundTrip(["type": "status"]),
-          reply["ok"] as? Bool == true else {
-      statusLine = "daemon unreachable"
-      return
-    }
+  /// Asks the daemon (off the main actor — the socket call blocks, for up
+  /// to `DaemonSocket.statusTimeout`) and publishes the menu line on it.
+  private func refreshStatus() async {
+    let line = daemonStatusLine()
+    await MainActor.run { statusLine = line }
+  }
+
+  /// Blocking; never call on the main thread.
+  private func daemonStatusLine() -> String {
+    guard DaemonSocket.available else { return "daemon not installed" }
+    guard let reply = DaemonSocket.status() else { return "daemon unreachable" }
     let age = reply["heartbeatAgeSecs"] as? Int ?? -1
     let captureOk = reply["captureOk"] as? Bool ?? false
     let epoch = reply["configEpoch"] as? Int ?? 0
     if age < 0 {
-      statusLine = "agent has not reported yet"
+      return "agent has not reported yet"
     } else if age > 60 {
-      statusLine = "agent silent for \(age)s"
+      return "agent silent for \(age)s"
     } else if !captureOk {
-      statusLine = "capture unhealthy (Screen Recording?)"
+      return "capture unhealthy (Screen Recording?)"
     } else {
-      statusLine = "healthy · config epoch \(epoch)"
+      return "healthy · config epoch \(epoch)"
     }
   }
 
   private func daemonConfigEpoch() -> UInt64 {
-    guard let reply = try? DaemonSocket.roundTrip(["type": "status"]),
-          let epoch = reply["configEpoch"] as? Int, epoch >= 0 else { return 0 }
+    guard let epoch = DaemonSocket.status()?["configEpoch"] as? Int, epoch >= 0 else { return 0 }
     return UInt64(epoch)
   }
 
   private func daemonTasksEpoch() -> UInt64 {
-    guard let reply = try? DaemonSocket.roundTrip(["type": "status"]),
-          let epoch = reply["tasksEpoch"] as? Int, epoch >= 0 else { return 0 }
+    guard let epoch = DaemonSocket.status()?["tasksEpoch"] as? Int, epoch >= 0 else { return 0 }
     return UInt64(epoch)
   }
 
