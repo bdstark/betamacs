@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 const AGENT_LABEL: &str = "com.bdstark.betamacs";
 const APP_PATH: &str = "/Applications/betamacs.app";
@@ -150,6 +151,254 @@ struct EarnedLedger {
     date: String,
     earned_today_min: f64,
     balance_min: f64,
+    /// Parent-verified chores (docs/chores.md). Absent in pre-chores
+    /// ledgers, hence the default.
+    #[serde(default)]
+    chores: ChoreLedger,
+}
+
+// ------------------------------------------------------------------ chores
+//
+// Parent-verified external tasks (docs/chores.md). The bank (tasks.json)
+// carries the definitions; the agent relays the `chores` policy module in
+// its earn report; this daemon owns everything the child must not be able
+// to fake: claims, verifications, the PIN hash (root-only file), the PIN
+// attempt counter, and the credit. A `required` chore holds the earned-time
+// gate (earning mode) on its due day until verified; a `bonus` chore
+// credits minutes on verification, capped.
+
+/// A chore as defined in the bank. Parsed here with serde defaults so the
+/// daemon needs nothing from settings.rs (kept lean on purpose).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ChoreDef {
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// "bonus" (default) | "required"
+    #[serde(default)]
+    kind: String,
+    /// "daily" (default) | "weekly" | "once"
+    #[serde(default)]
+    repeat: String,
+    #[serde(default)]
+    days: Vec<String>,
+    #[serde(default)]
+    minutes: u32,
+}
+
+impl ChoreDef {
+    fn required(&self) -> bool {
+        self.kind == "required"
+    }
+    /// Is the chore due on `day` (mon..sun)? Weekly/once chores are due every
+    /// day of their period; daily ones on their listed days (empty = all).
+    fn due_on(&self, day: &str) -> bool {
+        match self.repeat.as_str() {
+            "weekly" | "once" => true,
+            _ => self.days.is_empty() || self.days.iter().any(|d| d.eq_ignore_ascii_case(day)),
+        }
+    }
+    /// The period key a claim/verification belongs to.
+    fn period(&self, now: &LocalNow) -> String {
+        match self.repeat.as_str() {
+            "weekly" => now.week.clone(),
+            "once" => "once".to_string(),
+            _ => now.date.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct BankChores {
+    #[serde(default)]
+    chores: Vec<ChoreDef>,
+}
+
+/// The `chores` policy module as relayed by the agent (docs/chores.md).
+#[derive(Clone, Debug, PartialEq, Default)]
+struct ChorePolicy {
+    enabled: bool,
+    bonus_daily_cap_min: f64,
+    claim_ttl_min: f64,
+    /// HHMM local, e.g. 900 for "09:00".
+    required_hold_from: u32,
+    verify_max_attempts: u32,
+    verify_lockout_sec: u64,
+}
+
+impl ChorePolicy {
+    fn from_msg(v: Option<&serde_json::Value>) -> Self {
+        let Some(v) = v else { return Self::default() };
+        let num = |k: &str, d: f64| v.get(k).and_then(|x| x.as_f64()).unwrap_or(d);
+        let hold = v
+            .get("requiredHoldFrom")
+            .and_then(|x| x.as_str())
+            .and_then(parse_hhmm)
+            .unwrap_or(0);
+        Self {
+            enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+            bonus_daily_cap_min: num("bonusDailyCapMin", 0.0).max(0.0),
+            claim_ttl_min: num("claimTtlMin", 0.0).max(0.0),
+            required_hold_from: hold,
+            verify_max_attempts: num("verifyMaxAttempts", 5.0).max(1.0) as u32,
+            verify_lockout_sec: num("verifyLockoutSec", 600.0).max(0.0) as u64,
+        }
+    }
+}
+
+/// "HH:MM" -> HHMM as a number (09:30 -> 930).
+fn parse_hhmm(t: &str) -> Option<u32> {
+    let (h, m) = t.split_once(':')?;
+    Some(h.trim().parse::<u32>().ok()? * 100 + m.trim().parse::<u32>().ok()?)
+}
+
+/// A claim the child made, awaiting a parent.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct ChoreClaim {
+    id: String,
+    period: String,
+    claimed_at: u64,
+}
+
+/// A verification a parent made (with the minutes actually credited).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct ChoreDone {
+    id: String,
+    period: String,
+    at: u64,
+    minutes: f64,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+struct ChoreLedger {
+    #[serde(default)]
+    claims: Vec<ChoreClaim>,
+    #[serde(default)]
+    verified: Vec<ChoreDone>,
+    /// Bonus minutes credited today (reset on rollover).
+    #[serde(default)]
+    bonus_today_min: f64,
+    #[serde(default)]
+    pin_failures: u32,
+    #[serde(default)]
+    pin_locked_until: Option<u64>,
+}
+
+/// The daemon's view of local time for chore periods. From `/bin/date` (the
+/// OS clock — a mid-run clock change is already a tamper full-block).
+#[derive(Clone, Debug, PartialEq, Default)]
+struct LocalNow {
+    /// YYYY-MM-DD
+    date: String,
+    /// ISO week, YYYY-Www
+    week: String,
+    /// mon..sun
+    day: String,
+    /// HHMM
+    hhmm: u32,
+}
+
+impl LocalNow {
+    fn read() -> Self {
+        let out = std::process::Command::new("/bin/date")
+            .args(["+%F %G-W%V %u %H%M"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let mut it = out.split_whitespace();
+        let date = it.next().unwrap_or("").to_string();
+        let week = it.next().unwrap_or("").to_string();
+        let dow: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let hhmm: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let day = ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            .get(dow)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        Self { date, week, day, hhmm }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Outcome of a `chore-verify`, on the wire as `result`.
+#[derive(Clone, Debug, PartialEq)]
+enum ChoreVerify {
+    /// Verified; `minutes` were credited (0 for required chores).
+    Ok { minutes: f64 },
+    WrongPin { attempts_left: u32 },
+    /// PIN entry refused for `secs` more seconds.
+    Locked { secs: u64 },
+    /// No PIN delivered with the bank, module off, unknown id, etc.
+    Refused(&'static str),
+}
+
+/// Check `pin` against a `sha256$<salt>$<digest>` line as written by
+/// `publish.sh tasks` (same digest as challenge answers: salt || 0 || pin).
+fn pin_matches(stored: &str, pin: &str) -> bool {
+    let mut parts = stored.trim().split('$');
+    if parts.next() != Some("sha256") {
+        return false;
+    }
+    let (Some(salt), Some(digest)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let mut h = sha2::Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0u8]);
+    h.update(pin.trim().as_bytes());
+    format!("{:x}", h.finalize()) == digest
+}
+
+/// Split the PIN hash out of a delivered bank: `chorePinHash` goes to the
+/// root-only `chore-pin` file, and `tasks.json` is written without it. A bank
+/// with no PIN removes any stale `chore-pin`, so an old PIN never outlives
+/// the bank that set it. A bank that isn't a JSON object is written as-is.
+fn install_bank(managed_dir: &Path, artifact: &[u8]) -> Result<()> {
+    let pin_path = managed_dir.join("chore-pin");
+    let tmp = managed_dir.join("tasks.json.tmp");
+    let mut value: serde_json::Value = match serde_json::from_slice(artifact) {
+        Ok(v) => v,
+        Err(_) => {
+            std::fs::write(&tmp, artifact)?;
+            std::fs::rename(&tmp, managed_dir.join("tasks.json"))?;
+            return Ok(());
+        }
+    };
+    let pin = value
+        .as_object_mut()
+        .and_then(|o| o.remove("chorePinHash"))
+        .and_then(|v| v.as_str().map(str::to_string));
+    match pin {
+        Some(hash) => {
+            use std::os::unix::fs::OpenOptionsExt;
+            let ptmp = managed_dir.join("chore-pin.tmp");
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&ptmp)?;
+            f.write_all(hash.as_bytes())?;
+            f.write_all(b"\n")?;
+            std::fs::set_permissions(&ptmp, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::rename(&ptmp, &pin_path)?;
+        }
+        None => {
+            let _ = std::fs::remove_file(&pin_path);
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, managed_dir.join("tasks.json"))?;
+    Ok(())
 }
 
 /// The site-filter policy snapshot the agent resolved from the config
@@ -184,6 +433,15 @@ struct EarnedGate {
     filter: FilterPolicy,
     last_report: Option<Instant>,
     last_tick: Instant,
+    /// Chore policy snapshot (from the agent's earn report) and the bank's
+    /// chore definitions (re-read from tasks.json when it changes).
+    chores: ChorePolicy,
+    chore_defs: Vec<ChoreDef>,
+    chore_defs_mtime: Option<std::time::SystemTime>,
+    /// Root-only `sha256$salt$digest` of the parent PIN (docs/chores.md).
+    pin_path: PathBuf,
+    /// Tests pin local time; production reads /bin/date.
+    now_override: Option<LocalNow>,
 }
 
 impl EarnedGate {
@@ -205,16 +463,273 @@ impl EarnedGate {
             filter: FilterPolicy::default(),
             last_report: None,
             last_tick: Instant::now(),
+            chores: ChorePolicy::default(),
+            chore_defs: Vec::new(),
+            chore_defs_mtime: None,
+            pin_path: paths.managed_dir.join("chore-pin"),
+            now_override: None,
         }
     }
 
-    fn today() -> String {
-        std::process::Command::new("/bin/date")
-            .args(["+%F"])
-            .output()
+    fn local_now(&self) -> LocalNow {
+        self.now_override.clone().unwrap_or_else(LocalNow::read)
+    }
+
+    /// Reset the daily counters when the local date moves on, and drop
+    /// chore state from past periods. Idempotent within a day.
+    fn rollover(&mut self, now: &LocalNow) {
+        if now.date.is_empty() || self.ledger.date == now.date {
+            return;
+        }
+        self.ledger.date = now.date.clone();
+        self.ledger.earned_today_min = 0.0;
+        self.ledger.chores.bonus_today_min = 0.0;
+        let defs = self.chore_defs.clone();
+        let current = |id: &str, period: &str| {
+            defs.iter()
+                .find(|d| d.id == id)
+                .is_some_and(|d| d.period(now) == period)
+        };
+        self.ledger.chores.claims.retain(|c| current(&c.id, &c.period));
+        self.ledger
+            .chores
+            .verified
+            .retain(|v| v.period == "once" || current(&v.id, &v.period));
+    }
+
+    /// Bank `minutes` of credit into the balance under the earned-time daily
+    /// cap and bank ceiling. Returns what was actually credited.
+    fn bank(&mut self, minutes: f64) -> f64 {
+        let mut add = minutes.max(0.0);
+        if self.daily_cap_min > 0.0 {
+            add = add.min((self.daily_cap_min - self.ledger.earned_today_min).max(0.0));
+        }
+        if add > 0.0 {
+            self.ledger.earned_today_min += add;
+            self.ledger.balance_min += add;
+            if self.max_bank_min > 0.0 {
+                self.ledger.balance_min = self.ledger.balance_min.min(self.max_bank_min);
+            }
+        }
+        add
+    }
+
+    /// (Re)load the chore definitions when the bank changed on disk.
+    fn reload_chores(&mut self) {
+        let mtime = std::fs::metadata(&self.tasks_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime.is_none() {
+            self.chore_defs.clear();
+            self.chore_defs_mtime = None;
+            return;
+        }
+        if mtime == self.chore_defs_mtime {
+            return;
+        }
+        self.chore_defs_mtime = mtime;
+        self.chore_defs = std::fs::read_to_string(&self.tasks_path)
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
+            .and_then(|s| serde_json::from_str::<BankChores>(&s).ok())
+            .map(|b| b.chores)
+            .unwrap_or_default();
+        tracing::info!("chores: loaded {} definition(s) from the bank", self.chore_defs.len());
+    }
+
+    fn chore(&self, id: &str) -> Option<&ChoreDef> {
+        self.chore_defs.iter().find(|d| d.id == id)
+    }
+
+    fn is_verified(&self, id: &str, period: &str) -> bool {
+        self.ledger
+            .chores
+            .verified
+            .iter()
+            .any(|v| v.id == id && v.period == period)
+    }
+
+    /// Drop claims past the TTL or from another period.
+    fn expire_claims(&mut self, now: &LocalNow) {
+        let ttl = (self.chores.claim_ttl_min * 60.0) as u64;
+        let t = unix_now();
+        let defs = self.chore_defs.clone();
+        self.ledger.chores.claims.retain(|c| {
+            let Some(d) = defs.iter().find(|d| d.id == c.id) else { return false };
+            d.period(now) == c.period && (ttl == 0 || t.saturating_sub(c.claimed_at) < ttl)
+        });
+    }
+
+    /// Chores whose absence holds the gate right now: enabled, required,
+    /// due today, not verified for the current period, and past the hold
+    /// hour. Empty when the module is off or nothing is outstanding.
+    fn required_outstanding(&self, now: &LocalNow) -> Vec<String> {
+        if !self.chores.enabled || now.hhmm < self.chores.required_hold_from {
+            return Vec::new();
+        }
+        self.chore_defs
+            .iter()
+            .filter(|d| d.required() && d.due_on(&now.day))
+            .filter(|d| !self.is_verified(&d.id, &d.period(now)))
+            .map(|d| d.id.clone())
+            .collect()
+    }
+
+    /// Claims awaiting a parent (current period, unexpired).
+    fn pending(&self, now: &LocalNow) -> Vec<String> {
+        let ttl = (self.chores.claim_ttl_min * 60.0) as u64;
+        let t = unix_now();
+        self.ledger
+            .chores
+            .claims
+            .iter()
+            .filter(|c| self.chore(&c.id).is_some_and(|d| d.period(now) == c.period))
+            .filter(|c| ttl == 0 || t.saturating_sub(c.claimed_at) < ttl)
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    /// Seconds of PIN lockout remaining, 0 when open.
+    fn pin_locked_secs(&self) -> u64 {
+        self.ledger
+            .chores
+            .pin_locked_until
+            .map(|u| u.saturating_sub(unix_now()))
+            .unwrap_or(0)
+    }
+
+    /// The child marks a chore done. Idempotent per period. Errors are wire
+    /// strings for the agent's dialog.
+    fn chore_claim(&mut self, id: &str) -> Result<(), &'static str> {
+        self.reload_chores();
+        let now = self.local_now();
+        self.rollover(&now);
+        self.expire_claims(&now);
+        if !self.chores.enabled {
+            return Err("chores are not enabled");
+        }
+        let Some(def) = self.chore(id).cloned() else { return Err("unknown chore") };
+        let period = def.period(&now);
+        if self.is_verified(id, &period) {
+            return Err("already verified");
+        }
+        if !self.ledger.chores.claims.iter().any(|c| c.id == id && c.period == period) {
+            self.ledger.chores.claims.push(ChoreClaim {
+                id: id.to_string(),
+                period,
+                claimed_at: unix_now(),
+            });
+            self.persist();
+        }
+        Ok(())
+    }
+
+    /// The child (or a parent pressing Cancel) withdraws a claim.
+    fn chore_reject(&mut self, id: &str) {
+        let before = self.ledger.chores.claims.len();
+        self.ledger.chores.claims.retain(|c| c.id != id);
+        if self.ledger.chores.claims.len() != before {
+            self.persist();
+        }
+    }
+
+    /// A parent verifies a chore with the PIN. A claim is not required (the
+    /// PIN is the parent's word), but a chore already verified this period
+    /// is refused so it can't be credited twice. Wrong PINs count toward a
+    /// lockout that survives agent restarts (it lives in the ledger).
+    fn chore_verify(&mut self, id: &str, pin: &str) -> ChoreVerify {
+        self.reload_chores();
+        let now = self.local_now();
+        self.rollover(&now);
+        self.expire_claims(&now);
+        if !self.chores.enabled {
+            return ChoreVerify::Refused("chores are not enabled");
+        }
+        let Some(def) = self.chore(id).cloned() else {
+            return ChoreVerify::Refused("unknown chore");
+        };
+        let period = def.period(&now);
+        if self.is_verified(id, &period) {
+            return ChoreVerify::Refused("already verified");
+        }
+        let Ok(stored) = std::fs::read_to_string(&self.pin_path) else {
+            return ChoreVerify::Refused("no PIN delivered with the task bank");
+        };
+        let locked = self.pin_locked_secs();
+        if locked > 0 {
+            return ChoreVerify::Locked { secs: locked };
+        }
+        if !pin_matches(&stored, pin) {
+            let c = &mut self.ledger.chores;
+            c.pin_failures += 1;
+            let out = if c.pin_failures >= self.chores.verify_max_attempts {
+                c.pin_failures = 0;
+                c.pin_locked_until = Some(unix_now() + self.chores.verify_lockout_sec);
+                ChoreVerify::Locked { secs: self.chores.verify_lockout_sec }
+            } else {
+                ChoreVerify::WrongPin {
+                    attempts_left: self.chores.verify_max_attempts - c.pin_failures,
+                }
+            };
+            self.persist();
+            return out;
+        }
+        self.ledger.chores.pin_failures = 0;
+        self.ledger.chores.pin_locked_until = None;
+        self.ledger.chores.claims.retain(|c| c.id != id);
+        let mut minutes = 0.0;
+        if !def.required() && def.minutes > 0 {
+            let mut want = def.minutes as f64;
+            if self.chores.bonus_daily_cap_min > 0.0 {
+                want = want
+                    .min((self.chores.bonus_daily_cap_min - self.ledger.chores.bonus_today_min).max(0.0));
+            }
+            minutes = self.bank(want);
+            self.ledger.chores.bonus_today_min += minutes;
+        }
+        self.ledger.chores.verified.push(ChoreDone {
+            id: id.to_string(),
+            period,
+            at: unix_now(),
+            minutes,
+        });
+        self.persist();
+        tracing::info!("chores: \"{id}\" verified (+{minutes:.0} min)");
+        ChoreVerify::Ok { minutes }
+    }
+
+    /// The chore snapshot for the `status` / `chores` replies.
+    fn chores_status(&mut self) -> serde_json::Value {
+        self.reload_chores();
+        let now = self.local_now();
+        let today_verified: Vec<&str> = self
+            .ledger
+            .chores
+            .verified
+            .iter()
+            .filter(|v| self.chore(&v.id).is_some_and(|d| d.period(&now) == v.period))
+            .map(|v| v.id.as_str())
+            .collect();
+        let defs: Vec<serde_json::Value> = self
+            .chore_defs
+            .iter()
+            .map(|d| {
+                let kind = if d.required() { "required" } else { "bonus" };
+                let repeat = if d.repeat.is_empty() { "daily" } else { d.repeat.as_str() };
+                serde_json::json!({
+                    "id": d.id, "name": d.name, "kind": kind, "repeat": repeat,
+                    "minutes": d.minutes, "due": d.due_on(&now.day),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "enabled": self.chores.enabled && self.tasks_path.exists(),
+            "pinSet": self.pin_path.exists(),
+            "outstanding": self.required_outstanding(&now),
+            "pending": self.pending(&now),
+            "verified": today_verified,
+            "pinLockedSecs": self.pin_locked_secs(),
+            "chores": defs,
+        })
     }
 
     fn persist(&self) {
@@ -237,12 +752,12 @@ impl EarnedGate {
         max_bank_min: f64,
         allow_hosts: Vec<String>,
         filter: FilterPolicy,
+        chores: ChorePolicy,
     ) {
-        let today = Self::today();
-        if !today.is_empty() && self.ledger.date != today {
-            self.ledger.date = today;
-            self.ledger.earned_today_min = 0.0;
-        }
+        self.reload_chores();
+        let now = self.local_now();
+        self.rollover(&now);
+        self.chores = chores;
         self.gate_active = gate_active;
         self.spend_ratio = spend_ratio.max(0.0);
         self.daily_cap_min = daily_cap_min.max(0.0);
@@ -251,25 +766,18 @@ impl EarnedGate {
         self.filter = filter;
         self.last_report = Some(Instant::now());
 
-        let mut add = secs as f64 / 60.0;
-        if self.daily_cap_min > 0.0 {
-            add = add.min((self.daily_cap_min - self.ledger.earned_today_min).max(0.0));
-        }
-        if add > 0.0 {
-            self.ledger.earned_today_min += add;
-            self.ledger.balance_min += add;
-            if self.max_bank_min > 0.0 {
-                self.ledger.balance_min = self.ledger.balance_min.min(self.max_bank_min);
-            }
+        if self.bank(secs as f64 / 60.0) > 0.0 {
             self.persist();
         }
     }
 
     /// Watch-loop tick. `full_blocked` means a full quarantine reason
     /// (tamper/exposure/challenge) is already active and supersedes this.
-    /// Returns the earning-mode allowlist when the internet should be gated
-    /// to only the earn sources (gate active + balance depleted), else None.
-    fn tick(&mut self, full_blocked: bool) -> Option<Vec<String>> {
+    /// Returns the earning-mode allowlist and why, when the internet should
+    /// be gated to only the earn sources: gate active and either an
+    /// outstanding required chore (`QReason::Chores`) or a depleted balance
+    /// (`QReason::EarnedGate`). None when open.
+    fn tick(&mut self, full_blocked: bool) -> Option<(Vec<String>, QReason)> {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
@@ -289,6 +797,15 @@ impl EarnedGate {
         if !self.gate_active || !fresh || full_blocked {
             return None;
         }
+        // An unverified required chore holds the gate regardless of balance
+        // (and no balance is spent while it does — the child is only on the
+        // earn sites). Nothing is due before the hold hour.
+        self.reload_chores();
+        let now = self.local_now();
+        self.rollover(&now);
+        if !self.required_outstanding(&now).is_empty() {
+            return Some((self.allow_hosts.clone(), QReason::Chores));
+        }
         if self.ledger.balance_min > 0.0 {
             // Spending: time online inside a gate window burns balance.
             let spent = elapsed.as_secs_f64() / 60.0 * self.spend_ratio;
@@ -298,7 +815,7 @@ impl EarnedGate {
             }
             None
         } else {
-            Some(self.allow_hosts.clone()) // depleted → earning-mode lockout
+            Some((self.allow_hosts.clone(), QReason::EarnedGate)) // depleted → earning-mode lockout
         }
     }
 
@@ -402,6 +919,8 @@ enum QReason {
     Focus,
     Challenge,
     EarnedGate,
+    /// A required chore is unverified on its due day (docs/chores.md).
+    Chores,
     ClockTamper,
     CaptureUnhealthy,
     HeartbeatStale,
@@ -416,6 +935,7 @@ impl QReason {
             QReason::Focus => "focus",
             QReason::Challenge => "challenge",
             QReason::EarnedGate => "earned-gate",
+            QReason::Chores => "chores",
             QReason::ClockTamper => "clock-tamper",
             QReason::CaptureUnhealthy => "capture-unhealthy",
             QReason::HeartbeatStale => "heartbeat-stale",
@@ -915,14 +1435,15 @@ fn main() -> Result<()> {
             let mut e = earned.lock().unwrap();
             (e.tick(want_full), e.filter_policy())
         };
-        let desired = compose(want_full, earning.clone(), filter);
+        let desired = compose(want_full, earning.as_ref().map(|(h, _)| h.clone()), filter);
         // Publish the effective reason for the status handler: a full block's
-        // reason, else the earned-time gate when it engages earning-mode, else
-        // none. This is the single source of truth the HUD reads.
+        // reason, else why earning-mode engaged (depleted balance or an
+        // outstanding required chore), else none. This is the single source
+        // of truth the HUD reads.
         *quarantine_reason.lock().unwrap() = if want_full {
             full_reason
-        } else if earning.is_some() {
-            QReason::EarnedGate
+        } else if let Some((_, why)) = earning {
+            why
         } else {
             QReason::None
         };
@@ -1076,9 +1597,54 @@ fn handle_client(
                     allow: list("filterAllowHosts"),
                     block: list("filterBlockHosts"),
                 };
+                let chores = ChorePolicy::from_msg(msg.get("chores"));
                 earned.lock().unwrap().apply_report(
                     secs, gate_active, spend_ratio, daily_cap, max_bank, allow_hosts, filter,
+                    chores,
                 );
+            }
+            // Chore ops (docs/chores.md): one request per connection, JSON
+            // reply. The PIN is checked HERE, never by the agent.
+            Some("chore-claim") | Some("chore-reject") | Some("chore-verify") | Some("chores") => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let reply = {
+                    let mut e = earned.lock().unwrap();
+                    match msg.get("type").and_then(|t| t.as_str()) {
+                        Some("chore-claim") => match e.chore_claim(id) {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(err) => serde_json::json!({"ok": false, "error": err}),
+                        },
+                        Some("chore-reject") => {
+                            e.chore_reject(id);
+                            serde_json::json!({"ok": true})
+                        }
+                        Some("chore-verify") => {
+                            let pin = msg.get("pin").and_then(|v| v.as_str()).unwrap_or("");
+                            match e.chore_verify(id, pin) {
+                                ChoreVerify::Ok { minutes } => {
+                                    serde_json::json!({"ok": true, "result": "verified", "minutes": minutes})
+                                }
+                                ChoreVerify::WrongPin { attempts_left } => serde_json::json!({
+                                    "ok": false, "result": "wrong-pin", "attemptsLeft": attempts_left
+                                }),
+                                ChoreVerify::Locked { secs } => {
+                                    serde_json::json!({"ok": false, "result": "locked", "secs": secs})
+                                }
+                                ChoreVerify::Refused(err) => {
+                                    serde_json::json!({"ok": false, "result": "refused", "error": err})
+                                }
+                            }
+                        }
+                        _ => {
+                            let mut v = e.chores_status();
+                            v["ok"] = serde_json::Value::Bool(true);
+                            v
+                        }
+                    }
+                };
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                return;
             }
             Some("envelope") => {
                 let reply = match apply_envelope(&line, managed_dir, verifier) {
@@ -1136,9 +1702,14 @@ fn handle_client(
                     .exposure_penalty_until
                     .map(|u| u.saturating_duration_since(Instant::now()).as_secs() as i64)
                     .unwrap_or(0);
-                let (earned_balance_min, earned_gate_active, earned_today_min) = {
-                    let e = earned.lock().unwrap();
-                    (e.ledger.balance_min, e.gate_active, e.ledger.earned_today_min)
+                let (earned_balance_min, earned_gate_active, earned_today_min, chores) = {
+                    let mut e = earned.lock().unwrap();
+                    let mut c = e.chores_status();
+                    // The status line carries the summary; `chores` has the definitions.
+                    if let Some(o) = c.as_object_mut() {
+                        o.remove("chores");
+                    }
+                    (e.ledger.balance_min, e.gate_active, e.ledger.earned_today_min, c)
                 };
                 let assigned_tz = std::fs::read_to_string(managed_dir.join("assigned-timezone"))
                     .map(|s| s.trim().to_string())
@@ -1159,7 +1730,7 @@ fn handle_client(
                     (f.0.clone(), denied, forwarded)
                 };
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}},\"siteFilter\":{{\"mode\":{},\"deniedRecent\":{},\"forwardedRecent\":{}}}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}},\"siteFilter\":{{\"mode\":{},\"deniedRecent\":{},\"forwardedRecent\":{}}},\"chores\":{}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
@@ -1179,6 +1750,7 @@ fn handle_client(
                     serde_json::json!(filter_mode),
                     serde_json::json!(denied),
                     serde_json::json!(forwarded),
+                    chores,
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());
@@ -1257,11 +1829,10 @@ fn apply_tasks_envelope(
     let verified = verifier.verify(&env, read_epoch(&epoch_path), envelope::TASKS_APP)?;
     check_generation(&authored_path, &verified.authored_at)?;
 
-    // Persist artifact then bump the epoch + generation high-waters last, so a
+    // Persist artifact (PIN hash split into the root-only chore-pin file,
+    // docs/chores.md) then bump the epoch + generation high-waters last, so a
     // crash never leaves them ahead of the bank (mirrors apply_envelope).
-    let tmp = managed_dir.join("tasks.json.tmp");
-    std::fs::write(&tmp, &verified.artifact)?;
-    std::fs::rename(&tmp, managed_dir.join("tasks.json"))?;
+    install_bank(managed_dir, &verified.artifact)?;
     std::fs::write(&epoch_path, format!("{}\n", verified.epoch))?;
     if let Some(authored) = &verified.authored_at {
         std::fs::write(&authored_path, format!("{authored}\n"))?;
@@ -1633,6 +2204,16 @@ mod earned_tests {
             filter: FilterPolicy::default(),
             last_report: Some(Instant::now()),
             last_tick: Instant::now(),
+            chores: ChorePolicy::default(),
+            chore_defs: Vec::new(),
+            chore_defs_mtime: None,
+            pin_path: PathBuf::from(format!("{path}.pin")),
+            now_override: Some(LocalNow {
+                date: "2026-09-07".into(),
+                week: "2026-W37".into(),
+                day: "mon".into(),
+                hhmm: 1000,
+            }),
         }
     }
 
@@ -1640,9 +2221,9 @@ mod earned_tests {
     fn banks_and_caps_daily() {
         let mut g = gate("/tmp/bm-earn-t1.json");
         // 600s = 10 earned min, but the daily cap is 5.
-        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![], FilterPolicy::default());
+        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![], FilterPolicy::default(), ChorePolicy::default());
         assert!((g.ledger.balance_min - 5.0).abs() < 1e-6);
-        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![], FilterPolicy::default()); // cap already hit
+        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![], FilterPolicy::default(), ChorePolicy::default()); // cap already hit
         assert!((g.ledger.balance_min - 5.0).abs() < 1e-6);
         let _ = std::fs::remove_file("/tmp/bm-earn-t1.json");
     }
@@ -1650,7 +2231,7 @@ mod earned_tests {
     #[test]
     fn bank_ceiling() {
         let mut g = gate("/tmp/bm-earn-t2.json");
-        g.apply_report(6000, true, 1.0, 0.0, 30.0, vec![], FilterPolicy::default()); // 100 min, ceiling 30
+        g.apply_report(6000, true, 1.0, 0.0, 30.0, vec![], FilterPolicy::default(), ChorePolicy::default()); // 100 min, ceiling 30
         assert!((g.ledger.balance_min - 30.0).abs() < 1e-6);
         let _ = std::fs::remove_file("/tmp/bm-earn-t2.json");
     }
@@ -1666,7 +2247,10 @@ mod earned_tests {
         // Depleted → earning-mode allowlist.
         g.ledger.balance_min = 0.0;
         g.last_tick = Instant::now();
-        assert_eq!(g.tick(false), Some(vec!["khanacademy.org".to_string()]));
+        assert_eq!(
+            g.tick(false),
+            Some((vec!["khanacademy.org".to_string()], QReason::EarnedGate))
+        );
         // A full-block reason supersedes the earned gate.
         assert!(g.tick(true).is_none());
         let _ = std::fs::remove_file("/tmp/bm-earn-t3.json");
@@ -1694,7 +2278,7 @@ mod earned_tests {
             allow: vec!["kastatic.org".into()],
             block: vec!["tiktok.com".into()],
         };
-        g.apply_report(0, false, 1.0, 0.0, 0.0, vec![], fp.clone());
+        g.apply_report(0, false, 1.0, 0.0, 0.0, vec![], fp.clone(), ChorePolicy::default());
         assert_eq!(g.filter_policy(), Some(fp.clone()));
         g.last_report = Some(Instant::now() - Duration::from_secs(120)); // stale
         assert!(g.filter_policy().is_none());
@@ -1748,6 +2332,183 @@ mod earned_tests {
         );
         assert_eq!(compose(false, None, Some(audit)), Desired { pf: PfMode::Open, dns: Mode::Audit });
         assert_eq!(compose(false, None, None), Desired::OPEN);
+    }
+
+    // ---- chores (docs/chores.md)
+
+    const PIN_LINE: &str = "sha256$00ff$"; // completed in pin_hash()
+
+    fn pin_hash(pin: &str) -> String {
+        let mut h = sha2::Sha256::new();
+        h.update(b"00ff");
+        h.update([0u8]);
+        h.update(pin.as_bytes());
+        format!("{PIN_LINE}{:x}\n", h.finalize())
+    }
+
+    fn chore_gate(path: &str) -> EarnedGate {
+        let mut g = gate(path);
+        std::fs::write(
+            &g.tasks_path,
+            r#"{"version":2,"tasks":[],"chores":[
+              {"id":"bed","name":"Bed","kind":"required","repeat":"daily"},
+              {"id":"dishes","name":"Dishes","kind":"required","repeat":"daily","days":["tue"]},
+              {"id":"piano","name":"Piano","kind":"bonus","repeat":"daily","minutes":20},
+              {"id":"trash","name":"Trash","kind":"bonus","repeat":"weekly","minutes":30},
+              {"id":"garage","name":"Garage","kind":"bonus","repeat":"once","minutes":60}]}"#,
+        )
+        .unwrap();
+        std::fs::write(&g.pin_path, pin_hash("4821")).unwrap();
+        g.chores = ChorePolicy {
+            enabled: true,
+            bonus_daily_cap_min: 45.0,
+            claim_ttl_min: 60.0,
+            required_hold_from: 900,
+            verify_max_attempts: 3,
+            verify_lockout_sec: 600,
+        };
+        g.ledger.date = "2026-09-07".into();
+        g
+    }
+
+    fn cleanup(g: &EarnedGate) {
+        let _ = std::fs::remove_file(&g.ledger_path);
+        let _ = std::fs::remove_file(&g.tasks_path);
+        let _ = std::fs::remove_file(&g.pin_path);
+    }
+
+    #[test]
+    fn required_chore_holds_gate_until_verified() {
+        let mut g = chore_gate("/tmp/bm-chore-t1.json");
+        g.ledger.balance_min = 30.0; // balance doesn't matter
+        // Monday 10:00: "bed" is due (every day), "dishes" only on Tuesday.
+        assert_eq!(g.tick(false), Some((vec!["khanacademy.org".into()], QReason::Chores)));
+        assert_eq!(g.required_outstanding(&g.local_now()), vec!["bed".to_string()]);
+        assert!((g.ledger.balance_min - 30.0).abs() < 1e-9, "no spend while held");
+        // Before the hold hour nothing is due yet.
+        g.now_override.as_mut().unwrap().hhmm = 830;
+        assert!(g.tick(false).is_none() || g.ledger.balance_min < 30.0);
+        g.now_override.as_mut().unwrap().hhmm = 1000;
+        // Verify with the PIN → released, nothing credited (required).
+        assert_eq!(g.chore_verify("bed", "4821"), ChoreVerify::Ok { minutes: 0.0 });
+        assert!(g.required_outstanding(&g.local_now()).is_empty());
+        g.last_tick = Instant::now();
+        assert!(g.tick(false).is_none());
+        // Same period again is refused (no double verification).
+        assert_eq!(g.chore_verify("bed", "4821"), ChoreVerify::Refused("already verified"));
+        // Next day it is due again.
+        g.now_override.as_mut().unwrap().date = "2026-09-08".into();
+        g.now_override.as_mut().unwrap().day = "tue".into();
+        let now = g.local_now();
+        g.rollover(&now);
+        let mut out = g.required_outstanding(&now);
+        out.sort();
+        assert_eq!(out, vec!["bed".to_string(), "dishes".to_string()]);
+        cleanup(&g);
+    }
+
+    #[test]
+    fn bonus_chore_credits_under_caps() {
+        let mut g = chore_gate("/tmp/bm-chore-t2.json");
+        g.daily_cap_min = 100.0;
+        g.max_bank_min = 0.0;
+        assert_eq!(g.chore_claim("piano"), Ok(()));
+        assert_eq!(g.pending(&g.local_now()), vec!["piano".to_string()]);
+        assert_eq!(g.chore_verify("piano", "4821"), ChoreVerify::Ok { minutes: 20.0 });
+        assert!(g.pending(&g.local_now()).is_empty(), "claim consumed");
+        assert!((g.ledger.balance_min - 20.0).abs() < 1e-9);
+        assert!((g.ledger.earned_today_min - 20.0).abs() < 1e-9, "counts toward the earn cap");
+        // Weekly trash: 30 wanted, chore cap 45 leaves 25.
+        assert_eq!(g.chore_verify("trash", "4821"), ChoreVerify::Ok { minutes: 25.0 });
+        assert!((g.ledger.balance_min - 45.0).abs() < 1e-9);
+        // Chore cap exhausted: verified, but nothing credited.
+        assert_eq!(g.chore_verify("garage", "4821"), ChoreVerify::Ok { minutes: 0.0 });
+        // Next day: piano is due again, trash (weekly) and garage (once) are not.
+        g.now_override.as_mut().unwrap().date = "2026-09-08".into();
+        g.now_override.as_mut().unwrap().day = "tue".into();
+        assert_eq!(g.chore_verify("piano", "4821"), ChoreVerify::Ok { minutes: 20.0 });
+        assert_eq!(g.chore_verify("trash", "4821"), ChoreVerify::Refused("already verified"));
+        assert_eq!(g.chore_verify("garage", "4821"), ChoreVerify::Refused("already verified"));
+        // Ledger round-trips with the chore section.
+        let back: EarnedLedger =
+            serde_json::from_str(&std::fs::read_to_string(&g.ledger_path).unwrap()).unwrap();
+        assert!(back.chores.verified.iter().any(|v| v.id == "garage" && v.period == "once"));
+        cleanup(&g);
+    }
+
+    #[test]
+    fn wrong_pins_lock_out() {
+        let mut g = chore_gate("/tmp/bm-chore-t3.json");
+        assert_eq!(g.chore_verify("bed", "0000"), ChoreVerify::WrongPin { attempts_left: 2 });
+        assert_eq!(g.chore_verify("bed", "1111"), ChoreVerify::WrongPin { attempts_left: 1 });
+        assert_eq!(g.chore_verify("bed", "2222"), ChoreVerify::Locked { secs: 600 });
+        // Even the right PIN is refused while locked, and the lock persists.
+        assert!(matches!(g.chore_verify("bed", "4821"), ChoreVerify::Locked { .. }));
+        let back: EarnedLedger =
+            serde_json::from_str(&std::fs::read_to_string(&g.ledger_path).unwrap()).unwrap();
+        assert!(back.chores.pin_locked_until.is_some());
+        // Lock expired → verification works and clears the counter.
+        g.ledger.chores.pin_locked_until = Some(unix_now() - 1);
+        assert_eq!(g.chore_verify("bed", " 4821 "), ChoreVerify::Ok { minutes: 0.0 });
+        assert_eq!(g.ledger.chores.pin_failures, 0);
+        cleanup(&g);
+    }
+
+    #[test]
+    fn claims_expire_and_module_off_refuses() {
+        let mut g = chore_gate("/tmp/bm-chore-t4.json");
+        assert_eq!(g.chore_claim("piano"), Ok(()));
+        assert_eq!(g.chore_claim("piano"), Ok(()), "idempotent");
+        assert_eq!(g.ledger.chores.claims.len(), 1);
+        assert_eq!(g.chore_claim("nope"), Err("unknown chore"));
+        g.ledger.chores.claims[0].claimed_at = unix_now() - 61 * 60; // past the 60-min TTL
+        assert!(g.pending(&g.local_now()).is_empty());
+        g.chore_reject("piano");
+        assert!(g.ledger.chores.claims.is_empty());
+        // No PIN file → refused, not a crash; module off → refused.
+        std::fs::remove_file(&g.pin_path).unwrap();
+        assert!(matches!(g.chore_verify("bed", "4821"), ChoreVerify::Refused(_)));
+        g.chores.enabled = false;
+        assert!(g.required_outstanding(&g.local_now()).is_empty());
+        assert_eq!(g.chore_claim("piano"), Err("chores are not enabled"));
+        // With the module off the unverified "bed" no longer holds the gate
+        // (a positive balance keeps it open as usual).
+        g.ledger.balance_min = 10.0;
+        g.last_tick = Instant::now();
+        assert!(g.tick(false).is_none());
+        cleanup(&g);
+    }
+
+    #[test]
+    fn install_bank_splits_pin() {
+        let dir = PathBuf::from("/tmp/bm-chore-bank");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        install_bank(&dir, br#"{"version":2,"tasks":[],"chores":[],"chorePinHash":"sha256$ab$cd"}"#)
+            .unwrap();
+        let tasks = std::fs::read_to_string(dir.join("tasks.json")).unwrap();
+        assert!(!tasks.contains("chorePinHash"), "hash must not be in the readable bank");
+        assert!(tasks.contains("\"version\": 2"));
+        assert_eq!(std::fs::read_to_string(dir.join("chore-pin")).unwrap(), "sha256$ab$cd\n");
+        let mode = std::fs::metadata(dir.join("chore-pin")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // A bank without a PIN removes the stale one; non-JSON is written as-is.
+        install_bank(&dir, br#"{"version":3,"tasks":[]}"#).unwrap();
+        assert!(!dir.join("chore-pin").exists());
+        install_bank(&dir, b"not json").unwrap();
+        assert_eq!(std::fs::read(dir.join("tasks.json")).unwrap(), b"not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pin_hash_format() {
+        assert!(pin_matches(&pin_hash("4821"), "4821"));
+        assert!(pin_matches(&pin_hash("4821"), " 4821\n"));
+        assert!(!pin_matches(&pin_hash("4821"), "4822"));
+        assert!(!pin_matches("md5$x$y", "4821"));
+        assert!(!pin_matches("garbage", "4821"));
+        assert_eq!(parse_hhmm("09:30"), Some(930));
+        assert_eq!(parse_hhmm("9"), None);
     }
 
     #[test]

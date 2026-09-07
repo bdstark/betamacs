@@ -93,14 +93,14 @@ mint more than the earned-time policy allows in total.
 ## The flow
 
 1. **Claim.** The child picks a chore from the menu bar ("Chores…"). The
-   agent sends `{"chore-claim": {"id": "bed"}}` over the daemon socket. The
+   agent sends `{"type": "chore-claim", "id": "bed"}` over the daemon socket. The
    daemon records `{id, period, claimedAt}` in the ledger — once per chore
    per period; a second claim in the same period is a no-op. A claim
    older than `claimTtlMin` is dropped so a stale "done" cannot be verified
    a day later.
 2. **Verify.** A dialog says "Waiting for a parent — enter the chore PIN".
-   The parent types it; the agent relays `{"chore-verify": {"id": "bed",
-   "pin": "…"}}`. The **daemon** checks the PIN against the root-only hash,
+   The parent types it; the agent relays `{"type": "chore-verify", "id":
+   "bed", "pin": "…"}`. The **daemon** checks the PIN against the root-only hash,
    applying the attempt counter and lockout, and on success moves the claim
    to `verified` and (for `bonus`) credits `minutes` into the balance
    through the same capping path as observed earn credit.
@@ -162,29 +162,60 @@ The schema is already shaped for it — a grant is just
 `{choreId, period, minutes, issuedAt}` applied to the same ledger entry the
 PIN path writes.
 
+## Wire protocol (daemon socket)
+
+All chore state is daemon-owned; the agent only relays. One request per
+connection, one JSON line back.
+
+| request | reply |
+|---|---|
+| `{"type":"chores"}` | `{ok, enabled, pinSet, outstanding:[id], pending:[id], verified:[id], pinLockedSecs, chores:[{id,name,kind,repeat,minutes,due}]}` |
+| `{"type":"chore-claim","id"}` | `{ok:true}` or `{ok:false, error}` (`unknown chore`, `already verified`, `chores are not enabled`) |
+| `{"type":"chore-reject","id"}` | `{ok:true}` — withdraws a claim |
+| `{"type":"chore-verify","id","pin"}` | `{ok:true, result:"verified", minutes}` / `{ok:false, result:"wrong-pin", attemptsLeft}` / `{ok:false, result:"locked", secs}` / `{ok:false, result:"refused", error}` |
+
+The agent's `earn` report gained a `chores` object carrying the resolved
+policy module (`enabled`, `bonusDailyCapMin`, `claimTtlMin`,
+`requiredHoldFrom`, `verifyMaxAttempts`, `verifyLockoutSec`); the `status`
+reply gained `chores: {enabled, pinSet, outstanding, pending, verified,
+pinLockedSecs}`, and `quarantine.reason` can now be `chores`
+(docs/lockdown-reasons.md).
+
+The ledger (`earned-ledger.json`) gained a `chores` section: `claims`
+(`id`, `period`, `claimed_at`), `verified` (`id`, `period`, `at`,
+`minutes`), `bonus_today_min`, `pin_failures`, `pin_locked_until`. Periods
+are the local date for daily chores, the ISO week for weekly, and the
+literal `once`; past-period entries are pruned at date rollover (`once`
+entries are kept forever).
+
 ## Status (2026-09-06)
 
-**Scaffolded, not running:**
+**Built and unit-tested:**
 
-- Rust schema (`settings.rs`): `Chore`, `ChoreKind`, `ChoreRepeat`;
-  `TaskBank.chores` / `chore_pin` / `chore_pin_hash`; `ChoreSettings` /
-  `ChorePatch` wired into `ModulePatches`, `Effective`, `resolve()`.
-  Disabled by default. Unit-tested (defaults, layering, bank round-trip).
-- TypeScript mirror (`webapp/src/schema.ts`) incl. `defaultChores()` and
-  `resolve`.
-- `publish.sh tasks`: hashes and strips `chorePin`; validates `chores`.
-- `config/example-tasks.json` and `config/example-config.json` carry
-  examples.
+- Schema on both sides (`settings.rs`, `webapp/src/schema.ts`),
+  `publish.sh tasks` hashing/validation, examples.
+- **Daemon (`betamacsd`)**: `install_bank` splits `chorePinHash` into the
+  root-only `chore-pin` (0600) on every bank delivery and strips it from
+  `tasks.json` (a bank without a PIN removes a stale one); ledger `chores`
+  section; `chores` / `chore-claim` / `chore-reject` / `chore-verify` socket
+  ops with the PIN check, attempt counter and lockout in the daemon; bonus
+  credit through the same cap path as observed earn credit plus the chore
+  cap; required-chore hold in the earned-time gate (earning mode, no
+  balance spent while held, nothing due before `requiredHoldFrom`);
+  `QReason::Chores` and the `status` summary. Eight daemon tests plus a
+  socket smoke run in prefix mode.
+- Agent relay: `earned.rs` sends the `chores` policy in the earn report;
+  the HUD maps the `chores` lockdown reason to plain language.
 
 **Not built yet (in order):**
 
-1. Daemon: PIN split in `apply_tasks_envelope` (root-only `chore-pin`),
-   ledger `chores` section (claims / verified / attempt counter / lockout),
-   `chore-claim` + `chore-verify` socket ops, required-chore hold in the
-   earned-time gate, `status` fields (`choresOutstanding`, `choresPending`).
-2. Agent: "Chores…" menu item, claim + PIN dialogs (`prompt.rs`), HUD
-   lines, lockdown reason text.
-3. Config app: `chores` editor tab; chore list in the tasks editor.
+1. Agent UI: "Chores…" menu item listing the bank's chores (from the
+   `chores` reply), claim + PIN dialogs (`prompt.rs`) that call
+   `chore-claim` / `chore-verify` / `chore-reject`, HUD lines for
+   outstanding/pending chores.
+2. Config app: `chores` editor tab; chore list + PIN in the tasks editor.
+3. Ship: betamacs release, then a bank with chores + a PIN, then a config
+   enabling `chores`.
 4. Phase 2 remote approval.
 
 ## Open questions

@@ -44,6 +44,7 @@ fn lockdown_phrase(reason: &str) -> &'static str {
         "focus" => "too much scrolling",
         "challenge" => "unanswered challenge",
         "earned-gate" => "earn time to unlock (allowlist only)",
+        "chores" => "finish today's required chores (allowlist only)",
         "clock-tamper" => "clock tampered",
         "capture-unhealthy" => "screen recording off",
         "heartbeat-stale" | "session/health" => "censor not reporting",

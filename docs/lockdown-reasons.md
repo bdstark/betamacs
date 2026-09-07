@@ -35,6 +35,7 @@ watchdog tick, but timed countdowns do not.
 | `focus`             | too much scrolling                      | yes (`secsLeft`) | timed penalty |
 | `challenge`         | unanswered challenge                    | no | health block (clears when answered) |
 | `earned-gate`       | earn time to unlock (allowlist only)    | no | gate (spend/earn balance) |
+| `chores`            | finish today's required chores (allowlist only) | no | gate (parent verifies with the PIN) |
 | `clock-tamper`      | clock tampered                          | no | tamper block (clears when clock ok) |
 | `capture-unhealthy` | screen recording off                    | no | health block (clears when capture ok) |
 | `heartbeat-stale`   | censor not reporting                    | no | health block (clears when heartbeats resume) |
@@ -50,6 +51,10 @@ Notes:
   depleted balance. Only the earn-source allowlist (plus `siteFilter.allowHosts`
   when the site filter is on, docs/site-filter.md) is reachable; the block lifts
   when the child earns/has balance again.
+- `chores` is the same earning-mode gate held for a different reason: a
+  `required` chore is due today and a parent has not verified it yet
+  (docs/chores.md). Balance is neither needed nor spent while it holds; it
+  lifts the moment the chore is verified (or the module is turned off).
 - The `status` reply also carries `siteFilter: {mode, deniedRecent,
   forwardedRecent}` — the DNS filter's mode (`off|audit|block|allow`) and the
   last 20 unique names it denied/forwarded. A `block` mode with the quarantine
@@ -85,6 +90,11 @@ printf '{"type":"status"}\n' | nc -U /var/run/betamacsd.sock   # inspect quarant
   the gate active and balance 0, `tick` returns the earn allowlist → reason
   `earned-gate`, `secsLeft` 0. Fastest repro: deliver a task bank, let the gate
   window open, and spend the banked balance to 0.
+
+- **chores** — with a task bank that defines a `required` chore due today and
+  the `chores` module enabled, wait for a gate window past `requiredHoldFrom`
+  without verifying it. `status.chores.outstanding` lists the ids; verify with
+  `{"type":"chore-verify","id":"bed","pin":"…"}` on the socket to clear.
 
 - **capture-unhealthy** — revoke Screen Recording for betamacs in
   System Settings › Privacy & Security › Screen Recording while logged in. The
