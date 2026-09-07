@@ -329,6 +329,9 @@ mod tests {
                     answer_hash: None,
                 },
             ],
+            chores: Vec::new(),
+            chore_pin: None,
+            chore_pin_hash: None,
         };
         let cfg = ChallengeSettings {
             categories: vec!["math-word".into()],

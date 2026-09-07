@@ -174,11 +174,35 @@ export interface Task {
   answerHash?: string[];
 }
 
+export type ChoreKind = "bonus" | "required";
+export type ChoreRepeat = "daily" | "weekly" | "once";
+
+/** A parent-verified external task (docs/chores.md). `required` holds the
+ * earned-time gate on its due day until verified; `bonus` credits `minutes`
+ * when verified. Defined per kid in the task bank. */
+export interface Chore {
+  id: string;
+  name: string;
+  kind?: ChoreKind; // default bonus
+  repeat?: ChoreRepeat; // default daily
+  /** Due days for daily chores (mon..sun); empty = every day. */
+  days?: string[];
+  /** Bonus credit on verification; ignored for required. */
+  minutes?: number;
+  note?: string;
+}
+
 /** The betamacs-tasks artifact: standalone, independently versioned. */
 export interface TaskBank {
   version: number;
   name?: string;
   tasks: Task[];
+  chores?: Chore[];
+  /** AUTHORED plaintext chore PIN; `publish.sh tasks` hashes and removes it. */
+  chorePin?: string;
+  /** `sha256$<salt>$<digest>`; present in the shipped bank only, and moved
+   * by the daemon into a root-only file on delivery. */
+  chorePinHash?: string;
 }
 
 export interface ChallengeSettings {
@@ -274,6 +298,19 @@ export interface SiteFilterSettings {
 }
 export type SiteFilterPatch = Partial<SiteFilterSettings>;
 
+// -------------------------------------------------------------------- chores
+// Policy for parent-verified external tasks (docs/chores.md). The chores
+// themselves live in the per-kid task bank. Disabled by default.
+export interface ChoreSettings {
+  enabled: boolean;
+  bonusDailyCapMin: number; // chore credit per day, on top of earnedTime.dailyEarnCapMin
+  claimTtlMin: number; // unverified claims expire after this
+  requiredHoldFrom: string; // HH:MM local; required chores hold the gate from here
+  verifyMaxAttempts: number; // wrong PINs before a lockout
+  verifyLockoutSec: number;
+}
+export type ChorePatch = Partial<ChoreSettings>;
+
 // Trust the clock behind all time-of-day policy: evaluate schedule windows
 // against an ASSIGNED timezone applied to a trusted epoch (never the OS
 // timezone/clock), and quarantine when the clock is changed under a running
@@ -324,6 +361,7 @@ export interface ModulePatches {
   earnedTime?: EarnedTimePatch;
   focusLimit?: FocusLimitPatch;
   siteFilter?: SiteFilterPatch;
+  chores?: ChorePatch;
   clockIntegrity?: ClockIntegrityPatch;
   coverageEscalation?: CoverageEscalationPatch;
   captureExclusions?: CaptureExclusionPatch;
@@ -351,6 +389,7 @@ export interface Effective {
   earnedTime: EarnedTimeSettings;
   focusLimit: FocusLimitSettings;
   siteFilter: SiteFilterSettings;
+  chores: ChoreSettings;
   clockIntegrity: ClockIntegritySettings;
   coverageEscalation: CoverageEscalationSettings;
   captureExclusions: CaptureExclusionSettings;
@@ -507,6 +546,17 @@ export function defaultSiteFilter(): SiteFilterSettings {
   };
 }
 
+export function defaultChores(): ChoreSettings {
+  return {
+    enabled: false,
+    bonusDailyCapMin: 60,
+    claimTtlMin: 120,
+    requiredHoldFrom: "00:00",
+    verifyMaxAttempts: 5,
+    verifyLockoutSec: 600,
+  };
+}
+
 export function defaultClockIntegrity(): ClockIntegritySettings {
   return {
     enabled: false,
@@ -546,6 +596,7 @@ export function resolve(pkg: Package): Effective {
     earnedTime: defaultEarnedTime(),
     focusLimit: defaultFocusLimit(),
     siteFilter: defaultSiteFilter(),
+    chores: defaultChores(),
     clockIntegrity: defaultClockIntegrity(),
     coverageEscalation: defaultCoverageEscalation(),
     captureExclusions: defaultCaptureExclusions(),
@@ -561,6 +612,7 @@ export function resolve(pkg: Package): Effective {
     if (patches.earnedTime) Object.assign(effective.earnedTime, patches.earnedTime);
     if (patches.focusLimit) Object.assign(effective.focusLimit, patches.focusLimit);
     if (patches.siteFilter) Object.assign(effective.siteFilter, patches.siteFilter);
+    if (patches.chores) Object.assign(effective.chores, patches.chores);
     if (patches.clockIntegrity) Object.assign(effective.clockIntegrity, patches.clockIntegrity);
     if (patches.coverageEscalation)
       Object.assign(effective.coverageEscalation, patches.coverageEscalation);

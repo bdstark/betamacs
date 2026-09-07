@@ -74,6 +74,8 @@ pub struct ModulePatches {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site_filter: Option<SiteFilterPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chores: Option<ChorePatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_integrity: Option<ClockIntegrityPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_escalation: Option<CoverageEscalationPatch>,
@@ -591,6 +593,52 @@ pub struct Task {
     pub answer_hash: Option<Vec<String>>,
 }
 
+/// Whether a chore is a prerequisite (holds the earned-time gate on its due
+/// day until verified) or a bonus (credits `minutes` when verified). See
+/// docs/chores.md for why both exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ChoreKind {
+    #[default]
+    Bonus,
+    Required,
+}
+
+/// How often a chore comes due. `Daily` resets at local date rollover (on
+/// the listed `days`, or every day), `Weekly` once per ISO week (Monday),
+/// `Once` is claimable a single time ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ChoreRepeat {
+    #[default]
+    Daily,
+    Weekly,
+    Once,
+}
+
+/// An external task the child does away from the screen and a parent
+/// verifies (docs/chores.md). Defined per kid in the task bank; policy
+/// (caps, claim expiry, PIN lockout) is the `chores` config module.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct Chore {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub kind: ChoreKind,
+    #[serde(default)]
+    pub repeat: ChoreRepeat,
+    /// Due days for `Daily` (lowercase `mon`..`sun`); empty = every day.
+    #[serde(default)]
+    pub days: Vec<String>,
+    /// Bonus credit on verification. Ignored for `Required`.
+    #[serde(default)]
+    pub minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// The `betamacs-tasks` artifact: a standalone, independently-versioned
 /// bank delivered as its own signed envelope (own epoch / anti-rollback),
 /// merged with the challenge policy at runtime.
@@ -602,6 +650,19 @@ pub struct TaskBank {
     pub name: Option<String>,
     #[serde(default)]
     pub tasks: Vec<Task>,
+    /// Parent-verified external tasks (docs/chores.md). Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chores: Vec<Chore>,
+    /// AUTHORED plaintext verification PIN; `publish.sh tasks` hashes it
+    /// into `chore_pin_hash` and removes it, so it is never shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chore_pin: Option<String>,
+    /// `sha256$<hex salt>$<hex digest>` of the PIN. The daemon moves this
+    /// out of the world-readable `tasks.json` into a root-only `chore-pin`
+    /// file on delivery (a short PIN's hash must not be readable — it
+    /// would be brute-forced offline in milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chore_pin_hash: Option<String>,
 }
 
 /// Challenge policy (lives in `betamacs-config`). Disabled by default; a
@@ -1098,6 +1159,78 @@ impl SiteFilterSettings {
     }
 }
 
+// ------------------------------------------------------------------ chores
+//
+// Policy for parent-verified external tasks (docs/chores.md). The chores
+// themselves live in the per-kid task bank; this module only sets caps,
+// claim expiry, the hour from which `required` chores hold the earned-time
+// gate, and the PIN attempt lockout the daemon enforces. Kids-only for free
+// via the same task-bank gate as earned-time. Policy only; disabled by
+// default.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ChoreSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bonus-chore credit per day, on top of `EarnedTimeSettings::daily_earn_cap_min`
+    /// (both apply; chores can never out-mint the earned-time policy).
+    pub bonus_daily_cap_min: u32,
+    /// An unverified claim is dropped after this long.
+    pub claim_ttl_min: u32,
+    /// `HH:MM` local time from which outstanding `required` chores hold the
+    /// gate closed (before it, the day's chores are simply not due yet).
+    pub required_hold_from: String,
+    /// Wrong PIN entries before verification is refused for a while.
+    pub verify_max_attempts: u32,
+    /// Length of that refusal.
+    pub verify_lockout_sec: u32,
+}
+
+impl Default for ChoreSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bonus_daily_cap_min: 60,
+            claim_ttl_min: 120,
+            required_hold_from: "00:00".into(),
+            verify_max_attempts: 5,
+            verify_lockout_sec: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ChorePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonus_daily_cap_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_ttl_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_hold_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_lockout_sec: Option<u32>,
+}
+
+impl ChoreSettings {
+    pub fn apply(&mut self, p: &ChorePatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(
+            enabled, bonus_daily_cap_min, claim_ttl_min, required_hold_from,
+            verify_max_attempts, verify_lockout_sec
+        );
+    }
+}
+
 // ------------------------------------------------------------- focus limit
 //
 // Auto-lockout when the user stays ACTIVELY on one browser tab too long
@@ -1284,6 +1417,8 @@ pub struct Effective {
     #[serde(default)]
     pub site_filter: SiteFilterSettings,
     #[serde(default)]
+    pub chores: ChoreSettings,
+    #[serde(default)]
     pub clock_integrity: ClockIntegritySettings,
     #[serde(default)]
     pub coverage_escalation: CoverageEscalationSettings,
@@ -1321,6 +1456,9 @@ impl Package {
             }
             if let Some(p) = &patches.site_filter {
                 effective.site_filter.apply(p);
+            }
+            if let Some(p) = &patches.chores {
+                effective.chores.apply(p);
             }
             if let Some(p) = &patches.clock_integrity {
                 effective.clock_integrity.apply(p);
@@ -1542,7 +1680,101 @@ mod tests {
     fn new_policies_off_by_default() {
         assert!(!CoverageEscalationSettings::default().enabled);
         assert!(!CaptureExclusionSettings::default().enabled);
+        assert!(!ChoreSettings::default().enabled);
         assert!(CaptureExclusionSettings::default().bundle_ids.is_empty());
+    }
+
+    #[test]
+    fn chore_patch_layers() {
+        let mut s = ChoreSettings::default();
+        s.apply(&ChorePatch {
+            enabled: Some(true),
+            bonus_daily_cap_min: Some(30),
+            required_hold_from: Some("09:00".into()),
+            ..Default::default()
+        });
+        assert!(s.enabled);
+        assert_eq!(s.bonus_daily_cap_min, 30);
+        assert_eq!(s.required_hold_from, "09:00");
+        // Untouched fields keep their defaults.
+        assert_eq!(s.claim_ttl_min, 120);
+        assert_eq!(s.verify_max_attempts, 5);
+        assert_eq!(s.verify_lockout_sec, 600);
+    }
+
+    #[test]
+    fn chores_resolve_through_layers() {
+        let pkg: Package = serde_json::from_str(
+            r#"{"version":1,"namedConfigs":[{"name":"kids","settings":{"chores":{"enabled":true}}}],
+                "layers":["kids"],"overrides":{"chores":{"claimTtlMin":30}},"textSets":[]}"#,
+        )
+        .unwrap();
+        let e = pkg.resolve();
+        assert!(e.chores.enabled);
+        assert_eq!(e.chores.claim_ttl_min, 30);
+        assert_eq!(e.chores.bonus_daily_cap_min, 60);
+    }
+
+    #[test]
+    fn task_bank_parses_chores_and_stays_compatible() {
+        // A pre-chores bank (no new fields) still loads with no chores.
+        let old: TaskBank = serde_json::from_str(r#"{"version":1,"tasks":[]}"#).unwrap();
+        assert!(old.chores.is_empty());
+        assert!(old.chore_pin_hash.is_none());
+
+        let bank: TaskBank = serde_json::from_str(
+            r#"{"version":2,"tasks":[],
+                "chorePinHash":"sha256$00$ff",
+                "chores":[
+                  {"id":"bed","name":"Make your bed","kind":"required","repeat":"daily"},
+                  {"id":"trash","name":"Trash","kind":"bonus","repeat":"weekly","minutes":30,
+                   "days":["mon"]},
+                  {"id":"garage","name":"Garage","repeat":"once","minutes":60}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(bank.chores.len(), 3);
+        assert_eq!(bank.chores[0].kind, ChoreKind::Required);
+        assert_eq!(bank.chores[0].repeat, ChoreRepeat::Daily);
+        assert_eq!(bank.chores[0].minutes, 0);
+        assert_eq!(bank.chores[1].minutes, 30);
+        assert_eq!(bank.chores[1].days, vec!["mon"]);
+        // kind defaults to bonus when omitted.
+        assert_eq!(bank.chores[2].kind, ChoreKind::Bonus);
+        assert_eq!(bank.chores[2].repeat, ChoreRepeat::Once);
+        assert_eq!(bank.chore_pin_hash.as_deref(), Some("sha256$00$ff"));
+
+        // Round-trips with camelCase enum values, and omits empties.
+        let json = serde_json::to_string(&bank).unwrap();
+        assert!(json.contains("\"kind\":\"required\""));
+        assert!(json.contains("\"repeat\":\"once\""));
+        assert!(!json.contains("chorePin\""));
+        let back: TaskBank = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, bank);
+    }
+
+    #[test]
+    fn example_files_carry_chores() {
+        // Guard the local examples: the config parses with the `chores`
+        // module and the task bank parses its chores + authored PIN.
+        // `config/` is gitignored (it holds the live package), so read at
+        // runtime and skip when absent rather than failing a clean clone.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/config/");
+        let (Ok(cfg), Ok(tasks)) = (
+            std::fs::read_to_string(format!("{dir}example-config.json")),
+            std::fs::read_to_string(format!("{dir}example-tasks.json")),
+        ) else {
+            eprintln!("skipping: config/example-*.json not present");
+            return;
+        };
+        let pkg: Package = serde_json::from_str(&cfg).unwrap();
+        let e = pkg.resolve();
+        assert!(!e.chores.enabled, "example config must ship chores disabled");
+        assert_eq!(e.chores.required_hold_from, "09:00");
+        let bank: TaskBank = serde_json::from_str(&tasks).unwrap();
+        assert_eq!(bank.chores.len(), 5);
+        assert!(bank.chore_pin.is_some() && bank.chore_pin_hash.is_none());
+        assert!(bank.chores.iter().all(|c| c.kind == ChoreKind::Required || c.minutes > 0));
     }
 
     #[test]

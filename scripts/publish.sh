@@ -81,21 +81,43 @@ PYEOF
     FILE="${3:-$ROOT/config/tasks.json}"
     [ -f "$FILE" ] || { echo "no task bank at $FILE" >&2; exit 1; }
     python3 - "$FILE" <<'PYEOF'
-import json, sys
+import json, re, sys
 d = json.load(open(sys.argv[1]))
 if isinstance(d, dict) and "authorSignature" in d and "packageB64" in d:
     sys.exit("refusing to publish an already-authored wrapper (%s); pass the raw tasks.json" % sys.argv[1])
 if not (isinstance(d, dict) and isinstance(d.get("tasks"), list)):
     sys.exit("%s is not a task bank ({version, tasks:[...]})" % sys.argv[1])
+chores = d.get("chores", [])
+if not isinstance(chores, list):
+    sys.exit("chores must be a list (docs/chores.md)")
+seen = set()
+for c in chores:
+    cid = c.get("id") if isinstance(c, dict) else None
+    if not cid or not c.get("name"):
+        sys.exit("every chore needs an id and a name: %r" % (c,))
+    if cid in seen:
+        sys.exit("duplicate chore id %r" % cid)
+    seen.add(cid)
+    if c.get("kind", "bonus") not in ("bonus", "required"):
+        sys.exit("chore %r: kind must be bonus|required" % cid)
+    if c.get("repeat", "daily") not in ("daily", "weekly", "once"):
+        sys.exit("chore %r: repeat must be daily|weekly|once" % cid)
+    if c.get("kind", "bonus") == "bonus" and not c.get("minutes"):
+        sys.exit("chore %r: a bonus chore needs minutes > 0" % cid)
+if chores and not (d.get("chorePin") or d.get("chorePinHash")):
+    sys.exit("chores are defined but no chorePin is set; verification needs one (docs/chores.md)")
+if d.get("chorePin") is not None and not re.fullmatch(r"[0-9]{4,12}", str(d["chorePin"])):
+    sys.exit("chorePin must be 4-12 digits")
 PYEOF
     # Hash answers so the shipped, on-device bank is not a cheat sheet: each
     # task gets `answerHash` (per-task salted sha256 of the canonical
     # answer) and its plaintext secret is neutered, keeping only type and
     # presentation (e.g. choice options). Must match challenge.rs::canonical.
     # Line answers are the shown text — not a secret — so they are left as-is.
+    # A plaintext `chorePin` is hashed the same way (chorePinHash) and dropped.
     HASHED="$FILE.hashed"
     python3 - "$FILE" "$HASHED" <<'PYEOF'
-import json, sys, hashlib
+import json, sys, hashlib, secrets
 bank = json.load(open(sys.argv[1]))
 def canon_num(x):
     s = "%.6f" % float(x)
@@ -119,6 +141,12 @@ for t in bank.get("tasks", []):
         a["value"] = ""
     if hashes:
         t["answerHash"] = hashes
+# Chore PIN (docs/chores.md): salted hash, plaintext removed. The daemon
+# moves chorePinHash out of the readable tasks.json into a root-only file.
+pin = bank.pop("chorePin", None)
+if pin is not None:
+    salt = secrets.token_hex(16)
+    bank["chorePinHash"] = "sha256$%s$%s" % (salt, digest(salt, str(pin).strip()))
 json.dump(bank, open(sys.argv[2], "w"), indent=2)
 PYEOF
     FILE="$HASHED"
