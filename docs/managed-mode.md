@@ -106,7 +106,9 @@ Small, dependency-light second binary in this repo. Root LaunchDaemon,
      `BETAMACSD_QUARANTINE_DRYRUN=1` logs instead of loading.
      Disabled-by-policy (the signed config's `detection.enabled:
      false`) is reported in the heartbeat and treated as healthy — a
-     sanctioned off-switch never quarantines.
+     sanctioned off-switch never quarantines. The same anchor carries
+     the earned-time earning-mode lockout and the site filter's DNS
+     lock (docs/earned-time.md, docs/site-filter.md).
    - **Clock integrity — IMPLEMENTED (default-off).** Time-of-day policy
      (the earned-time schedule today; time-layers later) is only as
      trustworthy as the clock it reads, and a kid quickly learns that

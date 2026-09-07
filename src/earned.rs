@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use crate::heartbeat::{Health, DAEMON_SOCKET};
 use crate::settings::{
     ClockIntegritySettings, EarnSource, EarnedTimeSettings, Effective, FocusLimitSettings,
+    SiteFilterSettings,
 };
 
 /// Is the earned-time gate active right now? Enabled, and the day/time falls
@@ -77,17 +78,26 @@ fn gate_active(cfg: &EarnedTimeSettings, ci: &ClockIntegritySettings) -> bool {
 /// owns the authoritative balance ledger and the pf gate. Sent on the
 /// daemon's own socket (reachable even under an earning-mode lockout, which
 /// allows loopback). Silently skipped when there is no daemon (unmanaged).
-fn report_earn(secs: u32, gate_active: bool, cfg: &EarnedTimeSettings) {
-    let hosts = cfg
-        .sources
-        .iter()
-        .filter_map(|s| s.matcher.browser_host_suffix.clone())
-        .map(|h| format!("{h:?}")) // debug-quotes with JSON-safe escaping
-        .collect::<Vec<_>>()
-        .join(",");
+fn report_earn(secs: u32, gate_active: bool, cfg: &EarnedTimeSettings, sf: &SiteFilterSettings) {
+    let json_list = |it: Vec<String>| -> String {
+        it.iter()
+            .map(|h| format!("{h:?}")) // debug-quotes with JSON-safe escaping
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let hosts = json_list(
+        cfg.sources
+            .iter()
+            .filter_map(|s| s.matcher.browser_host_suffix.clone())
+            .collect(),
+    );
+    // The site filter's lists ride along: the daemon enforces them (DNS
+    // filter + pf), the agent only resolves the policy (docs/site-filter.md).
+    let filter_allow = json_list(sf.allow_hosts.clone());
+    let filter_block = json_list(sf.block_hosts.clone());
     let line = format!(
-        "{{\"type\":\"earn\",\"secs\":{secs},\"gateActive\":{gate_active},\"spendRatio\":{},\"dailyCapMin\":{},\"maxBankMin\":{},\"allowHosts\":[{hosts}]}}\n",
-        cfg.spend_ratio, cfg.daily_earn_cap_min, cfg.max_bank_min,
+        "{{\"type\":\"earn\",\"secs\":{secs},\"gateActive\":{gate_active},\"spendRatio\":{},\"dailyCapMin\":{},\"maxBankMin\":{},\"allowHosts\":[{hosts}],\"filterEnabled\":{},\"filterAuditOnly\":{},\"filterAllowHosts\":[{filter_allow}],\"filterBlockHosts\":[{filter_block}]}}\n",
+        cfg.spend_ratio, cfg.daily_earn_cap_min, cfg.max_bank_min, sf.enabled, sf.audit_only,
     );
     if let Ok(mut s) = UnixStream::connect(DAEMON_SOCKET) {
         let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
@@ -309,14 +319,14 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
         loop {
             std::thread::sleep(TICK);
             let eff = shared.read().unwrap().clone();
-            let (et, fl) = (&eff.earned_time, &eff.focus_limit);
+            let (et, fl, sf) = (&eff.earned_time, &eff.focus_limit, &eff.site_filter);
             let now = Instant::now();
             let elapsed = now.duration_since(last);
             let elapsed_min = elapsed.as_secs_f64() / 60.0;
             last = now;
 
             if !et.enabled && !fl.enabled {
-                report_earn(0, false, et); // clear any stale earned gate
+                report_earn(0, false, et, sf); // clear any stale earned gate; carry the filter lists
                 focus = FocusState::default();
                 continue;
             }
@@ -354,9 +364,9 @@ pub fn spawn(shared: Arc<RwLock<Effective>>, health: Arc<Health>) {
                 carry += credited_min * 60.0;
                 let whole = carry.floor().max(0.0) as u32;
                 carry -= whole as f64;
-                report_earn(whole, gate_active(et, &eff.clock_integrity), et);
+                report_earn(whole, gate_active(et, &eff.clock_integrity), et, sf);
             } else {
-                report_earn(0, false, et);
+                report_earn(0, false, et, sf);
             }
 
             // Same-tab focus limit. Drain the scroll counter every tick so

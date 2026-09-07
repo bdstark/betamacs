@@ -24,6 +24,7 @@ import "./modules/coverage.js";
 import "./modules/exclusions.js";
 import "./modules/earned.js";
 import "./modules/focus.js";
+import "./modules/sites.js";
 
 initTheme();
 
@@ -36,6 +37,7 @@ const SECTIONS = [
   { id: "exclusions", label: "Capture exclusions", group: "Policy", description: "Windows and apps the censor ignores" },
   { id: "earned", label: "Earned time", group: "Policy", description: "Activities that earn uncovered time" },
   { id: "focus", label: "Focus limit", group: "Policy", description: "Lockout after too long on one tab" },
+  { id: "sites", label: "Site filter", group: "Policy", description: "Sites allowed with no balance, and sites always blocked" },
   { id: "clock", label: "Clock integrity", group: "Policy", description: "Defences against clock tampering" },
   { id: "layers", label: "Layers & package", group: "Rollout", description: "Named configs, inheritance, and the package that ships" },
   { id: "assignment", label: "Devices", group: "Rollout", description: "Which machines take this package" },
@@ -180,6 +182,7 @@ export class BmApp extends LitElement {
       case "exclusions": return html`<bm-exclusions-module></bm-exclusions-module>`;
       case "earned": return html`<bm-earned-module></bm-earned-module>`;
       case "focus": return html`<bm-focus-module></bm-focus-module>`;
+      case "sites": return html`<bm-sites-module></bm-sites-module>`;
       case "clock": return html`<bm-clock-module></bm-clock-module>`;
       case "layers": return html`<bm-layers></bm-layers>`;
       case "assignment": return html`<bm-assignment></bm-assignment>`;

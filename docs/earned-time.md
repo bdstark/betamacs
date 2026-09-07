@@ -135,11 +135,15 @@ parent's Mac, and the parent stays open even though it gets the same config.
 No `kids` channel or release promotions required.
 
 Known limitations / decisions:
-- **Earning-mode allowlist covers web sources (`browserHostSuffix`) only** —
-  pf filters by resolved IP, so an app-only source (`bundleId`) can't be
-  selectively allowed while blocking everything else. App-based earning
-  relies on the app's offline content, or on earning during a non-gated
-  window. Documented; revisit if an app source needs online access to earn.
+- **Earning-mode allowlist is by name via the site filter** (2026-09-06,
+  docs/site-filter.md). With `siteFilter.enabled` the depleted-balance
+  lockout is enforced by a local DNS filter feeding a pf table: only the
+  earn sources' `browserHostSuffix` values plus `siteFilter.allowHosts`
+  resolve, and whatever they resolve to (CDN hosts included) is reachable.
+  This also covers an app source (`bundleId`) as long as its hosts are
+  allowlisted — apps use the system resolver too (use `auditOnly` to find
+  them). Without the site filter the legacy behaviour stands: pf passes
+  only the apex IPs the earn hosts resolve to, which misses CDNs.
 - **Schedule/policy is resolved by the agent**, not the daemon (keeps the
   daemon from parsing the full config). The daemon owns the *balance* (the
   un-fakeable part) and caps agent-reported credit; a tampered agent's worst

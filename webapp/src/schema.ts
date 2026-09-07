@@ -259,6 +259,21 @@ export interface FocusLimitSettings {
 }
 export type FocusLimitPatch = Partial<FocusLimitSettings>;
 
+// -------------------------------------------------------------- site filter
+// Internet allow/block lists enforced by betamacsd via a local DNS filter +
+// pf (docs/site-filter.md). allowHosts: the only sites reachable while the
+// earned-time balance is depleted (with the earn sources). blockHosts: never
+// reachable while the filter is on. Suffix match ("kastatic.org" covers
+// cdn.kastatic.org). auditOnly logs lookups without blocking (discovery).
+// Kids-only via the task-bank marker, like earned time. Disabled by default.
+export interface SiteFilterSettings {
+  enabled: boolean;
+  allowHosts: string[];
+  blockHosts: string[];
+  auditOnly: boolean;
+}
+export type SiteFilterPatch = Partial<SiteFilterSettings>;
+
 // Trust the clock behind all time-of-day policy: evaluate schedule windows
 // against an ASSIGNED timezone applied to a trusted epoch (never the OS
 // timezone/clock), and quarantine when the clock is changed under a running
@@ -308,6 +323,7 @@ export interface ModulePatches {
   exposure?: ExposurePatch;
   earnedTime?: EarnedTimePatch;
   focusLimit?: FocusLimitPatch;
+  siteFilter?: SiteFilterPatch;
   clockIntegrity?: ClockIntegrityPatch;
   coverageEscalation?: CoverageEscalationPatch;
   captureExclusions?: CaptureExclusionPatch;
@@ -334,6 +350,7 @@ export interface Effective {
   exposure: ExposureSettings;
   earnedTime: EarnedTimeSettings;
   focusLimit: FocusLimitSettings;
+  siteFilter: SiteFilterSettings;
   clockIntegrity: ClockIntegritySettings;
   coverageEscalation: CoverageEscalationSettings;
   captureExclusions: CaptureExclusionSettings;
@@ -481,6 +498,15 @@ export function defaultFocusLimit(): FocusLimitSettings {
   };
 }
 
+export function defaultSiteFilter(): SiteFilterSettings {
+  return {
+    enabled: false,
+    allowHosts: [],
+    blockHosts: [],
+    auditOnly: false,
+  };
+}
+
 export function defaultClockIntegrity(): ClockIntegritySettings {
   return {
     enabled: false,
@@ -519,6 +545,7 @@ export function resolve(pkg: Package): Effective {
     exposure: defaultExposure(),
     earnedTime: defaultEarnedTime(),
     focusLimit: defaultFocusLimit(),
+    siteFilter: defaultSiteFilter(),
     clockIntegrity: defaultClockIntegrity(),
     coverageEscalation: defaultCoverageEscalation(),
     captureExclusions: defaultCaptureExclusions(),
@@ -533,6 +560,7 @@ export function resolve(pkg: Package): Effective {
     if (patches.exposure) Object.assign(effective.exposure, patches.exposure);
     if (patches.earnedTime) Object.assign(effective.earnedTime, patches.earnedTime);
     if (patches.focusLimit) Object.assign(effective.focusLimit, patches.focusLimit);
+    if (patches.siteFilter) Object.assign(effective.siteFilter, patches.siteFilter);
     if (patches.clockIntegrity) Object.assign(effective.clockIntegrity, patches.clockIntegrity);
     if (patches.coverageEscalation)
       Object.assign(effective.coverageEscalation, patches.coverageEscalation);

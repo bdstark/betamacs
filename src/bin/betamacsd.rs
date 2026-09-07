@@ -19,8 +19,11 @@
 
 #[path = "../envelope.rs"]
 mod envelope;
+#[path = "../dnsfilter.rs"]
+mod dnsfilter;
 
 use std::io::{BufRead, BufReader, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -149,6 +152,18 @@ struct EarnedLedger {
     balance_min: f64,
 }
 
+/// The site-filter policy snapshot the agent resolved from the config
+/// (docs/site-filter.md). Enforced here through the local DNS filter + pf.
+#[derive(Clone, PartialEq, Default, Debug)]
+struct FilterPolicy {
+    enabled: bool,
+    audit_only: bool,
+    /// Reachable in earning mode, on top of the earn sources.
+    allow: Vec<String>,
+    /// Never reachable while the filter is on.
+    block: Vec<String>,
+}
+
 /// The earned-time gate: owns the ledger and the latest policy snapshot the
 /// agent resolved (the agent knows the schedule and config; the daemon owns
 /// the balance the child can't fake, and drives the pf earning-mode gate).
@@ -166,6 +181,7 @@ struct EarnedGate {
     daily_cap_min: f64,
     max_bank_min: f64,
     allow_hosts: Vec<String>,
+    filter: FilterPolicy,
     last_report: Option<Instant>,
     last_tick: Instant,
 }
@@ -186,6 +202,7 @@ impl EarnedGate {
             daily_cap_min: 0.0,
             max_bank_min: 0.0,
             allow_hosts: Vec::new(),
+            filter: FilterPolicy::default(),
             last_report: None,
             last_tick: Instant::now(),
         }
@@ -219,6 +236,7 @@ impl EarnedGate {
         daily_cap_min: f64,
         max_bank_min: f64,
         allow_hosts: Vec<String>,
+        filter: FilterPolicy,
     ) {
         let today = Self::today();
         if !today.is_empty() && self.ledger.date != today {
@@ -230,6 +248,7 @@ impl EarnedGate {
         self.daily_cap_min = daily_cap_min.max(0.0);
         self.max_bank_min = max_bank_min.max(0.0);
         self.allow_hosts = allow_hosts;
+        self.filter = filter;
         self.last_report = Some(Instant::now());
 
         let mut add = secs as f64 / 60.0;
@@ -282,6 +301,61 @@ impl EarnedGate {
             Some(self.allow_hosts.clone()) // depleted → earning-mode lockout
         }
     }
+
+    /// The site-filter policy to enforce right now: None when the module is
+    /// off, the agent's snapshot is stale, or this is not a provisioned kid
+    /// device (same task-bank marker as the gate — a fleet-wide config never
+    /// redirects the parent Mac's DNS).
+    fn filter_policy(&self) -> Option<FilterPolicy> {
+        if !self.tasks_path.exists() || !self.filter.enabled {
+            return None;
+        }
+        let fresh = self
+            .last_report
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+        fresh.then(|| self.filter.clone())
+    }
+}
+
+/// What the watchdog wants loaded: a pf ruleset and a DNS-filter mode.
+/// Orthogonal on purpose — the blocklist needs DNS pinned but no lockdown,
+/// the legacy earning mode needs a lockdown but no DNS.
+#[derive(Clone, PartialEq, Debug)]
+struct Desired {
+    pf: PfMode,
+    dns: dnsfilter::Mode,
+}
+
+impl Desired {
+    const OPEN: Desired = Desired { pf: PfMode::Open, dns: dnsfilter::Mode::Off };
+}
+
+/// Compose the pf + DNS state from the watchdog's three inputs. Pure —
+/// unit-tested. `earning` is the earn-source allowlist when the gate is
+/// depleted; `filter` the site-filter policy when it applies.
+fn compose(want_full: bool, earning: Option<Vec<String>>, filter: Option<FilterPolicy>) -> Desired {
+    use dnsfilter::Mode;
+    if want_full {
+        return Desired { pf: PfMode::Full, dns: Mode::Off };
+    }
+    match (earning, filter) {
+        // Depleted balance + site filter: only the earn sources and the
+        // configured allowlist resolve; pf passes only what they resolve to.
+        (Some(hosts), Some(f)) if !f.audit_only => {
+            let mut allow = hosts.clone();
+            allow.extend(f.allow.iter().cloned());
+            allow.extend(ALLOWED_HOSTS.iter().map(|h| h.to_string()));
+            Desired { pf: PfMode::EarningTable(hosts), dns: Mode::Allow { allow, block: f.block } }
+        }
+        // Audit never enforces: legacy gate, DNS only observed.
+        (Some(hosts), Some(_)) => Desired { pf: PfMode::EarningStatic(hosts), dns: Mode::Audit },
+        (Some(hosts), None) => Desired { pf: PfMode::EarningStatic(hosts), dns: Mode::Off },
+        (None, Some(f)) if f.audit_only => Desired { pf: PfMode::Open, dns: Mode::Audit },
+        (None, Some(f)) if !f.block.is_empty() => {
+            Desired { pf: PfMode::DnsLock, dns: Mode::Block { block: f.block } }
+        }
+        _ => Desired::OPEN,
+    }
 }
 
 /// Layer-4 local enforcement (docs/managed-mode.md): when the censor is
@@ -294,14 +368,21 @@ impl EarnedGate {
 /// tethering or another Wi-Fi doesn't escape. Cleared automatically the
 /// moment health returns. The anchor lives under com.apple/* because
 /// the stock /etc/pf.conf evaluates that tree — no config edits.
-/// What the pf anchor is currently loaded with. `Full` blocks everything
-/// but management (tamper/exposure/challenge). `Earning` additionally allows
-/// the earn-source hosts, so a child with a depleted balance can still reach
-/// the approved sites to earn more time.
-#[derive(Clone, PartialEq)]
-enum QMode {
+/// What the pf anchor is loaded with. `Full` blocks everything but
+/// management (tamper/exposure/challenge). The two earning modes additionally
+/// allow the earn-source hosts so a child with a depleted balance can still
+/// reach the approved sites: `EarningStatic` by resolving their apex IPs
+/// (legacy; misses CDNs), `EarningTable` by passing a pf table the DNS filter
+/// fills with whatever the allowlisted names resolve to (docs/site-filter.md).
+/// `DnsLock` is not a lockdown: it only pins DNS to the local filter so the
+/// blocklist can't be resolved around.
+#[derive(Clone, PartialEq, Debug)]
+enum PfMode {
+    Open,
     Full,
-    Earning(Vec<String>),
+    EarningStatic(Vec<String>),
+    EarningTable(Vec<String>),
+    DnsLock,
 }
 
 /// Why the daemon is (or would be) fully blocking the network — the single
@@ -344,7 +425,7 @@ impl QReason {
 }
 
 struct Quarantine {
-    engaged: Option<QMode>,
+    engaged: Desired,
     unhealthy_since: Option<Instant>,
     /// BETAMACSD_NO_QUARANTINE=1, non-root, or a test prefix disables.
     armed: bool,
@@ -353,9 +434,20 @@ struct Quarantine {
     /// Default 180s; BETAMACSD_QUARANTINE_GRACE_SECS overrides.
     grace: Duration,
     rules_path: PathBuf,
+    /// The local DNS filter (docs/site-filter.md) and the system-resolver
+    /// redirect that feeds it; `pf_hook` adds learned IPs to the allow table.
+    filter: dnsfilter::Filter,
+    sysdns: dnsfilter::SystemDns,
+    pf_hook: dnsfilter::PfHook,
+    /// Manual DNS servers replaced by the redirect (used as upstreams).
+    saved_manual: Vec<String>,
+    /// Upstreams baked into the loaded ruleset (reload when they change).
+    loaded_upstreams: Vec<SocketAddr>,
 }
 
 const PF_ANCHOR: &str = "com.apple/250.BetamacsQuarantine";
+/// pf table (inside the anchor) of IPs the DNS filter learned for allowed names.
+const PF_TABLE: &str = "betamacs_allow";
 const QUARANTINE_GRACE: Duration = Duration::from_secs(180);
 const HEARTBEAT_FRESH: Duration = Duration::from_secs(60);
 /// Management hosts that stay reachable under quarantine.
@@ -379,14 +471,50 @@ impl Quarantine {
             .and_then(|s| s.parse().ok())
             .map(Duration::from_secs)
             .unwrap_or(QUARANTINE_GRACE);
+        let pf_hook = Self::table_hook(dry_run);
+        let sysdns = dnsfilter::SystemDns::new(&paths.managed_dir, dry_run);
+        // A previous instance died while DNS was redirected: put it back
+        // now; the watchdog re-engages within a tick if still warranted.
+        if armed && sysdns.is_engaged() {
+            tracing::warn!("system DNS was left redirected by a previous instance; restoring");
+            sysdns.restore();
+        }
         Self {
-            engaged: None,
+            engaged: Desired::OPEN,
             unhealthy_since: None,
             armed,
             dry_run,
             grace,
             rules_path: paths.managed_dir.join("quarantine.rules"),
+            filter: dnsfilter::Filter::new(&paths.managed_dir, pf_hook.clone()),
+            sysdns,
+            pf_hook,
+            saved_manual: Vec::new(),
+            loaded_upstreams: Vec::new(),
         }
+    }
+
+    /// `pfctl -a ANCHOR -t TABLE -T add …` for IPs the DNS filter learned.
+    fn table_hook(dry_run: bool) -> dnsfilter::PfHook {
+        Arc::new(move |ips: &[IpAddr]| {
+            let list: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
+            if dry_run {
+                tracing::info!("DRY RUN: would add to pf table {PF_TABLE}: {}", list.join(", "));
+                return;
+            }
+            match std::process::Command::new("/sbin/pfctl")
+                .args(["-a", PF_ANCHOR, "-t", PF_TABLE, "-T", "add"])
+                .args(&list)
+                .output()
+            {
+                Ok(o) if o.status.success() => tracing::debug!("pf table += {}", list.join(", ")),
+                Ok(o) => tracing::warn!(
+                    "pf table add failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => tracing::warn!("pfctl spawn failed: {e}"),
+            }
+        })
     }
 
     /// Which FULL-block reason applies right now, or `QReason::None` when the
@@ -470,26 +598,57 @@ impl Quarantine {
         QReason::None
     }
 
-    /// Reconcile the pf anchor to the desired mode: `None` releases,
-    /// `Full`/`Earning` load the matching ruleset. A no-op when already in
-    /// the desired mode.
-    fn apply(&mut self, desired: Option<QMode>) {
-        if !self.armed || desired == self.engaged {
+    /// Reconcile pf and the DNS filter to `desired`. A no-op when already
+    /// there (except that upstream resolvers are re-discovered while DNS is
+    /// engaged, and the ruleset reloaded if they moved — network switch).
+    fn apply(&mut self, mut desired: Desired) {
+        use dnsfilter::Mode;
+        if !self.armed {
             return;
         }
-        match &desired {
-            None => self.release_pf(),
-            Some(mode) => {
-                let extra = match mode {
-                    QMode::Full => &[][..],
-                    QMode::Earning(hosts) => hosts.as_slice(),
+        // Engage DNS first so the filter is answering before pf pins port 53.
+        if desired.dns != Mode::Off {
+            if desired.dns != self.engaged.dns && !self.filter.set_mode(desired.dns.clone()) {
+                // Can't bind :53 (another local resolver?) — fall back to the
+                // legacy IP gate so the child is still gated, not open.
+                tracing::error!("dns filter unavailable; falling back to the static earning gate");
+                desired = Desired {
+                    pf: match desired.pf {
+                        PfMode::EarningTable(h) => PfMode::EarningStatic(h),
+                        PfMode::DnsLock => PfMode::Open,
+                        other => other,
+                    },
+                    dns: Mode::Off,
                 };
-                self.load_pf(mode.clone(), extra);
+            } else {
+                if self.engaged.dns == Mode::Off {
+                    self.saved_manual = self.sysdns.engage();
+                }
+                self.filter.set_upstreams(dnsfilter::discover_upstreams(&self.saved_manual));
             }
         }
+        let ups = self.filter.upstreams();
+        let pf_changed = desired.pf != self.engaged.pf
+            || (Self::uses_upstreams(&desired.pf) && ups != self.loaded_upstreams);
+        if pf_changed {
+            match &desired.pf {
+                PfMode::Open => self.release_pf(),
+                mode => self.load_pf(mode.clone(), &ups),
+            }
+        }
+        if desired.dns == Mode::Off && self.engaged.dns != Mode::Off {
+            self.sysdns.restore();
+            self.saved_manual.clear();
+            self.filter.set_mode(Mode::Off);
+        }
+        self.engaged = desired;
     }
 
-    /// Resolve hostnames to a comma-joined IP list for a pf `to { ... }`.
+    fn uses_upstreams(pf: &PfMode) -> bool {
+        matches!(pf, PfMode::EarningTable(_) | PfMode::DnsLock)
+    }
+
+    /// Resolve hostnames to IPs (for a pf `to { ... }` or a table seed).
     fn resolve(hosts: &[&str]) -> Vec<String> {
         hosts
             .iter()
@@ -503,73 +662,138 @@ impl Quarantine {
             .collect()
     }
 
-    fn build_rules(&self, extra_hosts: &[String]) -> String {
+    fn build_rules(&self, pf: &PfMode, upstreams: &[SocketAddr]) -> String {
         let mgmt = Self::resolve(&ALLOWED_HOSTS);
-        let mut passes = String::new();
-        if mgmt.is_empty() {
+        let mgmt_pass = if mgmt.is_empty() {
             tracing::warn!("could not resolve management hosts; quarantine allows DNS only");
+            String::new()
         } else {
-            passes += &format!(
+            format!(
                 "pass out quick proto tcp from any to {{ {} }} port 443\n",
                 mgmt.join(", "),
-            );
+            )
+        };
+        // Port 53 only to the resolvers the local filter forwards to; any
+        // other resolver (and DoT on 853) is dropped so the filter can't be
+        // bypassed by pointing an app at a different server.
+        let ups: Vec<String> = upstreams.iter().map(|u| u.ip().to_string()).collect();
+        let dns_pass = if ups.is_empty() {
+            "pass out quick proto { udp, tcp } from any to any port 53\n".to_string()
+        } else {
+            format!("pass out quick proto {{ udp, tcp }} from any to {{ {} }} port 53\n", ups.join(", "))
+        };
+        let doh = dnsfilter::DOH_IPS.join(", ");
+        match pf {
+            PfMode::Open => String::new(),
+            PfMode::Full | PfMode::EarningStatic(_) => {
+                let mut passes = mgmt_pass;
+                if let PfMode::EarningStatic(hosts) = pf {
+                    let earn = Self::resolve(&hosts.iter().map(String::as_str).collect::<Vec<_>>());
+                    if !earn.is_empty() {
+                        passes += &format!(
+                            "pass out quick proto tcp from any to {{ {} }} port {{ 80, 443 }}\n",
+                            earn.join(", "),
+                        );
+                    }
+                }
+                format!(
+                    "# betamacs quarantine — loaded by betamacsd when the censor is\n\
+                     # unprotected, or the earned-time gate is depleted. Removed on recovery.\n\
+                     pass quick on lo0 all\n\
+                     pass out quick proto udp from any port 68 to any port 67\n\
+                     pass out quick proto {{ udp, tcp }} from any to any port 53\n\
+                     {passes}\
+                     pass in quick proto tcp from any to any port 22\n\
+                     block drop quick all\n",
+                )
+            }
+            PfMode::EarningTable(_) => format!(
+                "# betamacs earning-mode lockout (docs/site-filter.md): only what the\n\
+                 # allowlisted names resolve to is reachable; the local DNS filter fills\n\
+                 # the table. Removed when the balance goes positive.\n\
+                 table <{PF_TABLE}> persist\n\
+                 pass quick on lo0 all\n\
+                 pass out quick proto udp from any port 68 to any port 67\n\
+                 {dns_pass}\
+                 {mgmt_pass}\
+                 pass out quick proto {{ tcp, udp }} from any to <{PF_TABLE}> port {{ 80, 443 }}\n\
+                 pass in quick proto tcp from any to any port 22\n\
+                 block drop quick all\n",
+            ),
+            PfMode::DnsLock => format!(
+                "# betamacs dns lock (docs/site-filter.md): the blocklist is enforced by\n\
+                 # the local DNS filter; these rules only stop resolving around it.\n\
+                 pass quick on lo0 all\n\
+                 {dns_pass}\
+                 block drop out quick proto {{ udp, tcp }} from any to any port {{ 53, 853 }}\n\
+                 block drop out quick proto {{ tcp, udp }} from any to {{ {doh} }} port 443\n\
+                 block drop out quick proto udp from any to any port 443\n",
+            ),
         }
-        let earn = Self::resolve(&extra_hosts.iter().map(String::as_str).collect::<Vec<_>>());
-        if !earn.is_empty() {
-            passes += &format!(
-                "pass out quick proto tcp from any to {{ {} }} port {{ 80, 443 }}\n",
-                earn.join(", "),
-            );
-        }
-        format!(
-            "# betamacs quarantine — loaded by betamacsd when the censor is\n\
-             # unprotected, or the earned-time gate is depleted. Removed on recovery.\n\
-             pass quick on lo0 all\n\
-             pass out quick proto udp from any port 68 to any port 67\n\
-             pass out quick proto {{ udp, tcp }} from any to any port 53\n\
-             {passes}\
-             pass in quick proto tcp from any to any port 22\n\
-             block drop quick all\n",
-        )
     }
 
-    fn load_pf(&mut self, mode: QMode, extra_hosts: &[String]) {
+    fn load_pf(&mut self, mode: PfMode, upstreams: &[SocketAddr]) {
         let label = match &mode {
-            QMode::Full => "full".to_string(),
-            QMode::Earning(h) => format!("earning-mode (allow {})", h.join(", ")),
+            PfMode::Open => "open".to_string(),
+            PfMode::Full => "full".to_string(),
+            PfMode::EarningStatic(h) => format!("earning-mode/static (allow {})", h.join(", ")),
+            PfMode::EarningTable(h) => format!("earning-mode/dns (seed {})", h.join(", ")),
+            PfMode::DnsLock => "dns-lock".to_string(),
         };
-        let rules = self.build_rules(extra_hosts);
-        if self.dry_run {
+        let rules = self.build_rules(&mode, upstreams);
+        let loaded = if self.dry_run {
             tracing::warn!("DRY RUN: would load pf anchor {PF_ANCHOR} [{label}]:\n{rules}");
-            self.engaged = Some(mode);
-            return;
-        }
-        if let Err(e) = std::fs::write(&self.rules_path, &rules) {
+            true
+        } else if let Err(e) = std::fs::write(&self.rules_path, &rules) {
             tracing::error!("could not write quarantine rules: {e}");
+            false
+        } else {
+            let _ = std::process::Command::new("/sbin/pfctl").arg("-E").output();
+            match std::process::Command::new("/sbin/pfctl")
+                .args(["-a", PF_ANCHOR, "-f"])
+                .arg(&self.rules_path)
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::warn!("network quarantine ENGAGED [{label}] (pf anchor {PF_ANCHOR})");
+                    true
+                }
+                Ok(out) => {
+                    tracing::error!(
+                        "pfctl load failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim(),
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::error!("pfctl spawn failed: {e}");
+                    false
+                }
+            }
+        };
+        if !loaded {
             return;
         }
-        let _ = std::process::Command::new("/sbin/pfctl").arg("-E").output();
-        match std::process::Command::new("/sbin/pfctl")
-            .args(["-a", PF_ANCHOR, "-f"])
-            .arg(&self.rules_path)
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                self.engaged = Some(mode);
-                tracing::warn!("network quarantine ENGAGED [{label}] (pf anchor {PF_ANCHOR})");
+        self.loaded_upstreams = upstreams.to_vec();
+        if let PfMode::EarningTable(seed) = &mode {
+            // A fresh (or reloaded) anchor means an empty table: forget what
+            // the filter already handed over and seed it with the earn hosts'
+            // apex IPs so a page already open keeps working.
+            self.filter.reset_learned();
+            let ips: Vec<IpAddr> = Self::resolve(&seed.iter().map(String::as_str).collect::<Vec<_>>())
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if !ips.is_empty() {
+                (self.pf_hook)(&ips);
             }
-            Ok(out) => tracing::error!(
-                "pfctl load failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim(),
-            ),
-            Err(e) => tracing::error!("pfctl spawn failed: {e}"),
         }
     }
 
     fn release_pf(&mut self) {
+        self.loaded_upstreams.clear();
         if self.dry_run {
             tracing::warn!("DRY RUN: would flush pf anchor {PF_ANCHOR}");
-            self.engaged = None;
             return;
         }
         match std::process::Command::new("/sbin/pfctl")
@@ -577,7 +801,6 @@ impl Quarantine {
             .output()
         {
             Ok(out) if out.status.success() => {
-                self.engaged = None;
                 tracing::warn!("network quarantine released");
             }
             Ok(out) => tracing::error!(
@@ -587,6 +810,7 @@ impl Quarantine {
             Err(e) => tracing::error!("pfctl spawn failed: {e}"),
         }
     }
+
 }
 
 fn main() -> Result<()> {
@@ -627,6 +851,12 @@ fn main() -> Result<()> {
     // state instead of re-deriving it from a subset of signals. Refreshed each
     // watchdog tick; timed countdowns are recomputed live in the handler.
     let quarantine_reason: Arc<Mutex<QReason>> = Arc::new(Mutex::new(QReason::None));
+    // The quarantine (pf + DNS filter) lives on the watchdog loop; the DNS
+    // filter handle is shared with the `status` handler so the recent-names
+    // lists are live, and the engaged mode is published each tick.
+    let mut quarantine = Quarantine::new(&paths);
+    let filter_status: Arc<Mutex<(String, dnsfilter::Filter)>> =
+        Arc::new(Mutex::new(("off".to_string(), quarantine.filter.clone())));
 
     // Socket listener thread.
     let _ = std::fs::remove_file(&paths.socket);
@@ -642,6 +872,7 @@ fn main() -> Result<()> {
         let agent = agent.clone();
         let earned = earned.clone();
         let quarantine_reason = quarantine_reason.clone();
+        let filter_status = filter_status.clone();
         let managed_dir = paths.managed_dir.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -650,6 +881,7 @@ fn main() -> Result<()> {
                         let agent = agent.clone();
                         let earned = earned.clone();
                         let quarantine_reason = quarantine_reason.clone();
+                        let filter_status = filter_status.clone();
                         let managed_dir = managed_dir.clone();
                         let verifier = verifier.clone();
                         std::thread::spawn(move || {
@@ -658,6 +890,7 @@ fn main() -> Result<()> {
                                 &agent,
                                 &earned,
                                 &quarantine_reason,
+                                &filter_status,
                                 &managed_dir,
                                 verifier.as_ref(),
                             )
@@ -670,7 +903,6 @@ fn main() -> Result<()> {
     }
 
     // Watchdog loop.
-    let mut quarantine = Quarantine::new(&paths);
     let mut last_integrity = Instant::now() - Duration::from_secs(3600);
     loop {
         std::thread::sleep(Duration::from_secs(15));
@@ -679,12 +911,11 @@ fn main() -> Result<()> {
         // the earned-time gate; a depleted gate falls back to earning-mode.
         let full_reason = quarantine.want_full(&agent.lock().unwrap().clone());
         let want_full = full_reason != QReason::None;
-        let earning = earned.lock().unwrap().tick(want_full);
-        let desired = if want_full {
-            Some(QMode::Full)
-        } else {
-            earning.clone().map(QMode::Earning)
+        let (earning, filter) = {
+            let mut e = earned.lock().unwrap();
+            (e.tick(want_full), e.filter_policy())
         };
+        let desired = compose(want_full, earning.clone(), filter);
         // Publish the effective reason for the status handler: a full block's
         // reason, else the earned-time gate when it engages earning-mode, else
         // none. This is the single source of truth the HUD reads.
@@ -696,6 +927,7 @@ fn main() -> Result<()> {
             QReason::None
         };
         quarantine.apply(desired);
+        filter_status.lock().unwrap().0 = quarantine.engaged.dns.as_str().to_string();
         if last_integrity.elapsed() >= Duration::from_secs(600) {
             last_integrity = Instant::now();
             check_integrity(&paths);
@@ -708,6 +940,7 @@ fn handle_client(
     agent: &Mutex<AgentState>,
     earned: &Mutex<EarnedGate>,
     quarantine_reason: &Mutex<QReason>,
+    filter_status: &Mutex<(String, dnsfilter::Filter)>,
     managed_dir: &Path,
     verifier: Option<&envelope::Verifier>,
 ) {
@@ -826,17 +1059,25 @@ fn handle_client(
                 let spend_ratio = msg.get("spendRatio").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let daily_cap = msg.get("dailyCapMin").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let max_bank = msg.get("maxBankMin").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let allow_hosts = msg
-                    .get("allowHosts")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|h| h.as_str().map(str::to_string))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let list = |key: &str| -> Vec<String> {
+                    msg.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|h| h.as_str().map(str::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                let allow_hosts = list("allowHosts");
+                let filter = FilterPolicy {
+                    enabled: msg.get("filterEnabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                    audit_only: msg.get("filterAuditOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+                    allow: list("filterAllowHosts"),
+                    block: list("filterBlockHosts"),
+                };
                 earned.lock().unwrap().apply_report(
-                    secs, gate_active, spend_ratio, daily_cap, max_bank, allow_hosts,
+                    secs, gate_active, spend_ratio, daily_cap, max_bank, allow_hosts, filter,
                 );
             }
             Some("envelope") => {
@@ -912,8 +1153,13 @@ fn handle_client(
                     QReason::Exposure | QReason::Focus => quarantine_secs.max(0),
                     _ => 0,
                 };
+                let (filter_mode, denied, forwarded) = {
+                    let f = filter_status.lock().unwrap();
+                    let (denied, forwarded) = f.1.recent(20);
+                    (f.0.clone(), denied, forwarded)
+                };
                 let reply = format!(
-                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}}}}\n",
+                    "{{\"ok\":true,\"agentPid\":{},\"heartbeatAgeSecs\":{},\"captureOk\":{},\"configEpoch\":{},\"tasksEpoch\":{},\"enabled\":{},\"challengeOverdue\":{},\"clockTamper\":{},\"assignedTimezone\":\"{}\",\"exposureLockoutSecs\":{},\"earnedBalanceMin\":{:.1},\"earnedGateActive\":{},\"earnedTodayMin\":{:.1},\"quarantine\":{{\"active\":{},\"reason\":\"{}\",\"secsLeft\":{}}},\"siteFilter\":{{\"mode\":{},\"deniedRecent\":{},\"forwardedRecent\":{}}}}}\n",
                     a.pid,
                     a.last_seen.map(|t| t.elapsed().as_secs() as i64).unwrap_or(-1),
                     a.capture_ok,
@@ -930,6 +1176,9 @@ fn handle_client(
                     quarantine_active,
                     reason.as_str(),
                     quarantine_left,
+                    serde_json::json!(filter_mode),
+                    serde_json::json!(denied),
+                    serde_json::json!(forwarded),
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(reply.as_bytes());
@@ -1381,6 +1630,7 @@ mod earned_tests {
             daily_cap_min: 0.0,
             max_bank_min: 0.0,
             allow_hosts: vec!["khanacademy.org".into()],
+            filter: FilterPolicy::default(),
             last_report: Some(Instant::now()),
             last_tick: Instant::now(),
         }
@@ -1390,9 +1640,9 @@ mod earned_tests {
     fn banks_and_caps_daily() {
         let mut g = gate("/tmp/bm-earn-t1.json");
         // 600s = 10 earned min, but the daily cap is 5.
-        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![]);
+        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![], FilterPolicy::default());
         assert!((g.ledger.balance_min - 5.0).abs() < 1e-6);
-        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![]); // cap already hit
+        g.apply_report(600, true, 1.0, 5.0, 0.0, vec![], FilterPolicy::default()); // cap already hit
         assert!((g.ledger.balance_min - 5.0).abs() < 1e-6);
         let _ = std::fs::remove_file("/tmp/bm-earn-t1.json");
     }
@@ -1400,7 +1650,7 @@ mod earned_tests {
     #[test]
     fn bank_ceiling() {
         let mut g = gate("/tmp/bm-earn-t2.json");
-        g.apply_report(6000, true, 1.0, 0.0, 30.0, vec![]); // 100 min, ceiling 30
+        g.apply_report(6000, true, 1.0, 0.0, 30.0, vec![], FilterPolicy::default()); // 100 min, ceiling 30
         assert!((g.ledger.balance_min - 30.0).abs() < 1e-6);
         let _ = std::fs::remove_file("/tmp/bm-earn-t2.json");
     }
@@ -1433,6 +1683,71 @@ mod earned_tests {
         assert!(g.tick(false).is_none());
         let _ = std::fs::remove_file("/tmp/bm-earn-t4.json");
         let _ = std::fs::remove_file("/tmp/bm-earn-t4.json.tasks");
+    }
+
+    #[test]
+    fn filter_policy_gated_like_earned_time() {
+        let mut g = gate("/tmp/bm-earn-t6.json");
+        let fp = FilterPolicy {
+            enabled: true,
+            audit_only: false,
+            allow: vec!["kastatic.org".into()],
+            block: vec!["tiktok.com".into()],
+        };
+        g.apply_report(0, false, 1.0, 0.0, 0.0, vec![], fp.clone());
+        assert_eq!(g.filter_policy(), Some(fp.clone()));
+        g.last_report = Some(Instant::now() - Duration::from_secs(120)); // stale
+        assert!(g.filter_policy().is_none());
+        g.last_report = Some(Instant::now());
+        std::fs::remove_file(&g.tasks_path).unwrap(); // not a kid device
+        assert!(g.filter_policy().is_none());
+        let _ = std::fs::remove_file("/tmp/bm-earn-t6.json");
+    }
+
+    #[test]
+    fn compose_modes() {
+        use dnsfilter::Mode;
+        let hosts = vec!["khanacademy.org".to_string()];
+        let fp = FilterPolicy {
+            enabled: true,
+            audit_only: false,
+            allow: vec!["kastatic.org".into()],
+            block: vec!["tiktok.com".into()],
+        };
+        // Full block wins over everything.
+        assert_eq!(compose(true, Some(hosts.clone()), Some(fp.clone())).pf, PfMode::Full);
+        // Depleted + filter: DNS allow mode with sources + allowlist + mgmt.
+        let d = compose(false, Some(hosts.clone()), Some(fp.clone()));
+        assert_eq!(d.pf, PfMode::EarningTable(hosts.clone()));
+        match d.dns {
+            Mode::Allow { allow, block } => {
+                assert!(allow.contains(&"khanacademy.org".to_string()));
+                assert!(allow.contains(&"kastatic.org".to_string()));
+                assert!(allow.contains(&ALLOWED_HOSTS[0].to_string()));
+                assert_eq!(block, vec!["tiktok.com".to_string()]);
+            }
+            other => panic!("expected allow mode, got {other:?}"),
+        }
+        // Depleted, no filter: legacy static gate.
+        assert_eq!(
+            compose(false, Some(hosts.clone()), None),
+            Desired { pf: PfMode::EarningStatic(hosts.clone()), dns: Mode::Off }
+        );
+        // Balance available + blocklist: DNS lock only.
+        let d = compose(false, None, Some(fp.clone()));
+        assert_eq!(d.pf, PfMode::DnsLock);
+        assert_eq!(d.dns, Mode::Block { block: vec!["tiktok.com".into()] });
+        // Balance available, filter on but nothing to block: open.
+        let empty = FilterPolicy { block: vec![], ..fp.clone() };
+        assert_eq!(compose(false, None, Some(empty)), Desired::OPEN);
+        // Audit never enforces.
+        let audit = FilterPolicy { audit_only: true, ..fp.clone() };
+        assert_eq!(
+            compose(false, Some(hosts.clone()), Some(audit.clone())),
+            Desired { pf: PfMode::EarningStatic(hosts.clone()), dns: Mode::Audit }
+        );
+        assert_eq!(compose(false, None, Some(audit)), Desired { pf: PfMode::Open, dns: Mode::Audit });
+        assert_eq!(compose(false, None, None), Desired::OPEN);
     }
 
     #[test]
@@ -1471,14 +1786,40 @@ mod quarantine_tests {
     // An armed quarantine with zero grace, so want_full returns a health
     // reason on the first unhealthy call rather than waiting out the debounce.
     fn quarantine_no_grace() -> Quarantine {
+        let hook = Quarantine::table_hook(true);
+        let dir = PathBuf::from("/tmp");
         Quarantine {
-            engaged: None,
+            engaged: Desired::OPEN,
             unhealthy_since: None,
             armed: true,
             dry_run: true,
             grace: Duration::ZERO,
             rules_path: PathBuf::from("/tmp/bm-quar-test.rules"),
+            filter: dnsfilter::Filter::new(&dir, hook.clone()),
+            sysdns: dnsfilter::SystemDns::new(&dir, true),
+            pf_hook: hook,
+            saved_manual: Vec::new(),
+            loaded_upstreams: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rules_per_mode() {
+        let q = quarantine_no_grace();
+        let ups: Vec<SocketAddr> = vec!["192.0.2.53:53".parse().unwrap()];
+        let table = q.build_rules(&PfMode::EarningTable(vec![]), &ups);
+        assert!(table.contains("table <betamacs_allow> persist"));
+        assert!(table.contains("to { 192.0.2.53 } port 53"));
+        assert!(table.contains("to <betamacs_allow> port { 80, 443 }"));
+        assert!(table.trim_end().ends_with("block drop quick all"));
+        let lock = q.build_rules(&PfMode::DnsLock, &ups);
+        assert!(lock.contains("port { 53, 853 }"));
+        assert!(!lock.contains("block drop quick all"));
+        assert!(lock.contains("1.1.1.1"));
+        let full = q.build_rules(&PfMode::Full, &[]);
+        assert!(full.contains("to any port 53"));
+        assert!(full.trim_end().ends_with("block drop quick all"));
+        assert!(q.build_rules(&PfMode::Open, &[]).is_empty());
     }
 
     // session_active = true throughout: an unprotected logged-in session is

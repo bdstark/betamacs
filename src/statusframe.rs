@@ -143,6 +143,30 @@ fn compose(health: &Health) -> String {
         None => s += "Earned time: (daemon unreachable)\n",
     }
     s += &format!("Challenge: {}\n", if challenge_overdue { "OVERDUE" } else { "none" });
+    // Site filter (docs/site-filter.md): mode + the names it denied most
+    // recently, so a parent at the machine can see what to allowlist.
+    if let Some(sf) = d.as_ref().and_then(|v| v.get("siteFilter")) {
+        let mode = sf.get("mode").and_then(|x| x.as_str()).unwrap_or("off");
+        let names = |k: &str| -> Vec<String> {
+            sf.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        };
+        let denied = names("deniedRecent");
+        let line = match mode {
+            "off" => "Sites: unfiltered".to_string(),
+            "audit" => {
+                let seen = names("forwardedRecent");
+                format!("Sites: AUDIT (logging) · seen: {}", seen.iter().take(5).cloned().collect::<Vec<_>>().join(", "))
+            }
+            "block" => format!("Sites: blocklist on · denied: {}", denied.iter().take(5).cloned().collect::<Vec<_>>().join(", ")),
+            "allow" => format!("Sites: ALLOWLIST ONLY · denied: {}", denied.iter().take(5).cloned().collect::<Vec<_>>().join(", ")),
+            other => format!("Sites: {other}"),
+        };
+        s += line.trim_end_matches(": ");
+        s.push('\n');
+    }
     match (&assigned_tz, clock_tamper) {
         (_, true) => s += "Clock: TAMPER — changed while running\n",
         (Some(tz), false) => s += &format!("Clock: ok · tz {tz}\n"),

@@ -47,8 +47,13 @@ Notes:
   agent signal (`exposureOverBudget` vs `focusOverLimit`) set the standing
   deadline, so the reason is accurate rather than a generic "timed penalty".
 - `earned-gate` is a legitimate no-countdown block: an active earn gate with a
-  depleted balance. Only the earn-source allowlist is reachable; the block lifts
+  depleted balance. Only the earn-source allowlist (plus `siteFilter.allowHosts`
+  when the site filter is on, docs/site-filter.md) is reachable; the block lifts
   when the child earns/has balance again.
+- The `status` reply also carries `siteFilter: {mode, deniedRecent,
+  forwardedRecent}` — the DNS filter's mode (`off|audit|block|allow`) and the
+  last 20 unique names it denied/forwarded. A `block` mode with the quarantine
+  `none` is the blocklist-only state: not a lockdown, just DNS pinned.
 - Health/tamper reasons are debounced by the quarantine grace window
   (`BETAMACSD_QUARANTINE_GRACE_SECS`, default 180s) before `active` flips true;
   timed penalties bypass grace and engage immediately.

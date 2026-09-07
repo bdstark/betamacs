@@ -72,6 +72,8 @@ pub struct ModulePatches {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_limit: Option<FocusLimitPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_filter: Option<SiteFilterPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_integrity: Option<ClockIntegrityPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_escalation: Option<CoverageEscalationPatch>,
@@ -1030,6 +1032,72 @@ impl EarnedTimeSettings {
     }
 }
 
+// -------------------------------------------------------------- site filter
+//
+// Internet allow/block lists enforced by betamacsd through a local DNS
+// filter plus pf (docs/site-filter.md). Two lists:
+//   - `allowHosts`: the ONLY sites reachable while the earned-time balance is
+//     depleted (earning mode), on top of the earn sources themselves — so a
+//     child with no balance is steered to the educational sites.
+//   - `blockHosts`: never reachable while the filter is on, balance or not.
+// Hosts are domain suffixes ("kastatic.org" also matches cdn.kastatic.org).
+// Kids-only for free via the same task-bank gate as earned-time. Policy
+// only; disabled by default. `auditOnly` runs the DNS filter in log-only
+// mode (nothing blocked) to discover which hosts a site or app needs.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct SiteFilterSettings {
+    /// Master switch. Off = the earning-mode gate falls back to the legacy
+    /// resolve-the-apex-IP allowlist and no blocklist is enforced.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Domain suffixes reachable in earning mode (with the earn sources).
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// Domain suffixes never reachable while the filter is on.
+    #[serde(default)]
+    pub block_hosts: Vec<String>,
+    /// Log every lookup, block nothing (discovery mode).
+    #[serde(default)]
+    pub audit_only: bool,
+}
+
+impl Default for SiteFilterSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_hosts: Vec::new(),
+            block_hosts: Vec::new(),
+            audit_only: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct SiteFilterPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_only: Option<bool>,
+}
+
+impl SiteFilterSettings {
+    pub fn apply(&mut self, p: &SiteFilterPatch) {
+        macro_rules! set {
+            ($($f:ident),+) => { $( if let Some(v) = &p.$f { self.$f = v.clone(); } )+ };
+        }
+        set!(enabled, allow_hosts, block_hosts, audit_only);
+    }
+}
+
 // ------------------------------------------------------------- focus limit
 //
 // Auto-lockout when the user stays ACTIVELY on one browser tab too long
@@ -1214,6 +1282,8 @@ pub struct Effective {
     #[serde(default)]
     pub focus_limit: FocusLimitSettings,
     #[serde(default)]
+    pub site_filter: SiteFilterSettings,
+    #[serde(default)]
     pub clock_integrity: ClockIntegritySettings,
     #[serde(default)]
     pub coverage_escalation: CoverageEscalationSettings,
@@ -1248,6 +1318,9 @@ impl Package {
             }
             if let Some(p) = &patches.focus_limit {
                 effective.focus_limit.apply(p);
+            }
+            if let Some(p) = &patches.site_filter {
+                effective.site_filter.apply(p);
             }
             if let Some(p) = &patches.clock_integrity {
                 effective.clock_integrity.apply(p);
