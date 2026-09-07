@@ -92,6 +92,97 @@ pub fn warn_exposure(message: &str) {
     });
 }
 
+/// Blocking one-button notice (the caller waits until it is acknowledged or
+/// it gives up after a minute). Use from flows that must not stack dialogs.
+pub fn notice(message: &str) {
+    let script = format!(
+        "display dialog {} buttons {{\"OK\"}} default button \"OK\" \
+         with title \"betamacs\" with icon note giving up after 60",
+        quote(message),
+    );
+    let _ = Command::new("/usr/bin/osascript").args(["-e", &script]).output();
+}
+
+/// The AppleScript for `choose_from_list` (pure, unit-tested by compiling).
+fn choose_script(title: &str, prompt: &str, items: &[String], ok: &str, cancel: &str) -> String {
+    let list = items.iter().map(|i| quote(i)).collect::<Vec<_>>().join(", ");
+    format!(
+        "set r to choose from list {{{list}}} with title {} with prompt {} \
+         OK button name {} cancel button name {}\n\
+         if r is false then return \"__CANCEL__\"\n\
+         return \"__OK__\" & item 1 of r",
+        quote(title),
+        quote(prompt),
+        quote(ok),
+        quote(cancel),
+    )
+}
+
+/// A single-selection list picker. Returns the chosen item's text, or None
+/// on cancel / no GUI. Blocking.
+pub fn choose_from_list(
+    title: &str,
+    prompt: &str,
+    items: &[String],
+    ok: &str,
+    cancel: &str,
+) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let script = choose_script(title, prompt, items, ok, cancel);
+    let out = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim_end_matches(['\n', '\r']);
+    text.strip_prefix("__OK__").map(str::to_string)
+}
+
+/// The AppleScript for `ask_hidden` (pure, unit-tested by compiling). The
+/// cancel button raises "user canceled" (non-zero exit), a give-up returns
+/// the sentinel; both map to None.
+fn ask_hidden_script(title: &str, prompt: &str, cancel: &str, ok: &str, timeout_sec: u32) -> String {
+    format!(
+        "set r to display dialog {} default answer \"\" with hidden answer \
+         buttons {{{cancel}, {ok}}} default button {ok} cancel button {cancel} \
+         with title {} with icon caution giving up after {timeout}\n\
+         if gave up of r then return \"__GAVE_UP__\"\n\
+         return \"__OK__\" & text returned of r",
+        quote(prompt),
+        quote(title),
+        cancel = quote(cancel),
+        ok = quote(ok),
+        timeout = timeout_sec.max(5),
+    )
+}
+
+/// Ask for a masked entry (a PIN) with a cancel button. Some(text) on `ok`,
+/// None on cancel, give-up, or no GUI. Blocking.
+pub fn ask_hidden(
+    title: &str,
+    prompt: &str,
+    cancel: &str,
+    ok: &str,
+    timeout_sec: u32,
+) -> Option<String> {
+    let script = ask_hidden_script(title, prompt, cancel, ok, timeout_sec);
+    let out = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim_end_matches(['\n', '\r']);
+    text.strip_prefix("__OK__").map(str::to_string)
+}
+
 /// Ask for a typed answer, blocking until the user submits or the dialog
 /// gives up after `timeout_sec`. The only button is Submit (no Cancel), so
 /// the dialog can't be dismissed without answering — a give-up returns
@@ -121,4 +212,43 @@ pub fn ask(prompt: &str, timeout_sec: u32) -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let text = text.trim_end_matches(['\n', '\r']);
     text.strip_prefix("__OK__").map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Syntax-check a script with osacompile (compiles, never runs — no
+    /// dialog appears). Skipped where osacompile is missing.
+    fn compiles(script: &str) -> bool {
+        if !std::path::Path::new("/usr/bin/osacompile").exists() {
+            return true;
+        }
+        let out = std::env::temp_dir().join(format!("bm-prompt-{}.scpt", std::process::id()));
+        let ok = Command::new("/usr/bin/osacompile")
+            .args(["-o", out.to_str().unwrap(), "-e", script])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(out);
+        ok
+    }
+
+    #[test]
+    fn quote_escapes() {
+        assert_eq!(quote("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
+
+    #[test]
+    fn chore_scripts_compile() {
+        let items = vec!["☐ Make your \"bed\" — required today".to_string(), "✓ Trash — done".into()];
+        assert!(compiles(&choose_script("betamacs — Chores", "Pick one:", &items, "I did it", "Close")));
+        assert!(compiles(&ask_hidden_script(
+            "betamacs — Verify a chore",
+            "Wrong PIN — 2 attempt(s) left.\n\nAsk a parent to check \"bed\".",
+            "Not yet",
+            "Verify",
+            300
+        )));
+    }
 }

@@ -53,6 +53,12 @@ define_class!(
         fn toggle_status(&self, _sender: Option<&AnyObject>) {
             let _ = self.ivars().stats_proxy.send_event(OverlayMsg::ToggleStats);
         }
+
+        #[unsafe(method(openChores:))]
+        fn open_chores(&self, _sender: Option<&AnyObject>) {
+            // Runs its dialogs on a background thread (docs/chores.md).
+            crate::chores::open();
+        }
     }
 );
 
@@ -76,6 +82,7 @@ pub struct MenuBar {
     _item: Retained<NSStatusItem>,
     status_line: Retained<NSMenuItem>,
     boxes_line: Retained<NSMenuItem>,
+    chores_line: Retained<NSMenuItem>,
     _target: Retained<MenuTarget>,
 }
 
@@ -94,10 +101,13 @@ impl MenuBar {
         let title = disabled_item(mtm, &format!("betamacs {}", env!("CARGO_PKG_VERSION")));
         let status_line = disabled_item(mtm, "starting…");
         let boxes_line = disabled_item(mtm, "no censor boxes");
+        let chores_line = disabled_item(mtm, "Chores: —");
         menu.addItem(&title);
         menu.addItem(&status_line);
         menu.addItem(&boxes_line);
+        menu.addItem(&chores_line);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&action_item(mtm, "Chores…", sel!(openChores:), &target));
         menu.addItem(&action_item(
             mtm,
             "Show/Hide Status",
@@ -122,6 +132,7 @@ impl MenuBar {
             _item: item,
             status_line,
             boxes_line,
+            chores_line,
             _target: target,
         })
     }
@@ -129,6 +140,12 @@ impl MenuBar {
     /// First status line: what is being monitored (from the pipeline).
     pub fn set_status(&self, text: &str) {
         self.status_line.setTitle(&NSString::from_str(text));
+    }
+
+    /// Third status line: today's chores at a glance (from `statusframe`).
+    pub fn set_chores(&self, text: &str) {
+        self.chores_line
+            .setTitle(&NSString::from_str(&format!("Chores: {text}")));
     }
 
     /// Second status line: how many censor boxes are on screen right now.

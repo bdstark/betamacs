@@ -206,17 +206,27 @@ entries are kept forever).
   socket smoke run in prefix mode.
 - Agent relay: `earned.rs` sends the `chores` policy in the earn report;
   the HUD maps the `chores` lockdown reason to plain language.
+- **Agent UI (`src/chores.rs`)**: a "Chores…" menu-bar item opens a native
+  list picker (osascript `choose from list`) of the bank's chores with
+  their state — `☐ Make your bed — required today`, `☐ Piano — +20 min`,
+  `⏳ … — waiting for a parent`, `✓ … — done`. Choosing one claims it and
+  opens a masked-entry dialog ("Ask a parent to check …", buttons *Not
+  yet* / *Verify*, `with hidden answer`, 5-minute give-up). *Verify* relays
+  the PIN; a wrong PIN re-asks with the attempts left; *Not yet*, a
+  give-up, a lockout, or a refusal withdraws the claim. After a result the
+  picker returns until *Close*. One flow at a time; all blocking dialogs
+  run on their own thread. The menu also carries a live `Chores:` line and
+  the HUD a `Chores:` row (`N required to do (ids) · N waiting for a parent
+  · N done today`, `nothing to do`, or `not configured`). The dialog
+  scripts are syntax-checked with `osacompile` in unit tests; the dialogs
+  themselves need an Aqua session and have not been clicked through yet.
 
 **Not built yet (in order):**
 
-1. Agent UI: "Chores…" menu item listing the bank's chores (from the
-   `chores` reply), claim + PIN dialogs (`prompt.rs`) that call
-   `chore-claim` / `chore-verify` / `chore-reject`, HUD lines for
-   outstanding/pending chores.
-2. Config app: `chores` editor tab; chore list + PIN in the tasks editor.
-3. Ship: betamacs release, then a bank with chores + a PIN, then a config
-   enabling `chores`.
-4. Phase 2 remote approval.
+1. Config app: `chores` editor tab; chore list + PIN in the tasks editor.
+2. Ship: betamacs release, then a bank with chores + a PIN, then a config
+   enabling `chores`. Then click through the dialogs on the kid Mac.
+3. Phase 2 remote approval.
 
 ## Open questions
 

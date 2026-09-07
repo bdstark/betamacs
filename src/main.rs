@@ -2,6 +2,7 @@ mod capture;
 mod capture_sck;
 mod censor_fx;
 mod challenge;
+mod chores;
 mod clock;
 mod detect;
 mod earned;

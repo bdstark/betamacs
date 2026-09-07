@@ -28,8 +28,20 @@ fn daemon_status() -> Option<serde_json::Value> {
 
 pub fn spawn(health: Arc<Health>, handle: OverlayHandle) {
     std::thread::spawn(move || {
+        let mut last_chores = String::new();
         loop {
-            let _ = handle.set_stats(compose(&health));
+            let d = daemon_status();
+            let _ = handle.set_stats(compose(&health, d.as_ref()));
+            // The menu's "Chores:" line, pushed only on change.
+            let chores = match d.as_ref() {
+                None => "(daemon unreachable)".to_string(),
+                Some(v) => crate::chores::summary(v.get("chores"))
+                    .unwrap_or_else(|| "(daemon predates chores)".to_string()),
+            };
+            if chores != last_chores {
+                let _ = handle.set_chores(chores.clone());
+                last_chores = chores;
+            }
             std::thread::sleep(REFRESH);
         }
     });
@@ -52,8 +64,7 @@ fn lockdown_phrase(reason: &str) -> &'static str {
     }
 }
 
-fn compose(health: &Health) -> String {
-    let d = daemon_status();
+fn compose(health: &Health, d: Option<&serde_json::Value>) -> String {
     let f = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_f64());
     let i = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_i64());
     let b = |k: &str| d.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_bool());
@@ -144,6 +155,10 @@ fn compose(health: &Health) -> String {
         None => s += "Earned time: (daemon unreachable)\n",
     }
     s += &format!("Challenge: {}\n", if challenge_overdue { "OVERDUE" } else { "none" });
+    // Chores (docs/chores.md): required-to-do / waiting / done today.
+    if let Some(line) = crate::chores::summary(d.as_ref().and_then(|v| v.get("chores"))) {
+        s += &format!("Chores: {line}\n");
+    }
     // Site filter (docs/site-filter.md): mode + the names it denied most
     // recently, so a parent at the machine can see what to allowlist.
     if let Some(sf) = d.as_ref().and_then(|v| v.get("siteFilter")) {

@@ -111,6 +111,8 @@ pub enum OverlayMsg {
     Stats(String),
     /// Show/hide the status HUD (from the menu bar).
     ToggleStats,
+    /// The menu bar's "Chores:" line (composed by `statusframe`).
+    Chores(String),
 }
 
 /// Handle used by the pipeline/server threads to push updates.
@@ -145,6 +147,13 @@ impl OverlayHandle {
     pub fn set_stats(&self, text: String) -> Result<()> {
         self.proxy
             .send_event(OverlayMsg::Stats(text))
+            .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
+    }
+
+    /// Update the menu bar's "Chores:" line.
+    pub fn set_chores(&self, text: String) -> Result<()> {
+        self.proxy
+            .send_event(OverlayMsg::Chores(text))
             .map_err(|_| anyhow::anyhow!("overlay event loop is gone"))
     }
 }
@@ -426,6 +435,11 @@ impl ApplicationHandler<OverlayMsg> for OverlayApp {
                 self.hud_text = text;
                 if let Some(hud) = &self.hud {
                     hud.set_text(&self.hud_text);
+                }
+            }
+            OverlayMsg::Chores(text) => {
+                if let Some(mb) = &self.menubar {
+                    mb.set_chores(&text);
                 }
             }
             OverlayMsg::ToggleStats => {
